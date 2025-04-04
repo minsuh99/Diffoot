@@ -371,8 +371,8 @@ class MultiMatchSoccerDataset(Dataset):
 
 if __name__ == "__main__":
     set_seed(42)
-    raw_data_path = "kim-internship/Minsuh/SoccerTrajPredict/idsse-data"
-    data_save_path = "kim-internship/Minsuh/SoccerTrajPredict/match_data"
+    raw_data_path = "idsse-data"
+    data_save_path = "match_data"
     organize_and_process(raw_data_path, data_save_path)
     dataset = MultiMatchSoccerDataset(data_root=data_save_path)
     dataloader = torch.utils.data.DataLoader(
