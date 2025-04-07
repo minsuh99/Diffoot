@@ -1,4 +1,6 @@
 import os
+import random
+import torch
 import pandas as pd
 import numpy as np
 import scipy.signal as signal
@@ -9,6 +11,15 @@ from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_
 
 # This code is from "https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking"
 # "https://github.com/spoho-datascience/idsse-data"
+
+# Setting seed with reproducibility
+def set_seed(seed=42):
+    random.seed(seed)                 
+    np.random.seed(seed)              
+    torch.manual_seed(seed)           
+    torch.cuda.manual_seed_all(seed)  
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Load team sheet information from matchinformation XML files
 def load_team_sheets(path):

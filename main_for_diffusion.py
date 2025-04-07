@@ -4,32 +4,36 @@ import torch.nn as nn
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
+from utils.utils import set_seed
 from utils.data_utils import split_dataset_indices, custom_collate_fn
 import random
 import numpy as np
 from tqdm import tqdm
 
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 def main():
     # 1. Hyperparameter Setting
     # raw_data_path = "Download raw file path"
-    raw_data_path = "kim-internship/Minsuh/SoccerTrajPredict/idsse-data"
-    data_save_path = "kim-internship/Minsuh/SoccerTrajPredict/match_data"
-    batch_size = 16
-    num_workers = 4
-    epochs = 30
-    learning_rate = 1e-4
+    raw_data_path = "idsse-data"
+    data_save_path = "match_data"
+    batch_size = 32
+    num_workers = 8
+    epochs = 50
+    learning_rate = 5e-4
     num_samples = 10
+    
+    set_seed(42)
+    
+    # fix seed of data_workers
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    g = torch.Generator()
+    g.manual_seed(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(42)
+    
 
     # 2. Data Loading
     print("---Data Loading---")
@@ -44,7 +48,9 @@ def main():
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
+        worker_init_fn=seed_worker,
+        generator=g
     )
 
     test_dataloader = DataLoader(
@@ -76,16 +82,18 @@ def main():
         model.train()
         total_loss = 0
 
-        for batch in tqdm(train_dataloader):
+        for batch in train_dataloader:
             cond = batch["condition"].to(device)  # [B, T, 158]
             target = batch["target"].to(device).view(-1, cond.shape[1], 11, 2)  # [B, T, 11, 2]
-
-            cond = cond.permute(0, 2, 1).unsqueeze(2)  # [B, 158, 1, T]
-
+            
+            cond = cond.permute(0, 2, 1).unsqueeze(2).expand(-1, -1, 11, -1)  # [B, 158, 11, T]
+            
             loss = model(target, cond_info=cond)
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_dataloader)
@@ -101,25 +109,43 @@ def main():
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
-            cond = batch["condition"].to(device)  # [B, T, 158]
-            target = batch["target"].to(device).view(-1, cond.shape[1], 11, 2)
+            cond = batch["condition"].to(device)   # [B, T, 158]
+            target = batch["target"].to(device).view(-1, cond.shape[1], 11, 2)  # [B, T, 11, 2]
 
             cond_for_gen = cond.permute(0, 2, 1).unsqueeze(2)  # [B, 158, 1, T]
+            cond_for_gen = cond_for_gen.expand(-1, -1, 11, -1)
 
-            # Generate multiple samples
             generated = model.generate(shape=target.shape, cond_info=cond_for_gen, num_samples=num_samples)  # [N, B, T, 11, 2]
+            target_exp = target.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)  # [N, B, T, 11, 2]
+            
+            # batch_size
+            B = generated.shape[1]
 
-            # Find best sample (lowest ADE)
-            target_exp = target.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)
+            # Denormalize            
+            x_scales = torch.tensor([s[0] for s in batch["pitch_scale"]], device=device , dtype=torch.float32).view(1, B, 1, 1)
+            y_scales = torch.tensor([s[1] for s in batch["pitch_scale"]], device=device, dtype=torch.float32).view(1, B, 1, 1)
+            
+            x_scales = x_scales.expand(num_samples, B, 1, 1)
+            y_scales = y_scales.expand(num_samples, B, 1, 1)
+
+            generated = generated.clone()
+            target_exp = target_exp.clone()
+            
+            generated[..., 0] = (generated[..., 0] + 1.0) * x_scales
+            generated[..., 1] = (generated[..., 1] + 1.0) * y_scales
+
+            target_exp[..., 0] = (target_exp[..., 0] + 1.0) * x_scales
+            target_exp[..., 1] = (target_exp[..., 1] + 1.0) * y_scales
+
             ade = ((generated - target_exp) ** 2).sum(-1).sqrt().mean(2)  # [N, B, 11]
             ade = ade.mean(dim=2)  # [N, B]
 
             best_idx = ade.argmin(dim=0)  # [B]
-            best_pred = generated[best_idx, torch.arange(generated.shape[1])]  # [B, T, 11, 2]
+            best_pred = generated[best_idx, torch.arange(generated.shape[1])]     # [B, T, 11, 2]
+            best_target = target_exp[0, torch.arange(generated.shape[1])]         # [B, T, 11, 2]
 
-            # Final ADE & FDE
-            ade_final = ((best_pred - target) ** 2).sum(-1).sqrt().mean(1).mean(1)  # [B]
-            fde_final = ((best_pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt().mean(1)  # [B]
+            ade_final = ((best_pred - best_target) ** 2).sum(-1).sqrt().mean(1).mean(1)  # [B]
+            fde_final = ((best_pred[:, -1] - best_target[:, -1]) ** 2).sum(-1).sqrt()    # [B]
 
             all_ade.extend(ade_final.cpu().numpy())
             all_fde.extend(fde_final.cpu().numpy())

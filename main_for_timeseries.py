@@ -20,12 +20,12 @@ def set_seed(seed=42):
 # 0331: LSTM 기본 모델 사용중
 def main():
     # 1. Hyperparameter Setting
-    raw_data_path = "kim-internship/Minsuh/SoccerTrajPredict/idsse-data"
-    data_save_path = "kim-internship/Minsuh/SoccerTrajPredict/match_data"
-    batch_size = 64
-    num_workers = 4
+    raw_data_path = "idsse-data"
+    data_save_path = "match_data"
+    batch_size = 32
+    num_workers = 8
     epochs = 30
-    learning_rate = 1e-3
+    learning_rate = 5e-4
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(42)
@@ -69,7 +69,7 @@ def main():
         model.train()
         total_loss = 0
 
-        for batch in tqdm(train_dataloader):
+        for batch in train_dataloader:
             condition = batch['condition'].to(device)  # [B, T, 158]
             target = batch['target'].to(device)        # [B, T, 22] (11 defenders × (x, y))
             pred = model(condition)                    # [B, T, 22]
@@ -100,26 +100,36 @@ def main():
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
             condition = batch['condition'].to(device)
-            target = batch['target'].to(device)  # [B, T, 22] (11 defenders × (x, y))
+            target = batch['target'].to(device)  # [B, T, 22]
+            pred = model(condition)              # [B, T, 22]
 
-            pred = model(condition)             # [B, T, 22]
-            pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)        # [B, T, 11, 2]
+            pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)      # [B, T, 11, 2]
             target = target.view(target.shape[0], target.shape[1], 11, 2)
 
-            # 선수별 ADE: [B, 11]
-            ade = ((pred - target) ** 2).sum(-1).sqrt().mean(1)  # [B, 11]
-            ade = ade.mean(dim=1)  # 배치별 선수 평균 → [B]
+            # Denormalize
+            x_scales = torch.tensor([s[0] for s in batch["pitch_scale"]], device=device).view(-1, 1, 1, 1)
+            y_scales = torch.tensor([s[1] for s in batch["pitch_scale"]], device=device).view(-1, 1, 1, 1)
+
+            pred = pred.clone()
+            target = target.clone()
+
+            pred[..., 0] = (pred[..., 0] + 1.0) * x_scales
+            pred[..., 1] = (pred[..., 1] + 1.0) * y_scales
+            target[..., 0] = (target[..., 0] + 1.0) * x_scales
+            target[..., 1] = (target[..., 1] + 1.0) * y_scales
+
+            # Player-wise ADE
+            ade = ((pred - target) ** 2).sum(-1).sqrt().mean(1).mean(1)  # [B]
             all_ade.extend(ade.cpu().numpy())
 
-            # 선수별 FDE: [B, 11]
-            fde = ((pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt()  # [B, 11]
-            fde = fde.mean(dim=1)  # [B]
+            # Player-wise FDE
+            fde = ((pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt().mean(1)  # [B]
             all_fde.extend(fde.cpu().numpy())
 
     avg_ade = np.mean(all_ade)
     avg_fde = np.mean(all_fde)
-
     print(f"[Inference] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
+
 
 
 if __name__ == "__main__":

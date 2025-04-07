@@ -112,6 +112,8 @@ def custom_collate_fn(batch):
             transposed = list(zip(*[b["condition_graph_seq"] for b in batch]))  # [T x B]
             collated_graphs = [GeoBatch.from_data_list(timestep_graphs) for timestep_graphs in transposed]
             collated[key] = collated_graphs
+        elif key == "pitch_scale":
+            collated[key] = [b["pitch_scale"] for b in batch]
         else:
             try:
                 collated[key] = default_collate([b[key] for b in batch])

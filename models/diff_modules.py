@@ -6,11 +6,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from utils.utils import set_seed
+
+# For Reproducability
+set_seed(42)
 
 
 def get_torch_trans(heads=8, layers=1, channels=64):
     encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu"
+        d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu", dropout=0.0
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
@@ -91,7 +95,8 @@ class ResidualBlock(nn.Module):
         y = self.mid_projection(y)
 
         if cond_info is not None and self.cond_projection is not None:
-            cond_info = cond_info.view(B, cond_info.shape[1], K * L)
+            B_c, _, K_c, L_c = cond_info.shape
+            cond_info = cond_info.reshape(B_c, cond_info.shape[1], K_c * L_c)
             cond_info = self.cond_projection(cond_info)
             y = y + cond_info
 
@@ -107,6 +112,8 @@ class diff_CSDI(nn.Module):
     def __init__(self, config, inputdim=2):
         super().__init__()
         self.channels = config["channels"]
+        self.num_players = 11
+        self.output_dim = 2  # (x, y)
 
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
@@ -115,7 +122,7 @@ class diff_CSDI(nn.Module):
 
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, 22, 1)  # 11명 × 2좌표
+        self.output_projection2 = Conv1d_with_init(self.channels, self.output_dim, 1)
         nn.init.zeros_(self.output_projection2.weight)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
@@ -126,16 +133,15 @@ class diff_CSDI(nn.Module):
                 diffusion_embedding_dim=config["diffusion_embedding_dim"],
                 nheads=config["nheads"],
                 side_dim=config.get("side_dim", None)
-            )
-            for _ in range(config["layers"])
+            ) for _ in range(config["layers"])
         ])
 
-    def forward(self, x, diffusion_step, cond_info=None):
-        B, inputdim, K, L = x.shape
+    def forward(self, x, diffusion_step, cond_info=None):       
+        B, inputdim, K, L = x.shape  # [B, 2, 11, 125]
 
-        x = x.reshape(B, inputdim, K * L)
-        x = F.relu(self.input_projection(x))
-        x = x.reshape(B, self.channels, K, L)
+        x = x.reshape(B, inputdim, K * L)              # [B, 2, 1375]
+        x = F.relu(self.input_projection(x))           # [B, C, 1375]
+        x = x.reshape(B, self.channels, K, L)          # [B, C, 11, 125]
 
         diffusion_emb = self.diffusion_embedding(diffusion_step)
 
@@ -144,9 +150,10 @@ class diff_CSDI(nn.Module):
             x, skip_connection = layer(x, cond_info, diffusion_emb)
             skip.append(skip_connection)
 
-        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
-        x = x.reshape(B, self.channels, K * L)
-        x = F.relu(self.output_projection1(x))
-        x = self.output_projection2(x)         # [B, 22, 125]
-        x = x.reshape(B, 2, 11, L)             # [B, 2, 11, 125]
+        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))  # [B, C, 11, 125]
+
+        x = F.relu(self.output_projection1(x.reshape(B, self.channels, K * L)))  # [B, C, 1375]
+        x = self.output_projection2(x)  # [B, 2, 1375]
+        x = x.reshape(B, self.output_dim, K, L)  # [B, 2, 11, 125]
         return x
+

@@ -2,7 +2,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from make_dataset import MultiMatchSoccerDataset
-from Minsuh.SoccerTrajPredict.code.models.encoder import GraphAutoencoder
+from encoder import GraphAutoencoder
 from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -7,8 +7,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from floodlight.io.dfl import read_position_data_xml, read_event_data_xml
-from utils.utils import calc_velocites, correct_all_player_jumps_adjacent
+from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_pitch_from_mat_info_xml
+from utils.utils import calc_velocites, correct_all_player_jumps_adjacent, set_seed
 from utils.data_utils import (
     infer_starters_from_tracking,
     sort_columns_by_original_order,
@@ -16,16 +16,6 @@ from utils.data_utils import (
     compute_cumulative_distances
 )
 from utils.graph_utils import build_graph_sequence_from_condition
-
-
-# Setting seed with reproducibility
-def set_seed(seed=42):
-    random.seed(seed)                 
-    np.random.seed(seed)              
-    torch.manual_seed(seed)           
-    torch.cuda.manual_seed_all(seed)  
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 # .xml files in DFL -> .csv with Metrica_sports format
@@ -172,6 +162,10 @@ def organize_and_process(data_path, save_path):
 
             df_player_info = pd.DataFrame(player_info_rows)
             df_player_info.to_csv(os.path.join(save_match_dir, "player_info.csv"), index=False)
+            
+            # 나중에 쓸 메타데이터 파일 복사         
+            shutil.copy(os.path.join(match_dir, info), os.path.join(save_match_dir, "matchinformation.xml"))
+
 
 
 class MultiMatchSoccerDataset(Dataset):
@@ -279,10 +273,7 @@ class MultiMatchSoccerDataset(Dataset):
 
         # Determine team roles (attacking or defending) based on possession
         possession_team = df.iloc[start_idx]["possession"]
-        if possession_team == 1:
-            atk_prefix, def_prefix = "Home", "Away"
-        else:
-            atk_prefix, def_prefix = "Away", "Home"
+        atk_prefix, def_prefix = ("Home", "Away") if possession_team == 1 else ("Away", "Home")
 
         # Extract 22 valid players (11 per team) from current segment
         atk_cols = get_valid_player_columns_in_order(full_seq, atk_prefix, self.column_order)
@@ -330,6 +321,31 @@ class MultiMatchSoccerDataset(Dataset):
         player_info = self.player_info_cache[match_id]
         player_info_map = player_info.set_index("col_name")[["position", "starter"]].to_dict("index")
 
+        # other: Attk + ball
+        # target: Def
+        other_seq = target_seq[other_columns]
+        target_seq = target_seq[target_columns]
+        
+        # Normalization
+        if not hasattr(self, "pitch_cache"):
+            self.pitch_cache = {}
+        if match_id not in self.pitch_cache:
+            info_path = os.path.join(self.data_root, match_id, "matchinformation.xml")
+            pitch = read_pitch_from_mat_info_xml(info_path)
+            self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
+        x_scale, y_scale = self.pitch_cache[match_id]
+
+        target_seq[target_columns[0::2]] = (target_seq[target_columns[0::2]] / x_scale) - 1.0
+        target_seq[target_columns[1::2]] = (target_seq[target_columns[1::2]] / y_scale) - 1.0
+
+        other_seq[other_columns[0::2]] = (other_seq[other_columns[0::2]] / x_scale) - 1.0
+        other_seq[other_columns[1::2]] = (other_seq[other_columns[1::2]] / y_scale) - 1.0
+
+        condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
+        condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
+        condition_seq[condition_x_cols] = (condition_seq[condition_x_cols] / x_scale) - 1.0
+        condition_seq[condition_y_cols] = (condition_seq[condition_y_cols] / y_scale) - 1.0
+
         # Add player's position, starter feature
         enriched_condition = []
         for i in range(len(condition_seq)):
@@ -345,24 +361,22 @@ class MultiMatchSoccerDataset(Dataset):
             enriched_condition.append(enriched_row)
 
         condition_tensor = torch.tensor(enriched_condition, dtype=torch.float32)
-
-        # other: Attk + ball
-        # target: Def
-        other_seq = target_seq[other_columns]
-        target_seq = target_seq[target_columns]
+        other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
+        target_tensor = torch.tensor(target_seq.values, dtype=torch.float32)
 
         sample = {
             "match_id": match_id,
             "condition": condition_tensor,
-            "other": torch.tensor(other_seq.values, dtype=torch.float32),
-            "target": torch.tensor(target_seq.values, dtype=torch.float32),
+            "other": other_tensor,
+            "target": target_tensor,
             "condition_columns": [
                 f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter"]
             ] + ball_feats,
             "other_columns": other_columns,
             "target_columns": target_columns,
             "condition_frames": list(condition_seq.index),
-            "target_frames": list(target_seq.index)
+            "target_frames": list(target_seq.index),
+            "pitch_scale": (x_scale, y_scale)
         }
         if self.use_condition_graph:
             sample["condition_graph_seq"] = build_graph_sequence_from_condition(sample, data_root=self.data_root)
@@ -371,8 +385,8 @@ class MultiMatchSoccerDataset(Dataset):
 
 if __name__ == "__main__":
     set_seed(42)
-    raw_data_path = "idsse-data"
-    data_save_path = "match_data"
+    raw_data_path = "idsse-data" # Raw Data Downloaded Path
+    data_save_path = "match_data" # Saving path for preprocessed data
     organize_and_process(raw_data_path, data_save_path)
     dataset = MultiMatchSoccerDataset(data_root=data_save_path)
     dataloader = torch.utils.data.DataLoader(
