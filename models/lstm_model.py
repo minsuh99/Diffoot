@@ -16,10 +16,31 @@ class DefenseTrajectoryPredictor(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(hidden_dim, projection_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(projection_dim, output_dim)
         )
 
+        # Linear 초기화
+        self.projection.apply(self._init_linear_weights)
+        
+        # LSTM 초기화
+        self._init_lstm_weights()
+    
+    def _init_linear_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def _init_lstm_weights(self):
+        for name, param in self.lstm.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param.data)
+            elif 'bias' in name:
+                nn.init.zeros_(param.data)
+    
+                    
     def forward(self, x):
         # x: [B, T, 158]
         x = self.norm(x)

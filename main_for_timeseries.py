@@ -29,9 +29,8 @@ def main():
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     set_seed(42)
     
-    
     # fix seed of data_workers
-    def seed_worker(worker_id=42):
+    def seed_worker(worker_id):
         worker_seed = torch.initial_seed() % 2**32
         np.random.seed(worker_seed)
         random.seed(worker_seed)
@@ -47,8 +46,6 @@ def main():
         print("Skip organize_and_process")
         
     dataset = MultiMatchSoccerDataset(data_root=data_save_path, use_condition_graph=False)
-    print(dataset.samples[:5])
-    
     train_idx, test_idx, _, _ = split_dataset_indices(dataset)
     train_dataloader = DataLoader(
         Subset(dataset, train_idx),
