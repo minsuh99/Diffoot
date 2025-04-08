@@ -186,7 +186,7 @@ class MultiMatchSoccerDataset(Dataset):
         match_ids = os.listdir(data_root)
         skip_ids = {"DFL-MAT-J03WN1"}  # Skip matches with insufficient data (red card early)
         match_ids = [m for m in match_ids if m not in skip_ids]
-        for match_id in tqdm(match_ids, desc= "Data Loading"):
+        for match_id in tqdm(match_ids, desc= "Data Loading..."):
             match_folder = os.path.join(data_root, match_id)
             home_path = os.path.join(match_folder, "tracking_home.csv")
             away_path = os.path.join(match_folder, "tracking_away.csv")
@@ -403,5 +403,17 @@ if __name__ == "__main__":
     print("Target shape:", sample["target"].shape)
     print("Condition frames:", sample["condition_frames"])
     print("Using frames:", sample["target_frames"])
+    
+    from utils.data_utils import split_dataset_indices
+    train_idx, test_idx, train_match_ids, test_match_ids = split_dataset_indices(dataset)
+
+    print("\n--- Match ID Split ---")
+    print(f"Train Matches ({len(train_match_ids)}): {sorted(train_match_ids)}")
+    print(f"Test Matches ({len(test_match_ids)}): {sorted(test_match_ids)}")
+    
+    print(f"Train index: {len(train_idx)}")
+    print(f"Test index: {len(test_idx)}")
     print("Length of condition graph seq:", len(sample["condition_graph_seq"]))
     print("Example of condition graph:", sample["condition_graph_seq"][:1] )
+    
+    

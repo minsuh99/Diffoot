@@ -1,14 +1,20 @@
-import torch
-from torch.utils.data import DataLoader, Subset
-import torch.nn as nn
-from models.diff_modules import diff_CSDI
-from models.diff_model import DiffusionTrajectoryModel
-from make_dataset import MultiMatchSoccerDataset, organize_and_process
-from utils.utils import set_seed
-from utils.data_utils import split_dataset_indices, custom_collate_fn
+import os
 import random
 import numpy as np
 from tqdm import tqdm
+
+import torch
+from torch.utils.data import DataLoader, Subset
+import torch.nn as nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+from models.diff_modules import diff_CSDI
+from models.diff_model import DiffusionTrajectoryModel
+from make_dataset import MultiMatchSoccerDataset, organize_and_process
+
+from utils.utils import set_seed, plot_trajectories_on_pitch
+from utils.data_utils import split_dataset_indices, custom_collate_fn
+
 
 def main():
     # 1. Hyperparameter Setting
@@ -17,10 +23,12 @@ def main():
     data_save_path = "match_data"
     batch_size = 32
     num_workers = 8
-    epochs = 50
-    learning_rate = 5e-4
+    epochs = 100
+    learning_rate = 1e-4
     num_samples = 10
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     set_seed(42)
     
     # fix seed of data_workers
@@ -30,18 +38,17 @@ def main():
         random.seed(worker_seed)
 
     g = torch.Generator()
-    g.manual_seed(42)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    g.manual_seed(42)    
 
     # 2. Data Loading
     print("---Data Loading---")
-    organize_and_process(raw_data_path, data_save_path)
+    if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
+        organize_and_process(raw_data_path, data_save_path)
+    else:
+        print("Skip organize_and_process")
 
     dataset = MultiMatchSoccerDataset(data_root=data_save_path, use_condition_graph=False)
     train_idx, test_idx, _, _ = split_dataset_indices(dataset)
-
     train_dataloader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=batch_size,
@@ -75,6 +82,7 @@ def main():
     denoiser = diff_CSDI(csdi_config)
     model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     # 4. Train
     print("--- Train ---")
@@ -97,18 +105,22 @@ def main():
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_dataloader)
-        print(f"[Epoch {epoch}] Train Loss: {avg_loss:.4f}")
+        tqdm.write(f"[Epoch {epoch}] Train Loss: {avg_loss:.6f}, Current LR: {scheduler.get_last_lr()[0]:.6f}")
+        scheduler.step(avg_loss)
 
     print("---Train finished!---")
 
-    # 5. Inference with Best-of-N Sampling
+    # 5. Inference (Best-of-N Sampling) & Visualization
     print("--- Inference ---")
     model.eval()
     all_ade = []
     all_fde = []
+    visualize_samples = 5
+    visualization_done = False
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
+            # Inference
             cond = batch["condition"].to(device)   # [B, T, 158]
             target = batch["target"].to(device).view(-1, cond.shape[1], 11, 2)  # [B, T, 11, 2]
 
@@ -149,7 +161,22 @@ def main():
 
             all_ade.extend(ade_final.cpu().numpy())
             all_fde.extend(fde_final.cpu().numpy())
+            
+            # Visualization
+            os.makedirs("results", exist_ok=True)
+            
+            if not visualization_done:
+                for i in range(min(B, visualize_samples)):
+                    others = batch["other"][i].view(-1, 12, 2).cpu()       # [T, 12, 2]
+                    target_vis = target[i].cpu()                           # [T, 11, 2]
+                    pred_vis = best_pred[i].cpu()                          # [T, 11, 2]
+                    pitch_scale = batch["pitch_scale"][i]
 
+                    save_path = f"results/sample_{i:02d}.png"
+                    plot_trajectories_on_pitch(others, target_vis, pred_vis, pitch_scale, save_path=save_path)
+
+                visualization_done = True
+                
     avg_ade = np.mean(all_ade)
     avg_fde = np.mean(all_fde)
     print(f"[Inference - Best of {num_samples}] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
