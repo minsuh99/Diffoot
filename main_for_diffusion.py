@@ -61,7 +61,7 @@ def main():
         Subset(dataset, test_idx),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=True,
         persistent_workers=False,
         collate_fn=custom_collate_fn,
@@ -128,7 +128,7 @@ def main():
 
             generated = model.generate(shape=target.shape, cond_info=cond_for_gen, num_samples=num_samples)  # [N, B, T, 11, 2]
             target_exp = target.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)  # [N, B, T, 11, 2]
-            
+                        
             # batch_size
             B = generated.shape[1]
 
@@ -142,11 +142,11 @@ def main():
             generated = generated.clone()
             target_exp = target_exp.clone()
             
-            generated[..., 0] = (generated[..., 0] + 1.0) * x_scales
-            generated[..., 1] = (generated[..., 1] + 1.0) * y_scales
+            generated[..., 0] *= x_scales
+            generated[..., 1] *= y_scales
 
-            target_exp[..., 0] = (target_exp[..., 0] + 1.0) * x_scales
-            target_exp[..., 1] = (target_exp[..., 1] + 1.0) * y_scales
+            target_exp[..., 0] *= x_scales
+            target_exp[..., 1] *= y_scales
 
             ade = ((generated - target_exp) ** 2).sum(-1).sqrt().mean(2)  # [N, B, 11]
             ade = ade.mean(dim=2)  # [N, B]
@@ -171,7 +171,7 @@ def main():
                     pred_vis = best_pred[i].cpu()                          # [T, 11, 2]
                     pitch_scale = batch["pitch_scale"][i]
 
-                    save_path = f"results/sample_{i:02d}.png"
+                    save_path = f"results/Diff_sample_{i:02d}.png"
                     plot_trajectories_on_pitch(others, target_vis, pred_vis, pitch_scale, save_path=save_path)
 
                 visualization_done = True

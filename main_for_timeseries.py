@@ -31,7 +31,8 @@ def main():
     data_save_path = "match_data"
     batch_size = 32
     num_workers = 8
-    epochs = 100
+    # epochs = 100
+    epochs=1
     learning_rate = 1e-4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -61,7 +62,7 @@ def main():
         Subset(dataset, test_idx),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=True,
         persistent_workers=False,
         collate_fn=custom_collate_fn,
@@ -83,10 +84,10 @@ def main():
 
         for batch in train_dataloader:
             condition = batch['condition'].to(device)  # [B, T, 158]
-            target = batch['target'].to(device)        # [B, T, 22] (11 defenders × (x, y))
+            target = batch['target'].to(device)        # [B, T, 22]
             pred = model(condition)                    # [B, T, 22]
 
-            # 선수별 (x, y) MSE → 평균
+            # 선수별 경로 MSE 구한 후 평균
             pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)      # [B, T, 11, 2]
             target = target.view(target.shape[0], target.shape[1], 11, 2)  # [B, T, 11, 2]
 
@@ -130,11 +131,11 @@ def main():
             pred = pred.clone()
             target = target.clone()
 
-            pred[..., 0] = (pred[..., 0] + 1.0) * x_scales
-            pred[..., 1] = (pred[..., 1] + 1.0) * y_scales
-            target[..., 0] = (target[..., 0] + 1.0) * x_scales
-            target[..., 1] = (target[..., 1] + 1.0) * y_scales
-
+            pred[..., 0] *= x_scales
+            pred[..., 1] *= y_scales
+            target[..., 0] *= x_scales
+            target[..., 1] *= y_scales
+            
             # Player-wise ADE
             ade = ((pred - target) ** 2).sum(-1).sqrt().mean(1).mean(1)  # [B]
             all_ade.extend(ade.cpu().numpy())
@@ -153,18 +154,6 @@ def main():
                     pred_vis = pred[i].cpu()
                     pitch_scale = batch["pitch_scale"][i]
                     
-                    # --- Debug ---
-                    if i == 0:
-                        print(f"\n[DEBUG] Sample {i} Info")
-                        print(f"→ others.shape : {others.shape}")       
-                        print(f"→ target_vis.shape : {target_vis.shape}")
-                        print(f"→ pred_vis.shape   : {pred_vis.shape}")
-                        print(f"→ pitch_scale[i]   : {pitch_scale}")
-                        
-                        print("x_scale:", x_scales[0].item())
-                        print("y_scale:", y_scales[0].item())
-                    # --- Debug ---
-
                     save_path = f"results/LSTM_sample_{i:02d}.png"
                     plot_trajectories_on_pitch(others, target_vis, pred_vis, pitch_scale, save_path=save_path)
 
@@ -173,7 +162,6 @@ def main():
     avg_ade = np.mean(all_ade)
     avg_fde = np.mean(all_fde)
     print(f"[Inference] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
-    # 0408 : [Inference] ADE: 23.3339 | FDE: 24.0526
 
 if __name__ == "__main__":
     main()

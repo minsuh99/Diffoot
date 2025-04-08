@@ -335,16 +335,16 @@ class MultiMatchSoccerDataset(Dataset):
             self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
         x_scale, y_scale = self.pitch_cache[match_id]
 
-        target_seq[target_columns[0::2]] = (target_seq[target_columns[0::2]] / x_scale) - 1.0
-        target_seq[target_columns[1::2]] = (target_seq[target_columns[1::2]] / y_scale) - 1.0
+        target_seq[target_columns[0::2]] = target_seq[target_columns[0::2]] / x_scale
+        target_seq[target_columns[1::2]] = target_seq[target_columns[1::2]] / y_scale
 
-        other_seq[other_columns[0::2]] = (other_seq[other_columns[0::2]] / x_scale) - 1.0
-        other_seq[other_columns[1::2]] = (other_seq[other_columns[1::2]] / y_scale) - 1.0
+        # other_seq[other_columns[0::2]] = other_seq[other_columns[0::2]] / x_scale
+        # other_seq[other_columns[1::2]] = other_seq[other_columns[1::2]] / y_scale
 
         condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
         condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
-        condition_seq[condition_x_cols] = (condition_seq[condition_x_cols] / x_scale) - 1.0
-        condition_seq[condition_y_cols] = (condition_seq[condition_y_cols] / y_scale) - 1.0
+        condition_seq[condition_x_cols] = condition_seq[condition_x_cols] / x_scale
+        condition_seq[condition_y_cols] = condition_seq[condition_y_cols] / y_scale
 
         # Add player's position, starter feature
         enriched_condition = []
@@ -413,6 +413,10 @@ if __name__ == "__main__":
     
     print(f"Train index: {len(train_idx)}")
     print(f"Test index: {len(test_idx)}")
+    
+    print("Condition:", sample["condition"])
+    print("Target:", sample["target"])
+    
     print("Length of condition graph seq:", len(sample["condition_graph_seq"]))
     print("Example of condition graph:", sample["condition_graph_seq"][:1] )
     
