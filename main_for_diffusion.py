@@ -1,22 +1,30 @@
 import os
 import random
+import torch
 import numpy as np
 from tqdm import tqdm
 
-import torch
 from torch.utils.data import DataLoader, Subset
-import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
-
 from utils.utils import set_seed, plot_trajectories_on_pitch
 from utils.data_utils import split_dataset_indices, custom_collate_fn
 
-
 def main():
+    # 0. Set seed
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    set_seed(42)
+    
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+    
+    g = torch.Generator()
+    g.manual_seed(42)  
+    
     # 1. Hyperparameter Setting
     # raw_data_path = "Download raw file path"
     raw_data_path = "idsse-data"
@@ -26,19 +34,7 @@ def main():
     epochs = 100
     learning_rate = 1e-4
     num_samples = 10
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    set_seed(42)
-    
-    # fix seed of data_workers
-    def seed_worker(worker_id):
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-
-    g = torch.Generator()
-    g.manual_seed(42)    
 
     # 2. Data Loading
     print("---Data Loading---")
@@ -55,6 +51,7 @@ def main():
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=False,
         collate_fn=custom_collate_fn,
         worker_init_fn=seed_worker,
         generator=g
@@ -66,7 +63,9 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn
+        persistent_workers=False,
+        collate_fn=custom_collate_fn,
+        worker_init_fn=seed_worker
     )
     print("---Data Load!---")
 

@@ -6,8 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.signal as signal
 from scipy.interpolate import CubicSpline
-import matplotlib
-import matplotlib.pyplot as plt
 from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_teamsheets_from_mat_info_xml
 
 # This code is from "https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking"
@@ -17,7 +15,8 @@ from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_
 def set_seed(seed=42):
     random.seed(seed)                 
     np.random.seed(seed)              
-    torch.manual_seed(seed)           
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)           
     torch.cuda.manual_seed_all(seed)  
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
