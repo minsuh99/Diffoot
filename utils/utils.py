@@ -21,6 +21,8 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Load team sheet information from matchinformation XML files
 def load_team_sheets(path):

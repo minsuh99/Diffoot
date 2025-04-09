@@ -1,4 +1,5 @@
 import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # For reproducability
 import random
 import torch
 import numpy as np
@@ -14,7 +15,6 @@ from utils.data_utils import split_dataset_indices, custom_collate_fn
 # 0331: LSTM 기본 모델 사용중
 def main():
     # 0. Set seed
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     set_seed(42)
     
     def seed_worker(worker_id):
