@@ -1,16 +1,16 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
-from models.encoder import InteractionGraphEncoder
+from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
 from utils.utils import set_evertyhing, worker_init_fn, generator, plot_trajectories_on_pitch
 from utils.data_utils import split_dataset_indices, custom_collate_fn
@@ -22,8 +22,8 @@ raw_data_path = "idsse-data"
 data_save_path = "match_data"
 batch_size = 32
 num_workers = 8
-epochs = 50
-learning_rate = 1e-4
+epochs = 1
+learning_rate = 2e-4
 num_samples = 10
 SEED = 42
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -88,21 +88,27 @@ graph = build_graph_sequence_from_condition({
 }).to(device)
 in_dim = graph['Node'].x.size(1)
 
+# Extract target's history trajectories from condition
+condition_columns = sample["condition_columns"]
+target_columns    = sample["target_columns"]
+target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
+
 csdi_config = {
     "num_steps": 500,
     "channels": 256,
     "diffusion_embedding_dim": 128,
     "nheads": 4,
     "layers": 10,
-    "side_dim": 128
+    # "side_dim": 128
+    "side_dim": 256
 }
 
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
+history_encoder = TargetTrajectoryEncoder().to(device)
 denoiser = diff_CSDI(csdi_config)
 model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, threshold=1e-4)
-
 # 4. Train
 best_state_dict = None
 best_val_loss = float("inf")
@@ -117,14 +123,22 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
-        cond = batch["condition"]                            # [B, T, F]
-        target = batch["target"].to(device).view(-1, cond.size(1), 11, 2)  # [B, T, 11, 2]
+        cond = batch["condition"].to(device)
+        B, T, _ = cond.shape
+        target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
         graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
         # graph → H
         H = graph_encoder(graph_batch)                                       # [B, 128]
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, cond.size(1))                    # [B,128,11,T]
-
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        
+        # Target's history trajectories
+        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+        hist_rep = history_encoder(hist)  # [B, 128]
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        
+        # Concat conditions
+        cond_info = torch.cat([cond_H, cond_hist], dim=1)
         # Preparing Self-conditioning data
         if torch.rand(1, device=device) < 0.5:
             s = torch.zeros_like(target)
@@ -133,13 +147,13 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 t = torch.randint(0, model.num_steps, (target.size(0),), device=device)
                 x_t, noise = model.q_sample(target, t)
                 x_t = x_t.permute(0,3,2,1)
-                eps_pred1 = model.model(x_t, t, cond_H, self_cond=None)
+                eps_pred1 = model.model(x_t, t, cond_info, self_cond=None)
                 a_hat = model.alpha_hat.to(device)[t].view(-1,1,1,1)
                 x0_hat = (x_t - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
                 x0_hat = x0_hat.permute(0,3,2,1)
             s = x0_hat
         
-        noise_loss, player_loss = model(target, cond_info=cond_H, self_cond=s)
+        noise_loss, player_loss = model(target, cond_info=cond_info, self_cond=s)
         loss = noise_loss + player_loss
         
         optimizer.zero_grad()
@@ -164,16 +178,26 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation"):
-            cond = batch["condition"]
-            target = batch["target"].to(device).view(-1, cond.size(1), 11, 2)
-            graph_batch = batch["graph"].to(device)
+            cond = batch["condition"].to(device)
+            B, T, _ = cond.shape
+            target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
-            H = graph_encoder(graph_batch)
-            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, cond.size(1))
+            # graph → H
+            H = graph_encoder(graph_batch)                                       # [B, 128]
+            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            
+            # Target's history trajectories
+            hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+            hist_rep = history_encoder(hist)  # [B, 128]
+            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+            
+            # Concat conditions
+            cond_info = torch.cat([cond_H, cond_hist], dim=1)
             
             s = torch.zeros_like(target)
             
-            noise_loss, player_loss = model(target, cond_info=cond_H, self_cond=s)
+            noise_loss, player_loss = model(target, cond_info=cond_info, self_cond=s)
             val_noise_loss += noise_loss.item()
             val_player_loss += player_loss.item()
             val_total_loss += (noise_loss + player_loss).item()
@@ -193,16 +217,76 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 # 4-1. Plot learning_curve
 plt.figure(figsize=(6,4))
 plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
-plt.plot(range(1, epochs+1), val_losses,   label='Val Loss')
+plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title('Train & Validation Loss, 500 steps, 128 channels, 128 embedding dim, 4 heads, 6 layers')
+plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels, "
+          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/diffusion_lr_curve.png')
+plt.savefig('results/0423_diffusion_lr_curve.png')
 
 plt.show()
+# 5. Validation Inference (Best-of-N Sampling) & Visualization
+model.load_state_dict(best_state_dict)
+model.eval()
+all_ade, all_fde = [], []
+visualize_samples = 5
+visualization_done = False
+
+with torch.no_grad():
+    for batch in tqdm(val_dataloader, desc="Val Inference"):
+        cond = batch["condition"].to(device)
+        B, T, _ = cond.shape
+        target = batch["target"].to(device).view(B, T, 11, 2)      
+        
+        H = graph_encoder(batch["graph"].to(device))
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        
+        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+        hist_rep = history_encoder(hist)  # [B, 128]
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        
+        cond_info = torch.cat([cond_H, cond_hist], dim=1)
+
+        generated = model.generate(shape=target.shape, cond_info=cond_info, num_samples=num_samples)  # [N, B, T, 11, 2]
+
+        # Denormalize
+        scales = torch.tensor(batch["pitch_scale"],device=device, dtype=torch.float32)           # [B,2]
+        scales = scales.view(1, B, 1, 1, 2)
+        
+        generated = generated * scales
+        target_gt = target.unsqueeze(0) * scales
+
+        ade = ((generated - target_gt) ** 2).sum(-1).sqrt().mean((2, 3))  # [N, B]
+        best_idx = ade.argmin(dim=0)                                    # [B]
+        best_pred = generated[best_idx, torch.arange(B)]                # [B, T, 11, 2]
+
+        ade_final = ((best_pred - target) ** 2).sum(-1).sqrt().mean((1, 2))                               # [B]
+        fde_final = ((best_pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt()                               # [B]
+
+        all_ade.extend(ade_final.cpu().numpy())
+        all_fde.extend(fde_final.cpu().numpy())
+        
+        if not visualization_done:
+            os.makedirs("results", exist_ok=True)
+            for i in range(min(B, visualize_samples)):
+                others = batch["other"][i].view(-1,12,2).cpu().numpy()
+                target_ = target[i].cpu().numpy()   # (T,11,2)
+                pred_ = best_pred[i].cpu().numpy()     # (T,11,2)
+                
+                save_path = "results/val_trajs"
+                
+                os.makedirs(save_path, exist_ok=True)
+                for p in range(11):
+                    save_path = os.path.join(save_path, f"sample{i:02d}_def{p:02d}.png")
+                    plot_trajectories_on_pitch(others, target_, pred_, player_idx=p, save_path=save_path)
+            visualization_done = True
+
+avg_ade = np.mean(all_ade)
+avg_fde = np.mean(all_fde)
+print(f"[Inference - Best of {num_samples}] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
 
 # 5. Inference (Best-of-N Sampling) & Visualization
 model.load_state_dict(best_state_dict)
@@ -213,61 +297,51 @@ visualization_done = False
 
 with torch.no_grad():
     for batch in tqdm(test_dataloader, desc="Inference"):
-        cond = batch["condition"]
-        target = batch["target"].to(device).view(-1, cond.size(1), 11, 2)
-        graph_batch = batch["graph"].to(device)
-        B = cond.size(0)
+        cond = batch["condition"].to(device)
+        B, T, _ = cond.shape
+        target = batch["target"].to(device).view(B, T, 11, 2)      
+        
+        H = graph_encoder(batch["graph"].to(device))
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        
+        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+        hist_rep = history_encoder(hist)  # [B, 128]
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        
+        cond_info = torch.cat([cond_H, cond_hist], dim=1)
 
-        H = graph_encoder(graph_batch)
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, cond.size(1))
-
-        generated = model.generate(shape=target.shape, cond_info=cond_H, num_samples=num_samples)  # [N, B, T, 11, 2]
-        target = target.unsqueeze(0).expand(num_samples, -1, -1, -1, -1).clone()
+        generated = model.generate(shape=target.shape, cond_info=cond_info, num_samples=num_samples)  # [N, B, T, 11, 2]
 
         # Denormalize
-        x_scales = torch.tensor([s[0] for s in batch["pitch_scale"]], device=device, dtype=torch.float32).view(1, B, 1, 1).expand(num_samples, B, 1, 1)
-        y_scales = torch.tensor([s[1] for s in batch["pitch_scale"]], device=device, dtype=torch.float32).view(1, B, 1, 1).expand(num_samples, B, 1, 1)
-
-        generated[..., 0] *= x_scales
-        generated[..., 1] *= y_scales
-        target[..., 0] *= x_scales
-        target[..., 1] *= y_scales
+        scales = torch.tensor(batch["pitch_scale"],device=device, dtype=torch.float32)           # [B,2]
+        scales = scales.view(1, B, 1, 1, 2)
         
-        # generated/[0,1] → [−1,1] → 실제[m]
-        # generated[..., 0] = (generated[..., 0] - 0.5) * 2 * x_scales
-        # generated[..., 1] = (generated[..., 1] - 0.5) * 2 * y_scales
+        generated = generated * scales
+        target_gt = target.unsqueeze(0) * scales
 
-        # # target도 동일하게 복원
-        # target[..., 0] = (target[..., 0] - 0.5) * 2 * x_scales
-        # target[..., 1] = (target[..., 1] - 0.5) * 2 * y_scales
-
-        ade = ((generated - target) ** 2).sum(-1).sqrt().mean(2).mean(2)  # [N, B]
+        ade = ((generated - target_gt) ** 2).sum(-1).sqrt().mean((2, 3))  # [N, B]
         best_idx = ade.argmin(dim=0)                                    # [B]
         best_pred = generated[best_idx, torch.arange(B)]                # [B, T, 11, 2]
-        best_target = target[0, torch.arange(B)]                        # [B, T, 11, 2]
 
-        ade_final = ((best_pred - best_target) ** 2).sum(-1).sqrt() \
-                        .mean(1).mean(0)                               # [B]
-        fde_final = ((best_pred[:, -1] - best_target[:, -1]) ** 2)\
-                        .sum(-1).sqrt()                               # [B]
+        ade_final = ((best_pred - target) ** 2).sum(-1).sqrt().mean((1, 2))                               # [B]
+        fde_final = ((best_pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt()                               # [B]
 
         all_ade.extend(ade_final.cpu().numpy())
         all_fde.extend(fde_final.cpu().numpy())
         
-
         if not visualization_done:
             os.makedirs("results", exist_ok=True)
             for i in range(min(B, visualize_samples)):
                 others = batch["other"][i].view(-1,12,2).cpu().numpy()
-                target = best_target[i].cpu().numpy()   # (T,11,2)
-                pred = best_pred[i].cpu().numpy()     # (T,11,2)
+                target_ = target[i].cpu().numpy()   # (T,11,2)
+                pred_ = best_pred[i].cpu().numpy()     # (T,11,2)
                 
-                save_path = f"results/Diff_sample_{i:02d}.png"
+                save_path = "results/test_trajs"
                 
-                os.makedirs('results/player_trajs', exist_ok=True)
+                os.makedirs(save_path, exist_ok=True)
                 for p in range(11):
-                    save_path = f'results/player_trajs/sample{i:02d}_def{p:02d}.png'
-                    plot_trajectories_on_pitch(others, target, pred, player_idx=p, save_path=save_path)
+                    save_path = os.path.join(save_path, f"sample{i:02d}_def{p:02d}.png")
+                    plot_trajectories_on_pitch(others, target_, pred_, player_idx=p, save_path=save_path)
             visualization_done = True
 
 avg_ade = np.mean(all_ade)

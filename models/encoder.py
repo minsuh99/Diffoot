@@ -81,3 +81,24 @@ class InteractionGraphEncoder(nn.Module):
         batch = graph['Node'].batch
         graph_rep = self.pool(x, batch)
         return self.proj(graph_rep)  # (B, out_dim)
+
+
+class TargetTrajectoryEncoder(nn.Module):
+    def __init__(self, input_dim = 22, hidden_dim = 64, num_layers = 1, bidirectional = True, rnn_type = "gru"):
+        super().__init__()
+        self.rnn_type = rnn_type.lower()
+        self.num_directions = 2 if bidirectional else 1
+        self.hidden_dim = hidden_dim
+        rnn_cls = nn.LSTM if self.rnn_type == "lstm" else nn.GRU
+
+        self.rnn = rnn_cls(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=bidirectional)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, h_n = self.rnn(x)
+        if self.rnn_type == "lstm":
+            h_n = h_n[0]
+
+        last = h_n.view(self.rnn.num_layers, self.num_directions, x.size(0), self.hidden_dim)[-1]
+
+        concat = last.permute(1, 0, 2).reshape(x.size(0), -1)  # (B, hidden_dim * num_directions)
+        return concat
