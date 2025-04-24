@@ -352,10 +352,9 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
     ax.scatter(ball_x[-1], ball_y[-1], color='black', s=30, marker='o', alpha=1.0)
 
     # 2) defenders GT / Pred
-    idxs = [player_idx] if player_idx is not None else list(range(11))
-    for i in idxs:
+    for i in range(11):
         x, y = target[:, i, 0], target[:, i, 1]
-        ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target' if i == idxs[0] else None)
+        ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target' if i == 0 else None)
         ax.scatter(x[-1], y[-1], color='blue', s=50, marker='o', alpha=0.7)
         
         if annotate and target_columns is not None:
@@ -365,14 +364,14 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
             ax.text(x0 + 0.5, y0 + 0.5, jersey, color='blue', fontsize=10)
         
         x, y = pred[:, i, 0], pred[:, i, 1]
-        ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted' if i == idxs[0] else None)
+        ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted' if i == 0 else None)
         ax.scatter(x[-1], y[-1], color='blue', s=50, marker='x', alpha=0.5)
         
         if annotate and target_columns is not None:
             col_x = target_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]
             x0, y0 = pred[0, m, 0], pred[0, m, 1]
-            ax.text(x0 + 0.5, y0 + 0.5, jersey + '(pred)', color='blue', fontsize=10)
+            ax.text(x0 + 0.5, y0 + 0.5, f"{jersey}(pred)", color='blue', fontsize=10)
 
     ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=True)
 

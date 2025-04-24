@@ -22,9 +22,9 @@ raw_data_path = "idsse-data"
 data_save_path = "match_data"
 batch_size = 32
 num_workers = 8
-epochs = 50
+epochs = 1
 learning_rate = 2e-4
-num_samples = 10
+num_samples = 1
 SEED = 42
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 os.environ["CUDA_LAUNCH_BLOCKING"]   = "1"
@@ -100,7 +100,7 @@ in_dim = graph['Node'].x.size(1)
 
 # Extract target's history trajectories from condition
 condition_columns = sample["condition_columns"]
-target_columns    = sample["target_columns"]
+target_columns = sample["target_columns"]
 target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
 
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
@@ -134,7 +134,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
         # Target's history trajectories
-        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+        hist = cond[:, :, target_idx].to(device) 
         hist_rep = history_encoder(hist)  # [B, 128]
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
         
@@ -155,7 +155,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             s = x0_hat
         
         noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss_mse + player_loss_frechet
+        loss = noise_loss + player_loss_mse + player_loss_frechet * 2
         
         optimizer.zero_grad()
         loss.backward()
@@ -163,7 +163,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
         train_noise_loss += noise_loss.item()
         train_mse_loss += player_loss_mse.item()
-        train_frechet_loss += player_loss_frechet.item()
+        train_frechet_loss += (player_loss_frechet * 2).item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
@@ -202,10 +202,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             s = torch.zeros_like(target)
             
             noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
+            val_loss = noise_loss + player_loss_mse + player_loss_frechet * 2
+            
             val_noise_loss += noise_loss.item()
             val_mse_loss += player_loss_mse.item()
-            val_frechet_loss += player_loss_frechet.item()
-            val_total_loss += (noise_loss + player_loss_mse + player_loss_frechet).item()
+            val_frechet_loss += (player_loss_frechet * 2).item()
+            val_total_loss += val_loss.item()
 
     avg_val_noise_loss = val_noise_loss / len(val_dataloader)
     avg_val_mse_loss = val_mse_loss / len(val_dataloader)
@@ -224,7 +226,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         best_state_dict = model.state_dict()
         
 # 4-1. Plot learning_curve
-plt.figure(figsize=(6,4))
+plt.figure(figsize=(8, 6))
 plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
@@ -293,12 +295,31 @@ with torch.no_grad():
 
         # 처음 한 번만 visualization
         if not visualized:
-            os.makedirs("results/val_trajs", exist_ok=True)
-            
+            base_dir = "results/val_trajs"
+            os.makedirs(base_dir, exist_ok=True)
+
+            # 한 배치의 컬럼 정보 가져오기
+            other_cols  = batch["other_columns"][0]
+            target_cols = batch["target_columns"][0]
+
+            defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
+
             for i in range(min(B, visualize_samples)):
-                others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()  
-                plot_trajectories_on_pitch(others_seq, target_den[i].cpu().numpy(), best_pred_batch[i].cpu().numpy(), player_idx=i, save_path=f"results/val_trajs/sample{i:02d}.png")
-                
+                sample_dir = os.path.join(base_dir, f"sample{i:02d}")
+                os.makedirs(sample_dir, exist_ok=True)
+
+                others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
+                target_traj = target_den[i].cpu().numpy()
+                pred_traj = best_pred_batch[i].cpu().numpy()
+
+                # 선수별로 그림 저장
+                for idx, col_x in enumerate(defender_nums):
+                    jersey = int(col_x.split('_')[1])
+                    save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
+                    plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
+                                               other_columns=other_cols, target_columns=target_cols,
+                                               player_idx=idx, annotate=True, save_path=save_path)
+
             visualized = True
 
 # 최종 결과 출력
@@ -355,12 +376,30 @@ with torch.no_grad():
 
         # 첫 배치만 시각화
         if not visualized:
-            os.makedirs("results/test_trajs", exist_ok=True)
-            
+            base_dir = "results/test_trajs"
+            os.makedirs(base_dir, exist_ok=True)
+
+            # 한 배치의 컬럼 정보 가져오기
+            other_cols  = batch["other_columns"][0]
+            target_cols = batch["target_columns"][0]
+            # defender 저지 번호 추출 (예: 'Home_5_x' → 5)
+
             for i in range(min(B, visualize_samples)):
+                sample_dir = os.path.join(base_dir, f"sample{i:02d}")
+                os.makedirs(sample_dir, exist_ok=True)
+
                 others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
-                plot_trajectories_on_pitch(others_seq, target_den[i].cpu().numpy(), best_pred_t[i].cpu().numpy(), player_idx=i, save_path=f"results/test_trajs/sample{i:02d}.png")
-                
+                target_traj = target_den[i].cpu().numpy()
+                pred_traj = best_pred_t[i].cpu().numpy()
+
+                # 선수별로 그림 저장
+                for idx, col_x in enumerate(defender_nums):
+                    jersey = int(col_x.split('_')[1])
+                    save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
+                    plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
+                                               other_columns=other_cols, target_columns=target_cols,
+                                               player_idx=idx, annotate=True, save_path=save_path)
+
             visualized = True
 
 avg_test_ade = np.mean(all_best_ades_test)
