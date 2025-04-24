@@ -52,7 +52,7 @@ hyperparams = {
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 2e-4,
-    'self_conditioning_ratio': 0.5,
+    'self_conditioning_ratio': 0.2,
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     **csdi_config
