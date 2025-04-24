@@ -1,6 +1,7 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,22 +17,23 @@ from utils.utils import set_evertyhing, worker_init_fn, generator, plot_trajecto
 from utils.data_utils import split_dataset_indices, custom_collate_fn
 from utils.graph_utils import build_graph_sequence_from_condition
 
-# 1. Hyperparameter Setting
-# raw_data_path = "Download raw file path"
-raw_data_path = "idsse-data"
-data_save_path = "match_data"
-batch_size = 32
-num_workers = 8
-epochs = 1
-learning_rate = 2e-4
-num_samples = 1
+# SEED Fix
 SEED = 42
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ["CUDA_LAUNCH_BLOCKING"]   = "1"
-
 set_evertyhing(SEED)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# Save Log / Logger Setting
+model_save_path = './results/logs/'
+os.makedirs(model_save_path, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    filename=os.path.join(model_save_path, 'train.log'),
+    filemode='a'
+)
+logger = logging.getLogger()
+
+# 1. Hyperparameter Setting
 csdi_config = {
     "num_steps": 500,
     "channels": 256,
@@ -41,6 +43,33 @@ csdi_config = {
     # "side_dim": 128
     "side_dim": 256
 }
+hyperparams = {
+    'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
+    'data_save_path': "match_data",
+    'train_batch_size': 32,
+    'val_batch_size': 32,
+    'test_batch_size': 16,
+    'num_workers': 8,
+    'epochs': 50,
+    'learning_rate': 2e-4,
+    'self_conditioning_ratio': 0.5,
+    'num_samples': 10,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    **csdi_config
+}
+raw_data_path = hyperparams['raw_data_path']
+data_save_path = hyperparams['data_save_path']
+train_batch_size = hyperparams['train_batch_size']
+val_batch_size = hyperparams['val_batch_size']
+test_batch_size = hyperparams['test_batch_size']
+num_workers = hyperparams['num_workers']
+epochs = hyperparams['epochs']
+learning_rate = hyperparams['learning_rate']
+self_conditioning_ratio = hyperparams['self_conditioning_ratio']
+num_samples = hyperparams['num_samples']
+device = hyperparams['device']
+
+logger.info(f"Hyperparameters: {hyperparams}")
 
 # 2. Data Loading
 print("---Data Loading---")
@@ -54,7 +83,7 @@ train_idx, val_idx, test_idx = split_dataset_indices(dataset, val_ratio=1/6, tes
 
 train_dataloader = DataLoader(
     Subset(dataset, train_idx),
-    batch_size=batch_size,
+    batch_size=train_batch_size,
     shuffle=True,
     num_workers=num_workers,
     pin_memory=True,
@@ -66,7 +95,7 @@ train_dataloader = DataLoader(
 
 val_dataloader = DataLoader(
     Subset(dataset, val_idx),
-    batch_size=batch_size,
+    batch_size=val_batch_size,
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
@@ -77,7 +106,7 @@ val_dataloader = DataLoader(
 
 test_dataloader = DataLoader(
     Subset(dataset, test_idx),
-    batch_size=16,
+    batch_size=test_batch_size,
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
@@ -109,6 +138,14 @@ denoiser = diff_CSDI(csdi_config)
 model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4)
+
+logger.info(f"Device: {device}")
+logger.info(f"GraphEncoder: {graph_encoder}")
+logger.info(f"HistoryEncoder: {history_encoder}")
+logger.info(f"Denoiser (diff_CSDI): {denoiser}")
+logger.info(f"DiffusionTrajectoryModel: {model}")
+
+
 # 4. Train
 best_state_dict = None
 best_val_loss = float("inf")
@@ -141,7 +178,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         # Concat conditions
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
         # Preparing Self-conditioning data
-        if torch.rand(1, device=device) < 0.5:
+        if torch.rand(1, device=device) < self_conditioning_ratio:
             s = torch.zeros_like(target)
         else:
             with torch.no_grad():
@@ -155,15 +192,15 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             s = x0_hat
         
         noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss_mse + player_loss_frechet * 2
+        loss = noise_loss * 0.25 + player_loss_mse * 0.25+ player_loss_frechet * 0.5
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        train_noise_loss += noise_loss.item()
-        train_mse_loss += player_loss_mse.item()
-        train_frechet_loss += (player_loss_frechet * 2).item()
+        train_noise_loss += (noise_loss * 0.25).item()
+        train_mse_loss += (player_loss_mse * 0.25).item()
+        train_frechet_loss += (player_loss_frechet * 0.5).item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
@@ -172,6 +209,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     avg_mse_loss = train_mse_loss / num_batches
     avg_frechet_loss = train_frechet_loss / num_batches
     avg_train_loss = train_loss / num_batches
+
 
     # --- Validation ---
     model.eval()
@@ -202,11 +240,11 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             s = torch.zeros_like(target)
             
             noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
-            val_loss = noise_loss + player_loss_mse + player_loss_frechet * 2
+            val_loss = noise_loss * 0.25 + player_loss_mse * 0.25+ player_loss_frechet * 0.5
             
-            val_noise_loss += noise_loss.item()
-            val_mse_loss += player_loss_mse.item()
-            val_frechet_loss += (player_loss_frechet * 2).item()
+            val_noise_loss += (noise_loss * 0.25).item()
+            val_mse_loss += (player_loss_mse * 0.25).item()
+            val_frechet_loss += (player_loss_frechet * 0.5).item()
             val_total_loss += val_loss.item()
 
     avg_val_noise_loss = val_noise_loss / len(val_dataloader)
@@ -217,13 +255,23 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
-    tqdm.write(f"[Epoch {epoch}]\nCost: {avg_train_loss:.6f} |"
-               f"[Train] Noise Loss: {avg_noise_loss:.6f} | MSE Loss: {avg_mse_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}\n"
+    current_lr = scheduler.get_last_lr()[0]
+    logger.info(
+    f"[Epoch {epoch}/{epochs}] "
+    f"Train Loss={avg_train_loss:.6f} "
+    f"(Noise={avg_noise_loss:.6f}, MSE={avg_mse_loss:.6f}, Frechet={avg_frechet_loss:.6f}) | "
+    f"Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}"
+    )
+    
+    tqdm.write(f"[Epoch {epoch}]\n"
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | MSE Loss: {avg_mse_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | LR: {current_lr:.6f}\n"
                f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise: {avg_val_noise_loss:.6f} | MSE: {avg_val_mse_loss:.6f} | Frechet: {avg_val_frechet_loss:.6f}")
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         best_state_dict = model.state_dict()
+
+logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
         
 # 4-1. Plot learning_curve
 plt.figure(figsize=(8, 6))
@@ -240,91 +288,92 @@ plt.savefig('results/0424_diffusion_lr_curve.png')
 
 plt.show()
 
-# 5. Validation Inference (Best-of-N Sampling) & Visualization
-model.load_state_dict(best_state_dict)
-model.eval()
-all_best_ades = []
-all_best_fdes = []
-visualize_samples = 5
-visualized = False
+# # 5. Validation Inference (Best-of-N Sampling) & Visualization
+# model.load_state_dict(best_state_dict)
+# model.eval()
+# all_best_ades = []
+# all_best_fdes = []
+# visualize_samples = 5
+# visualized = False
 
-with torch.no_grad():
-    for batch in tqdm(val_dataloader, desc="Val Streaming Inference"):
-        cond = batch["condition"].to(device)
-        B, T, _ = cond.shape
-        target = batch["target"].to(device).view(B, T, 11, 2)
+# with torch.no_grad():
+#     for batch in tqdm(val_dataloader, desc="Val Streaming Inference"):
+#         cond = batch["condition"].to(device)
+#         B, T, _ = cond.shape
+#         target = batch["target"].to(device).view(B, T, 11, 2)
 
-        # Graph → H
-        graph_batch = batch["graph"].to(device)
-        H = graph_encoder(graph_batch)
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+#         # Graph → H
+#         graph_batch = batch["graph"].to(device)
+#         H = graph_encoder(graph_batch)
+#         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
 
-        # History → cond_hist
-        hist = cond[:, :, target_idx].to(device)
-        hist_rep  = history_encoder(hist)
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+#         # History → cond_hist
+#         hist = cond[:, :, target_idx].to(device)
+#         hist_rep  = history_encoder(hist)
+#         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
 
-        cond_info = torch.cat([cond_H, cond_hist], dim=1)
-        best_ade_batch = torch.full((B,), float("inf"), device=device)
-        best_pred_batch= torch.zeros_like(target)
-        best_fde_batch = torch.full((B,), float("inf"), device=device)
+#         cond_info = torch.cat([cond_H, cond_hist], dim=1)
+#         best_ade_batch = torch.full((B,), float("inf"), device=device)
+#         best_pred_batch= torch.zeros_like(target)
+#         best_fde_batch = torch.full((B,), float("inf"), device=device)
         
-        scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
-        scales = scales.view(B, 1, 1, 2)
+#         scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
+#         scales = scales.view(B, 1, 1, 2)
 
-        for _ in tqdm(range(num_samples), desc="Generating..."):  # num_samples = 10
-            pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]  # (B, T, 11, 2)
+#         for _ in tqdm(range(num_samples), desc="Generating..."):  # num_samples = 10
+#             pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]  # (B, T, 11, 2)
             
-            pred_i_den = pred_i * scales
-            target_den = target * scales
+#             pred_i_den = pred_i * scales
+#             target_den = target * scales
             
-            # ADE/FDE 계산
-            ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
-            fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
+#             # ADE/FDE 계산
+#             ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
+#             fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
 
-            better = ade_i < best_ade_batch
+#             better = ade_i < best_ade_batch
             
-            best_pred_batch[better] = pred_i_den[better]
-            best_ade_batch[better] = ade_i[better]
-            best_fde_batch[better] = fde_i[better]
+#             best_pred_batch[better] = pred_i_den[better]
+#             best_ade_batch[better] = ade_i[better]
+#             best_fde_batch[better] = fde_i[better]
 
-        all_best_ades.extend(best_ade_batch.cpu().tolist())
-        all_best_fdes.extend(best_fde_batch.cpu().tolist())
+#         all_best_ades.extend(best_ade_batch.cpu().tolist())
+#         all_best_fdes.extend(best_fde_batch.cpu().tolist())
 
-        # Visualization
-        if not visualized:
-            base_dir = "results/val_trajs"
-            os.makedirs(base_dir, exist_ok=True)
-            for i in range(min(B, visualize_samples)):
-                sample_dir = os.path.join(base_dir, f"sample{i:02d}")
-                os.makedirs(sample_dir, exist_ok=True)
+#         # Visualization
+#         if not visualized:
+#             base_dir = "results/val_trajs"
+#             os.makedirs(base_dir, exist_ok=True)
+#             for i in range(min(B, visualize_samples)):
+#                 sample_dir = os.path.join(base_dir, f"sample{i:02d}")
+#                 os.makedirs(sample_dir, exist_ok=True)
                 
-                other_cols  = batch["other_columns"][i]
-                target_cols = batch["target_columns"][i]
-                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
+#                 other_cols  = batch["other_columns"][i]
+#                 target_cols = batch["target_columns"][i]
+#                 defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
 
-                others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
-                target_traj = target_den[i].cpu().numpy()
-                pred_traj = best_pred_batch[i].cpu().numpy()
+#                 others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
+#                 target_traj = target_den[i].cpu().numpy()
+#                 pred_traj = best_pred_batch[i].cpu().numpy()
 
-                for idx, jersey in enumerate(defender_nums):
-                    save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
-                    plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
-                                               other_columns=other_cols, target_columns=target_cols,
-                                               player_idx=idx, annotate=True, save_path=save_path)
+#                 for idx, jersey in enumerate(defender_nums):
+#                     save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
+#                     plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
+#                                                other_columns=other_cols, target_columns=target_cols,
+#                                                player_idx=idx, annotate=True, save_path=save_path)
 
-            visualized = True
+#             visualized = True
 
-# 최종 결과 출력
-avg_val_ade = np.mean(all_best_ades)
-avg_val_fde = np.mean(all_best_fdes)
-print(f"[Val Best-of-{num_samples}] Average ADE: {avg_val_ade:.4f} | Average FDE: {avg_val_fde:.4f}")
-print(f"[Val Best-of-{num_samples}] Best ADE overall: {min(all_best_ades):.4f} | Best FDE overall: {min(all_best_fdes):.4f}")
+# # 최종 결과 출력
+# avg_val_ade = np.mean(all_best_ades)
+# avg_val_fde = np.mean(all_best_fdes)
+# print(f"[Val Best-of-{num_samples}] Average ADE: {avg_val_ade:.4f} | Average FDE: {avg_val_fde:.4f}")
+# print(f"[Val Best-of-{num_samples}] Best ADE overall: {min(all_best_ades):.4f} | Best FDE overall: {min(all_best_fdes):.4f}")
 
 # 5. Inference (Best-of-N Sampling) & Visualization
 model.eval()
 all_best_ades_test = []
 all_best_fdes_test = []
+visualize_samples = 5
 visualized = False
 
 with torch.no_grad():
@@ -381,7 +430,7 @@ with torch.no_grad():
 
                 others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
                 target_traj = target_den[i].cpu().numpy()
-                pred_traj = best_pred_batch[i].cpu().numpy()
+                pred_traj = best_pred_t[i].cpu().numpy()
 
                 for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
