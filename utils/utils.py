@@ -227,6 +227,13 @@ def correct_all_player_jumps_adjacent(df: pd.DataFrame, framerate=25.0, maxspeed
     return corrected_df
 
 
+def per_player_frechet_loss(pred, target):
+    # pred, target (B, T, N=11, 2)
+    dists = torch.norm(pred - target, dim=-1) # (B, T, N)
+    max_dists = dists.max(dim=1).values # (B, N)
+    return max_dists.mean()
+
+
 def plot_pitch( field_dimen = (106.0,68.0), field_color ='green', linewidth=2, markersize=20):
     """ plot_pitch
     
@@ -331,25 +338,36 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
 
     # 1) attackers
     for m in range(11):
-        ax.plot(others[:, m, 0], others[:, m, 1], color='red', linestyle='-', linewidth=2.0, marker = 'o', markersize = 10, alpha = 0.7, label='Attackers' if m == 0 else None)
+        x, y = others[:, m, 0], others[:, m, 1]
+        ax.plot(x, y, color='red', linestyle='-', linewidth=2.0, alpha = 0.7, label='Attackers' if m == 0 else None)
+        ax.scatter(x[-1], y[-1], color='red', s=50, marker='o', alpha=0.7)
         if annotate and other_columns is not None:
             col_x = other_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]
             x0, y0 = others[0, m, 0], others[0, m, 1]
             ax.text(x0 + 0.5, y0 + 0.5, jersey, color='red', fontsize=10)
     # ball
-    ax.plot(others[:, 11, 0], others[:, 11, 1], color='black', linestyle='-', linewidth=2.0, marker = 'o', markersize = 6, alpha = 1.0, label='Ball')
+    ball_x, ball_y = others[:, 11, 0], others[:, 11, 1]
+    ax.plot(ball_x, ball_y, color='black', linestyle='-', linewidth=2.0, alpha = 1.0, label='Ball')
+    ax.scatter(ball_x[-1], ball_y[-1], color='black', s=30, marker='o', alpha=1.0)
 
     # 2) defenders GT / Pred
     idxs = [player_idx] if player_idx is not None else list(range(11))
     for i in idxs:
-        ax.plot(target[:, i, 0], target[:, i, 1], color='blue', linestyle='-', linewidth=2.0, alpha=0.7, marker = 'o', markersize = 10, label='Target' if i == idxs[0] else None)
+        x, y = target[:, i, 0], target[:, i, 1]
+        ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target' if i == idxs[0] else None)
+        ax.scatter(x[-1], y[-1], color='blue', s=50, marker='o', alpha=0.7)
+        
         if annotate and target_columns is not None:
             col_x = target_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]
             x0, y0 = target[0, m, 0], target[0, m, 1]
             ax.text(x0 + 0.5, y0 + 0.5, jersey, color='blue', fontsize=10)
-        ax.plot(pred[:, i, 0], pred[:, i, 1], color='blue', linestyle='--', linewidth=2.0, alpha=0.5, marker = 'x', markersize = 10, label='Predicted' if i == idxs[0] else None)
+        
+        x, y = pred[:, i, 0], pred[:, i, 1]
+        ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted' if i == idxs[0] else None)
+        ax.scatter(x[-1], y[-1], color='blue', s=50, marker='x', alpha=0.5)
+        
         if annotate and target_columns is not None:
             col_x = target_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]

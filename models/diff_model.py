@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.utils import per_player_frechet_loss
 
 class DiffusionTrajectoryModel(nn.Module):
     def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
@@ -55,10 +56,12 @@ class DiffusionTrajectoryModel(nn.Module):
 
         x_0 = x_0.to(device)
 
-        player_loss = F.mse_loss(x_0_pred, x_0, reduction='none')
-        player_loss = player_loss.mean(dim=[1, 3]).mean()
+        player_loss_mse = F.mse_loss(x_0_pred, x_0, reduction='none')
+        player_loss_mse = player_loss_mse.mean(dim=[1, 3]).mean()
 
-        return noise_loss, player_loss
+        player_frechet_loss = per_player_frechet_loss(x_0_pred, x_0)
+        
+        return noise_loss, player_loss_mse, player_frechet_loss
 
     @torch.no_grad()
     def generate(self, shape, cond_info=None, num_samples=10):

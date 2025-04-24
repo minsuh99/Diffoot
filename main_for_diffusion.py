@@ -22,7 +22,7 @@ raw_data_path = "idsse-data"
 data_save_path = "match_data"
 batch_size = 32
 num_workers = 8
-epochs = 1
+epochs = 50
 learning_rate = 2e-4
 num_samples = 10
 SEED = 42
@@ -31,6 +31,16 @@ os.environ["CUDA_LAUNCH_BLOCKING"]   = "1"
 
 set_evertyhing(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+csdi_config = {
+    "num_steps": 500,
+    "channels": 256,
+    "diffusion_embedding_dim": 128,
+    "nheads": 4,
+    "layers": 10,
+    # "side_dim": 128
+    "side_dim": 256
+}
 
 # 2. Data Loading
 print("---Data Loading---")
@@ -93,22 +103,12 @@ condition_columns = sample["condition_columns"]
 target_columns    = sample["target_columns"]
 target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
 
-csdi_config = {
-    "num_steps": 500,
-    "channels": 256,
-    "diffusion_embedding_dim": 128,
-    "nheads": 4,
-    "layers": 10,
-    # "side_dim": 128
-    "side_dim": 256
-}
-
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
-history_encoder = TargetTrajectoryEncoder().to(device)
+history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
 denoiser = diff_CSDI(csdi_config)
 model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, threshold=1e-4)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4)
 # 4. Train
 best_state_dict = None
 best_val_loss = float("inf")
@@ -119,7 +119,8 @@ val_losses   = []
 for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     model.train()
     train_noise_loss = 0
-    train_player_loss = 0
+    train_mse_loss = 0
+    train_frechet_loss = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
@@ -153,27 +154,30 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 x0_hat = x0_hat.permute(0,3,2,1)
             s = x0_hat
         
-        noise_loss, player_loss = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss
+        noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
+        loss = noise_loss + player_loss_mse + player_loss_frechet
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         train_noise_loss += noise_loss.item()
-        train_player_loss += player_loss.item()
+        train_mse_loss += player_loss_mse.item()
+        train_frechet_loss += player_loss_frechet.item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
     
     avg_noise_loss = train_noise_loss / num_batches
-    avg_player_loss = train_player_loss / num_batches
+    avg_mse_loss = train_mse_loss / num_batches
+    avg_frechet_loss = train_frechet_loss / num_batches
     avg_train_loss = train_loss / num_batches
 
     # --- Validation ---
     model.eval()
     val_noise_loss = 0
-    val_player_loss = 0
+    val_mse_loss = 0
+    val_frechet_loss = 0
     val_total_loss = 0
 
     with torch.no_grad():
@@ -197,18 +201,23 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             
             s = torch.zeros_like(target)
             
-            noise_loss, player_loss = model(target, cond_info=cond_info, self_cond=s)
+            noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
             val_noise_loss += noise_loss.item()
-            val_player_loss += player_loss.item()
-            val_total_loss += (noise_loss + player_loss).item()
+            val_mse_loss += player_loss_mse.item()
+            val_frechet_loss += player_loss_frechet.item()
+            val_total_loss += (noise_loss + player_loss_mse + player_loss_frechet).item()
 
+    avg_val_noise_loss = val_noise_loss / len(val_dataloader)
+    avg_val_mse_loss = val_mse_loss / len(val_dataloader)
+    avg_val_frechet_loss = val_frechet_loss / len(val_dataloader)
     avg_val_loss = val_total_loss / len(val_dataloader)
   
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
-    tqdm.write(f"[Epoch {epoch}]\nCost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Player Loss: {avg_player_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}\n"
-               f"Val Loss: {avg_val_loss:.6f} | Noise: {val_noise_loss/len(val_dataloader):.6f} | Player: {val_player_loss/len(val_dataloader):.6f}")
+    tqdm.write(f"[Epoch {epoch}]\nCost: {avg_train_loss:.6f} |"
+               f"[Train] Noise Loss: {avg_noise_loss:.6f} | MSE Loss: {avg_mse_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise: {avg_val_noise_loss:.6f} | MSE: {avg_val_mse_loss:.6f} | Frechet: {avg_val_frechet_loss:.6f}")
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
@@ -225,125 +234,136 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0423_diffusion_lr_curve.png')
+plt.savefig('results/0424_diffusion_lr_curve.png')
 
 plt.show()
+
 # 5. Validation Inference (Best-of-N Sampling) & Visualization
 model.load_state_dict(best_state_dict)
 model.eval()
-all_ade, all_fde = [], []
+all_best_ades = []
+all_best_fdes = []
 visualize_samples = 5
-visualization_done = False
+visualized = False
 
 with torch.no_grad():
-    for batch in tqdm(val_dataloader, desc="Val Inference"):
+    for batch in tqdm(val_dataloader, desc="Val Streaming Inference"):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(B, T, 11, 2)      
-        
-        H = graph_encoder(batch["graph"].to(device))
+        target = batch["target"].to(device).view(B, T, 11, 2)
+
+        # Graph → H
+        graph_batch = batch["graph"].to(device)
+        H = graph_encoder(graph_batch)
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-        
-        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
-        hist_rep = history_encoder(hist)  # [B, 128]
+
+        # History → cond_hist
+        hist = cond[:, :, target_idx].to(device)
+        hist_rep  = history_encoder(hist)
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
-        
+
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
-
-        generated = model.generate(shape=target.shape, cond_info=cond_info, num_samples=num_samples)  # [N, B, T, 11, 2]
-
-        # Denormalize
-        scales = torch.tensor(batch["pitch_scale"],device=device, dtype=torch.float32)           # [B,2]
-        scales = scales.view(1, B, 1, 1, 2)
+        best_ade_batch = torch.full((B,), float("inf"), device=device)
+        best_pred_batch= torch.zeros_like(target)
+        best_fde_batch = torch.full((B,), float("inf"), device=device)
         
-        generated = generated * scales
-        target_gt = target.unsqueeze(0) * scales
+        scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
+        scales = scales.view(B, 1, 1, 2)
 
-        ade = ((generated - target_gt) ** 2).sum(-1).sqrt().mean((2, 3))  # [N, B]
-        best_idx = ade.argmin(dim=0)                                    # [B]
-        best_pred = generated[best_idx, torch.arange(B)]                # [B, T, 11, 2]
+        for _ in tqdm(range(num_samples), desc="Generating..."):  # num_samples = 10
+            # 1개씩 생성
+            pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]  # (B, T, 11, 2)
+            
+            pred_i_den = pred_i * scales
+            target_den = target * scales
+            
+            # ADE/FDE 계산
+            ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
+            fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
 
-        ade_final = ((best_pred - target) ** 2).sum(-1).sqrt().mean((1, 2))                               # [B]
-        fde_final = ((best_pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt()                               # [B]
+            better = ade_i < best_ade_batch
+            
+            best_pred_batch[better] = pred_i_den[better]
+            best_ade_batch[better] = ade_i[better]
+            best_fde_batch[better] = fde_i[better]
 
-        all_ade.extend(ade_final.cpu().numpy())
-        all_fde.extend(fde_final.cpu().numpy())
-        
-        if not visualization_done:
-            os.makedirs("results", exist_ok=True)
+        # 결과 저장
+        all_best_ades.extend(best_ade_batch.cpu().tolist())
+        all_best_fdes.extend(best_fde_batch.cpu().tolist())
+
+        # 처음 한 번만 visualization
+        if not visualized:
+            os.makedirs("results/val_trajs", exist_ok=True)
+            
             for i in range(min(B, visualize_samples)):
-                others = batch["other"][i].view(-1,12,2).cpu().numpy()
-                target_ = target[i].cpu().numpy()   # (T,11,2)
-                pred_ = best_pred[i].cpu().numpy()     # (T,11,2)
+                others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()  
+                plot_trajectories_on_pitch(others_seq, target_den[i].cpu().numpy(), best_pred_batch[i].cpu().numpy(), player_idx=i, save_path=f"results/val_trajs/sample{i:02d}.png")
                 
-                save_path = "results/val_trajs"
-                
-                os.makedirs(save_path, exist_ok=True)
-                for p in range(11):
-                    save_path = os.path.join(save_path, f"sample{i:02d}_def{p:02d}.png")
-                    plot_trajectories_on_pitch(others, target_, pred_, player_idx=p, save_path=save_path)
-            visualization_done = True
+            visualized = True
 
-avg_ade = np.mean(all_ade)
-avg_fde = np.mean(all_fde)
-print(f"[Inference - Best of {num_samples}] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
+# 최종 결과 출력
+avg_val_ade = np.mean(all_best_ades)
+avg_val_fde = np.mean(all_best_fdes)
+print(f"[Val Best-of-{num_samples}] Average ADE: {avg_val_ade:.4f} | Average FDE: {avg_val_fde:.4f}")
+print(f"[Val Best-of-{num_samples}] Best ADE overall: {min(all_best_ades):.4f} | Best FDE overall: {min(all_best_fdes):.4f}")
 
 # 5. Inference (Best-of-N Sampling) & Visualization
-model.load_state_dict(best_state_dict)
 model.eval()
-all_ade, all_fde = [], []
-visualize_samples = 5
-visualization_done = False
+all_best_ades_test = []
+all_best_fdes_test = []
+visualized = False
 
 with torch.no_grad():
-    for batch in tqdm(test_dataloader, desc="Inference"):
+    for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(B, T, 11, 2)      
-        
-        H = graph_encoder(batch["graph"].to(device))
+        target = batch["target"].to(device).view(B, T, 11, 2)
+
+        graph_batch  = batch["graph"].to(device)
+        H = graph_encoder(graph_batch)
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
-        hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
-        hist_rep = history_encoder(hist)  # [B, 128]
+        hist = cond[:, :, target_idx].to(device)
+        hist_rep = history_encoder(hist)
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
-        
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
 
-        generated = model.generate(shape=target.shape, cond_info=cond_info, num_samples=num_samples)  # [N, B, T, 11, 2]
+        best_ade_t = torch.full((B,), float("inf"), device=device)
+        best_pred_t = torch.zeros_like(target)
+        best_fde_t = torch.full((B,), float("inf"), device=device)
+                    
+        scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
+        scales = scales.view(B, 1, 1, 2)
 
-        # Denormalize
-        scales = torch.tensor(batch["pitch_scale"],device=device, dtype=torch.float32)           # [B,2]
-        scales = scales.view(1, B, 1, 1, 2)
-        
-        generated = generated * scales
-        target_gt = target.unsqueeze(0) * scales
+        for _ in tqdm(range(num_samples), desc="Generating..."):
+            pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]
 
-        ade = ((generated - target_gt) ** 2).sum(-1).sqrt().mean((2, 3))  # [N, B]
-        best_idx = ade.argmin(dim=0)                                    # [B]
-        best_pred = generated[best_idx, torch.arange(B)]                # [B, T, 11, 2]
+            pred_i_den = pred_i * scales
+            target_den = target * scales
+            
+            ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
+            fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
+            
+            better = ade_i < best_ade_t
+            
+            best_pred_t[better] = pred_i_den[better]
+            best_ade_t[better] = ade_i[better]
+            best_fde_t[better] = fde_i[better]
 
-        ade_final = ((best_pred - target) ** 2).sum(-1).sqrt().mean((1, 2))                               # [B]
-        fde_final = ((best_pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt()                               # [B]
+        all_best_ades_test.extend(best_ade_t.cpu().tolist())
+        all_best_fdes_test.extend(best_fde_t.cpu().tolist())
 
-        all_ade.extend(ade_final.cpu().numpy())
-        all_fde.extend(fde_final.cpu().numpy())
-        
-        if not visualization_done:
-            os.makedirs("results", exist_ok=True)
+        # 첫 배치만 시각화
+        if not visualized:
+            os.makedirs("results/test_trajs", exist_ok=True)
+            
             for i in range(min(B, visualize_samples)):
-                others = batch["other"][i].view(-1,12,2).cpu().numpy()
-                target_ = target[i].cpu().numpy()   # (T,11,2)
-                pred_ = best_pred[i].cpu().numpy()     # (T,11,2)
+                others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
+                plot_trajectories_on_pitch(others_seq, target_den[i].cpu().numpy(), best_pred_t[i].cpu().numpy(), player_idx=i, save_path=f"results/test_trajs/sample{i:02d}.png")
                 
-                save_path = "results/test_trajs"
-                
-                os.makedirs(save_path, exist_ok=True)
-                for p in range(11):
-                    save_path = os.path.join(save_path, f"sample{i:02d}_def{p:02d}.png")
-                    plot_trajectories_on_pitch(others, target_, pred_, player_idx=p, save_path=save_path)
-            visualization_done = True
+            visualized = True
 
-avg_ade = np.mean(all_ade)
-avg_fde = np.mean(all_fde)
-print(f"[Inference - Best of {num_samples}] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
+avg_test_ade = np.mean(all_best_ades_test)
+avg_test_fde = np.mean(all_best_fdes_test)
+print(f"[Test Best-of-{num_samples}] Average ADE: {avg_test_ade:.4f} | Average FDE: {avg_test_fde:.4f}")
+print(f"[Test Best-of-{num_samples}] Best ADE overall: {min(all_best_ades_test):.4f} | Best FDE overall: {min(all_best_fdes_test):.4f}")
