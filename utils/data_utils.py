@@ -111,7 +111,9 @@ def split_dataset_indices(dataset, val_ratio=(1/6), test_ratio=(1/6), random_see
 def custom_collate_fn(batch):
     collated = {}
     for key in batch[0]:
-        if key == "graph":
+        if key in ("other_columns", "target_columns", "condition_columns"):
+            collated[key] = [b[key] for b in batch]
+        elif key == "graph":
             collated[key] = GeoBatch.from_data_list([b["graph"] for b in batch])
         elif key == "pitch_scale":
             collated[key] = [b["pitch_scale"] for b in batch]

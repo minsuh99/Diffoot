@@ -273,7 +273,6 @@ with torch.no_grad():
         scales = scales.view(B, 1, 1, 2)
 
         for _ in tqdm(range(num_samples), desc="Generating..."):  # num_samples = 10
-            # 1개씩 생성
             pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]  # (B, T, 11, 2)
             
             pred_i_den = pred_i * scales
@@ -289,32 +288,26 @@ with torch.no_grad():
             best_ade_batch[better] = ade_i[better]
             best_fde_batch[better] = fde_i[better]
 
-        # 결과 저장
         all_best_ades.extend(best_ade_batch.cpu().tolist())
         all_best_fdes.extend(best_fde_batch.cpu().tolist())
 
-        # 처음 한 번만 visualization
+        # Visualization
         if not visualized:
             base_dir = "results/val_trajs"
             os.makedirs(base_dir, exist_ok=True)
-
-            # 한 배치의 컬럼 정보 가져오기
-            other_cols  = batch["other_columns"][0]
-            target_cols = batch["target_columns"][0]
-
-            defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
-
             for i in range(min(B, visualize_samples)):
                 sample_dir = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(sample_dir, exist_ok=True)
+                
+                other_cols  = batch["other_columns"][i]
+                target_cols = batch["target_columns"][i]
+                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
 
                 others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
                 target_traj = target_den[i].cpu().numpy()
                 pred_traj = best_pred_batch[i].cpu().numpy()
 
-                # 선수별로 그림 저장
-                for idx, col_x in enumerate(defender_nums):
-                    jersey = int(col_x.split('_')[1])
+                for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
                                                other_columns=other_cols, target_columns=target_cols,
@@ -374,27 +367,23 @@ with torch.no_grad():
         all_best_ades_test.extend(best_ade_t.cpu().tolist())
         all_best_fdes_test.extend(best_fde_t.cpu().tolist())
 
-        # 첫 배치만 시각화
+        # Visualization
         if not visualized:
             base_dir = "results/test_trajs"
             os.makedirs(base_dir, exist_ok=True)
-
-            # 한 배치의 컬럼 정보 가져오기
-            other_cols  = batch["other_columns"][0]
-            target_cols = batch["target_columns"][0]
-            # defender 저지 번호 추출 (예: 'Home_5_x' → 5)
-
             for i in range(min(B, visualize_samples)):
                 sample_dir = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(sample_dir, exist_ok=True)
+                
+                other_cols  = batch["other_columns"][i]
+                target_cols = batch["target_columns"][i]
+                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
 
                 others_seq = batch["other"][i].view(T, 12, 2).cpu().numpy()
                 target_traj = target_den[i].cpu().numpy()
-                pred_traj = best_pred_t[i].cpu().numpy()
+                pred_traj = best_pred_batch[i].cpu().numpy()
 
-                # 선수별로 그림 저장
-                for idx, col_x in enumerate(defender_nums):
-                    jersey = int(col_x.split('_')[1])
+                for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(sample_dir, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(others_seq, target_traj, pred_traj,
                                                other_columns=other_cols, target_columns=target_cols,
