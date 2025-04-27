@@ -60,6 +60,12 @@ def extract_node_features(condition_tensor, condition_columns):
             feats.append(condition_tensor[column_index_map[col]])
         else:
             feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
+        col = f"{base}_possession"
+        if col in column_index_map:
+            feats.append(condition_tensor[column_index_map[col]])
+        else:
+            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
+        
         feats.append(torch.tensor(float(node_type_idx), device=device, dtype=dtype))
         return torch.stack(feats)
 
@@ -74,7 +80,7 @@ def extract_node_features(condition_tensor, condition_columns):
         col = f"ball_{feat}"
         val = condition_tensor[column_index_map[col]] if col in column_index_map else torch.tensor(0.0)
         ball_feats.append(val)
-    ball_feats += [torch.tensor(-1.0, device=device, dtype=dtype)] * 3  # dist, position, starter
+    ball_feats += [torch.tensor(-1.0, device=device, dtype=dtype)] * 4  # dist, position, starter, possession
     ball_feats.append(torch.tensor(2.0, device=device, dtype=dtype))    # node_type
     unified_feats.append(torch.stack(ball_feats))
 

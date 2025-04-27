@@ -1,4 +1,5 @@
 import os
+import ast
 import random
 import shutil
 from tqdm import tqdm
@@ -6,6 +7,9 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+import warnings
+warnings.filterwarnings("ignore", message="The 'gameclock' column does not match the defined value range.*", category=UserWarning, module=r"floodlight\.core\.events")
 
 from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_pitch_from_mat_info_xml
 from utils.utils import calc_velocites, correct_all_player_jumps_adjacent
@@ -16,6 +20,7 @@ from utils.data_utils import (
     compute_cumulative_distances
 )
 from utils.graph_utils import build_graph_sequence_from_condition
+
 
 
 # .xml files in DFL -> .csv with Metrica_sports format
@@ -89,6 +94,61 @@ def process_match(xy, possession, ballstatus):
 
     return home, away
 
+def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
+    # 초기화: None으로 채운 리스트
+    holder = [None] * (n_frames + offset)
+
+    # Home/Away 이벤트 합치고 시간순 정렬
+    all_events = pd.concat(
+        [ev_obj.events for ev_obj in event_objects[half].values()],
+        ignore_index=True
+    ).sort_values(['minute', 'second']).reset_index(drop=True)
+
+    current_possessor = None
+    for _, ev in all_events.iterrows():
+        q = ev['qualifier']
+        # qualifier는 문자열이므로 dict로 변환
+        qd = ast.literal_eval(q) if isinstance(q, str) else q
+
+        eid = ev['eID']
+        # 1) Pass 계열: 수신자(Recipient)가 새 소유자
+        if 'Recipient' in qd:
+            new_possessor = qd['Recipient']
+        # 2) TacklingGame: PossessionChange 확인
+        elif eid == 'TacklingGame' and 'PossessionChange' in qd:
+            if qd['PossessionChange'] == 1 and 'Winner' in qd:
+                new_possessor = qd['Winner']
+            elif 'Loser' in qd:
+                new_possessor = qd['Loser']
+            else:
+                new_possessor = current_possessor
+        # 3) 온볼 액션: Player 키가 있으면 해당 선수가 소유
+        elif 'Player' in qd and eid not in ('Delete', 'FinalWhistle', 'VideoAssistantAction'):
+            new_possessor = qd['Player']
+        else:
+            new_possessor = None
+
+        # 소유자 갱신
+        if new_possessor is not None:
+            current_possessor = new_possessor
+
+        # 해당 프레임 인덱스 계산
+        frame = int((ev['minute'] * 60 + ev['second']) * framerate) + offset
+        if 0 <= frame < len(holder):
+            holder[frame] = current_possessor
+
+    # 결측치는 이전 소유자 값으로 채움
+    for i in range(offset + 1, offset + n_frames):
+        if holder[i] is None:
+            holder[i] = holder[i - 1]
+
+    # Series로 변환 (offset 이후 n_frames 구간)
+    idx = list(range(offset, offset + n_frames))
+    return pd.Series(holder[offset:offset + n_frames], index=idx, name="possessor")
+
+
+
+
 # Save DFL .xml files as .csv format
 def organize_and_process(data_path, save_path):
     # Searching Folder
@@ -155,11 +215,12 @@ def organize_and_process(data_path, save_path):
                     start_f = end_f = None
 
                 player_info_rows.append({
-                    "col_name":   col_name,
-                    "position":   pos_num,
-                    "starter":    is_start,
+                    "col_name": col_name,
+                    "position": pos_num,
+                    "starter": is_start,
+                    "pID": row["pID"],
                     "start_frame": start_f,
-                    "end_frame":   end_f
+                    "end_frame": end_f
                 })
 
         df_pi = pd.DataFrame(player_info_rows)
@@ -169,6 +230,11 @@ def organize_and_process(data_path, save_path):
         shutil.copy(
             os.path.join(match_dir, info),
             os.path.join(save_match_dir, "matchinformation.xml")
+        )
+        
+        shutil.copy(
+            os.path.join(match_dir, events),
+            os.path.join(save_match_dir, "events_raw.xml")
         )
         
     match_ids = [d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))]
@@ -183,6 +249,9 @@ class MultiMatchSoccerDataset(Dataset):
         self.condition_length = condition_length
         self.framerate = framerate
         self.stride = stride
+        
+        self.match_events = {}
+        self.match_player_pid_map = {}
         self.samples = []
         self.match_data = {}
         self.column_order = None
@@ -199,6 +268,31 @@ class MultiMatchSoccerDataset(Dataset):
             # CSV 로드
             home = pd.read_csv(os.path.join(folder, "tracking_home.csv"), index_col="Frame")
             away = pd.read_csv(os.path.join(folder, "tracking_away.csv"), index_col="Frame")
+            
+            # Event Data 로드
+            events_fname = next(f for f in os.listdir(folder) if "events" in f and f.endswith(".xml"))
+            info_fname = next(f for f in os.listdir(folder) if "matchinformation" in f and f.endswith(".xml"))
+            events_path = os.path.join(folder, events_fname)
+            info_path = os.path.join(folder, info_fname)
+            
+            events_objects, teamsheets, _ = read_event_data_xml(events_path, info_path)
+            self.match_events[match_id] = events_objects
+            
+            pid_map = {}
+
+            home_sheet = teamsheets["Home"].teamsheet.reset_index(drop=True)
+            for i, row in home_sheet.iterrows():
+                base = f"Home_{i+1}"
+                pid_map[base] = row["pID"]
+
+            offset = len(home_sheet)
+            away_sheet = teamsheets["Away"].teamsheet.reset_index(drop=True)
+            for i, row in away_sheet.iterrows():
+                base = f"Away_{offset + i + 1}"
+                pid_map[base] = row["pID"]
+
+            self.match_player_pid_map[match_id] = pid_map
+            
             # 전처리
             home = correct_all_player_jumps_adjacent(home, self.framerate)
             away = correct_all_player_jumps_adjacent(away, self.framerate)
@@ -209,12 +303,12 @@ class MultiMatchSoccerDataset(Dataset):
 
             # 공통/팀별 컬럼 합치기
             common_cols = ['Period', 'Time [s]', 'match_time', 'active', 'possession']
-            common    = home[common_cols]
+            common = home[common_cols]
             home_only = home.drop(columns=common_cols).drop(
                 columns=['ball_x', 'ball_y', 'ball_vx', 'ball_vy', 'ball_speed']
             )
             away_only = away.drop(columns=common_cols)
-            df        = pd.concat([common, home_only, away_only, home_dist, away_dist], axis=1)
+            df = pd.concat([common, home_only, away_only, home_dist, away_dist], axis=1)
 
             # 세그먼트 정보 추출
             segs = self.extract_segments_info(df, match_id)
@@ -277,6 +371,7 @@ class MultiMatchSoccerDataset(Dataset):
                 target_feats = sort_columns_by_original_order(def_cols, self.column_order)
                 segments_info.append((match_id, i, input_feats, target_feats))
                 i += self.stride
+                
         return segments_info
 
     def __len__(self):
@@ -285,8 +380,19 @@ class MultiMatchSoccerDataset(Dataset):
     def __getitem__(self, idx):
         match_id, start_idx, other_columns, target_columns = self.samples[idx]
         df = self.match_data[match_id]
-        full_seq = df.iloc[start_idx:start_idx + self.segment_length]
+        
+        first_len = (df["Period"] == 1).sum()
+        second_len = len(df) - first_len
+        off = first_len
 
+        ball_possess_first = make_ball_holder_series(self.match_events[match_id], "firstHalf", self.framerate, first_len, offset=0)
+        ball_possess_second = make_ball_holder_series(self.match_events[match_id], "secondHalf", self.framerate, second_len, offset=off)
+        ball_possess = pd.concat([ball_possess_first, ball_possess_second])
+        
+        full_seq = df.iloc[start_idx:start_idx + self.segment_length]
+        condition_seq = full_seq.iloc[:self.condition_length].copy()
+        target_seq = full_seq.iloc[self.condition_length:].copy()
+        
         # Determine team roles (attacking or defending) based on possession
         possession_team = df.iloc[start_idx]["possession"]
         atk_prefix, def_prefix = ("Home", "Away") if possession_team == 1 else ("Away", "Home")
@@ -298,19 +404,17 @@ class MultiMatchSoccerDataset(Dataset):
         if len(atk_cols) != 22 or len(def_cols) != 22:
             raise ValueError("Invalid number of valid players in segment")
 
-        # List of player column prefixes (e.g., Home_3, Away_5)
-        def get_base(col):
-            return col.rsplit("_", 1)[0]  # Home_3_x -> Home_3
-
-        atk_bases = sorted(set([get_base(c) for c in atk_cols]), key=lambda x: int(x.split('_')[1]))
-        def_bases = sorted(set([get_base(c) for c in def_cols]), key=lambda x: int(x.split('_')[1]))
+        atk_bases = sorted({c.rsplit("_",1)[0] for c in atk_cols}, key=lambda b: int(b.split("_")[1]))
+        def_bases = sorted({c.rsplit("_",1)[0] for c in def_cols}, key=lambda b: int(b.split("_")[1]))
         player_bases = atk_bases + def_bases
         ball_feats = ["ball_x", "ball_y", "ball_vx", "ball_vy"]
 
-        # Extract the first part of the segment as the conditioning sequence
-        condition_seq = full_seq.iloc[:self.condition_length]
-        target_seq = full_seq.iloc[self.condition_length:]
-
+        pid_map = self.match_player_pid_map[match_id]
+        poss_slice = ball_possess.iloc[start_idx : start_idx + self.condition_length].values
+        for base in player_bases:
+            pid = pid_map[base]
+            condition_seq[f"{base}_possession"] = (poss_slice == pid).astype(float)
+        
         # Collect feature columns
         condition_columns = set()
         for base in player_bases:
@@ -318,6 +422,7 @@ class MultiMatchSoccerDataset(Dataset):
                 col = f"{base}_{feat}"
                 if col in df.columns:
                     condition_columns.add(col)
+            condition_columns.add(f"{base}_possession")
         for col in ball_feats:
             if col in df.columns:
                 condition_columns.add(col)
@@ -330,6 +435,7 @@ class MultiMatchSoccerDataset(Dataset):
         condition_columns = sort_columns_by_original_order(condition_columns, self.column_order)
         condition_seq = condition_seq[condition_columns]
 
+        poss_seq = ball_possess.iloc[start_idx:start_idx + self.condition_length].reset_index(drop=True)
         # Load player metadata
         if not hasattr(self, "player_info_cache"):
             self.player_info_cache = {}
@@ -339,7 +445,7 @@ class MultiMatchSoccerDataset(Dataset):
             self.player_info_cache[match_id] = pd.read_csv(player_info_path)
 
         player_info = self.player_info_cache[match_id]
-        player_info_map = player_info.set_index("col_name")[["position", "starter"]].to_dict("index")
+        player_info_map = player_info.set_index("col_name")[["position", "starter", "pID"]].to_dict("index")
 
         # other: Attk + ball
         # target: Def
@@ -355,31 +461,7 @@ class MultiMatchSoccerDataset(Dataset):
             self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
             
         x_scale, y_scale = self.pitch_cache[match_id]
-        
-        # condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
-        # condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
-        
-        # condition_seq[condition_x_cols] = (condition_seq[condition_x_cols] / x_scale) * 0.5 + 0.5
-        # condition_seq[condition_y_cols] = (condition_seq[condition_y_cols] / y_scale) * 0.5 + 0.5
-        # target_seq[target_columns[0::2]] = (target_seq[target_columns[0::2]] / x_scale) * 0.5 + 0.5
-        # target_seq[target_columns[1::2]] = (target_seq[target_columns[1::2]] / y_scale) * 0.5 + 0.5
-        
-        # other_seq[other_columns[0::2]] = (other_seq[other_columns[0::2]] / x_scale) * 0.5 + 0.5
-        # other_seq[other_columns[1::2]] = (other_seq[other_columns[1::2]] / y_scale) * 0.5 + 0.5
-        
-        # Normalization for other columns
-        # v_max = 12.0
-        # framerates = 25.0
-        # max_dist = len(condition_seq) / framerates
-        
-        # for col in condition_seq.columns:
-        #     if col.endswith("_vx") or col.endswith("ball_vx"):
-        #         condition_seq[col] = (condition_seq[col] + v_max) / (2 * v_max)
-        #     elif col.endswith("_vy") or col.endswith("ball_vy"):
-        #         condition_seq[col] = (condition_seq[col] + v_max) / (2 * v_max)
-        #     elif col.endswith("_dist"):
-        #         condition_seq[col] = condition_seq[col] / max_dist
-    
+
         target_seq[target_columns[0::2]] /= x_scale
         target_seq[target_columns[1::2]] /= y_scale
 
@@ -403,6 +485,7 @@ class MultiMatchSoccerDataset(Dataset):
         
         # Add player's position, starter feature
         enriched_condition = []
+        
         for i in range(len(condition_seq)):
             row = condition_seq.iloc[i].to_dict()
             enriched_row = []
@@ -412,6 +495,10 @@ class MultiMatchSoccerDataset(Dataset):
                 meta = player_info_map.get(base, {"position": -1, "starter": 0})
                 enriched_row.append(float(meta["position"]))
                 enriched_row.append(float(meta["starter"]))
+                
+                pID_map = self.match_player_pid_map[match_id][base]
+                enriched_row.append(1.0 if poss_seq[i] == pID_map else 0.0)
+                
             enriched_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
             enriched_condition.append(enriched_row)
 
@@ -425,7 +512,7 @@ class MultiMatchSoccerDataset(Dataset):
             "other": other_tensor,
             "target": target_tensor,
             "condition_columns": [
-                f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter"]
+                f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession"]
             ] + ball_feats,
             "other_columns": other_columns,
             "target_columns": target_columns,
