@@ -4,9 +4,9 @@ import torch.nn.functional as F
 import math
 
 
-def get_torch_trans(heads=8, layers=1, channels=64):
+def get_torch_trans(heads=4, layers=2, channels=256):
     encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu", dropout=0.0
+        d_model=channels, nhead=heads, dim_feedforward=channels * 2, activation="gelu", dropout=0.1, batch_first=True
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
@@ -49,12 +49,21 @@ class ResidualBlock(nn.Module):
     def __init__(self, channels, diffusion_embedding_dim, nheads, side_dim=None):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
-        self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1) if side_dim is not None else None
+        
+        if side_dim is not None:
+            self.cond_time_encoder = get_torch_trans(
+                heads=nheads, layers=1, channels=side_dim
+            )
+            self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
+        else:
+            self.cond_time_encoder = None
+            self.cond_projection = None
+
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
 
-        self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-        self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
+        self.time_layer = get_torch_trans(heads=nheads, layers=2, channels=channels)
+        self.feature_layer = get_torch_trans(heads=nheads, layers=2, channels=channels)
 
     def forward_time(self, y, base_shape):
         B, channel, K, L = base_shape
@@ -86,11 +95,13 @@ class ResidualBlock(nn.Module):
         y = self.forward_feature(y, base_shape)
         y = self.mid_projection(y)
 
-        if cond_info is not None and self.cond_projection is not None:
-            B_c, H_c, K_c, L_c = cond_info.shape  # [B, 158, 11, 125]
-            cond_info = cond_info.reshape(B_c, H_c, K_c * L_c)  # [B, 158, 1375]
-            cond_info = self.cond_projection(cond_info)         # [B, 128, 1375]
-            y = y + cond_info
+        if cond_info is not None and self.cond_time_encoder is not None:
+            c = cond_info.reshape(B * K, cond_info.size(1), L).permute(2, 0, 1)
+            c = self.cond_time_encoder(c)
+            c = c.permute(1, 2, 0).reshape(B, K, cond_info.size(1), L)
+            c = c.permute(0, 2, 1, 3).reshape(B, cond_info.size(1), K * L)
+            c = self.cond_projection(c)
+            y = y + c
 
         gate, filter = torch.chunk(y, 2, dim=1)
         y = torch.sigmoid(gate) * torch.tanh(filter)

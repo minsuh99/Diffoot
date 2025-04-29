@@ -56,48 +56,45 @@ class DiffusionTrajectoryModel(nn.Module):
 
         x_0 = x_0.to(device)
 
-        player_loss_mse = F.mse_loss(x_0_pred, x_0, reduction='none')
-        player_loss_mse = player_loss_mse.mean(dim=[1, 3]).mean()
+        # player_loss_mse = F.mse_loss(x_0_pred, x_0, reduction='none')
+        # player_loss_mse = player_loss_mse.mean(dim=[1, 3]).mean()
 
         player_frechet_loss = per_player_frechet_loss(x_0_pred, x_0)
         
-        return noise_loss, player_loss_mse, player_frechet_loss
+        # return noise_loss, player_loss_mse, player_frechet_loss
+        return noise_loss, player_frechet_loss
 
     @torch.no_grad()
     def generate(self, shape, cond_info=None, num_samples=10):
         B, T, N, D = shape
         device = next(self.parameters()).device
-        
+
         betas = self.betas.to(device)
         alphas = self.alphas.to(device)
         alpha_hat = self.alpha_hat.to(device)
 
+        sqrt_betas = torch.sqrt(betas)                               # [S]
+        coef1 = 1.0 / torch.sqrt(alphas)                        # [S]
+        coef2 = (1.0 - alphas) / torch.sqrt(1.0 - alpha_hat)    # [S]
+
         if cond_info is not None:
-            cond_info = cond_info.to(device)
-            cond_info = cond_info.repeat(num_samples, 1, 1, 1)
+            cond_info = cond_info.to(device).repeat(num_samples, 1, 1, 1)
 
+        # x_T ← N(0, I)
         x_t = torch.randn((num_samples * B, T, N, D), device=device)
-        x_t = x_t.permute(0, 3, 2, 1)  # [N*B, 2, 11, T]
-        s = torch.zeros_like(x_t) # Self-Conditioning initialization
+        x_t = x_t.permute(0, 3, 2, 1)  # [num_samples*B, D, N, T]
+        s = torch.zeros_like(x_t)
 
-        for t_i in reversed(range(self.num_steps)):
-            t_tensor = torch.full((num_samples * B,), t_i, device=device, dtype=torch.long)
-            noise_pred = self.model(x_t, t_tensor, cond_info, self_cond = s)
+        for t in reversed(range(self.num_steps)):
+            t_tensor = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
+            noise_pred = self.model(x_t, t_tensor, cond_info, self_cond=s)
+            noise = torch.randn_like(x_t) if t > 0 else torch.zeros_like(x_t)
+            x_prev = coef1[t] * (x_t - coef2[t] * noise_pred) + sqrt_betas[t] * noise
 
-            a = alphas[t_i]
-            a_hat = alpha_hat[t_i]
-            b = betas[t_i]
-
-            if t_i > 0:
-                noise = torch.randn_like(x_t)
-            else:
-                noise = torch.zeros_like(x_t)
-
-            x_prev = (1 / torch.sqrt(a)) * (x_t - ((1 - a) / torch.sqrt(1 - a_hat)) * noise_pred) + torch.sqrt(b) * noise
-            
             s = x_prev.clone()
             x_t = x_prev
 
-        x_t = x_t.permute(0, 3, 2, 1)  # [N*B, T, 11, 2]
+        x_t = x_t.permute(0, 3, 2, 1)                # [num_samples*B, T, N, D]
         x_t = x_t.view(num_samples, B, T, N, D)
         return x_t
+

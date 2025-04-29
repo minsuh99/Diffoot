@@ -231,7 +231,7 @@ def per_player_frechet_loss(pred, target):
     # pred, target (B, T, N=11, 2)
     dists = torch.norm(pred - target, dim=-1) # (B, T, N)
     max_dists = dists.max(dim=1).values # (B, N)
-    return max_dists.mean()
+    return max_dists.mean(dim=1).mean()
 
 
 def plot_pitch( field_dimen = (106.0,68.0), field_color ='green', linewidth=2, markersize=20):
