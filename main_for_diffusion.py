@@ -51,7 +51,7 @@ hyperparams = {
     'test_batch_size': 32,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 2e-4,
+    'learning_rate': 5e-4,
     'self_conditioning_ratio': 0.5,
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -360,7 +360,7 @@ with torch.no_grad():
                                                player_idx=idx, annotate=True, save_path=save_path)
 
             visualized = True
-        break
+
 avg_test_ade = np.mean(all_best_ades_test)
 avg_test_fde = np.mean(all_best_fdes_test)
 print(f"[Test Best-of-{num_samples}] Average ADE: {avg_test_ade:.4f} | Average FDE: {avg_test_fde:.4f}")
