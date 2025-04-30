@@ -106,7 +106,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, HeteroConv
+from torch_geometric.nn import GATConv, HeteroConv
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import softmax
 
@@ -130,11 +130,9 @@ class AttentionPooling(nn.Module):
 
         return graph_rep
 
+
 class InteractionGraphEncoder(nn.Module):
-    """
-    A lightweight encoder using built-in GATv2Conv per relation (no custom message-passing).
-    """
-    def __init__(self, in_dim, hidden_dim=128, out_dim=128):
+    def __init__(self, in_dim, hidden_dim=128, out_dim=128, heads=4):
         super().__init__()
         # normalization and pooling
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -150,39 +148,44 @@ class InteractionGraphEncoder(nn.Module):
             ('Node', 'def_and_ball', 'Node'),
             ('Node', 'temporal', 'Node'),
         ]
-        # 1st layer convs
-        conv1 = {
-            rel: GCNConv(in_dim, hidden_dim, normalize=True)
-            for rel in edge_types
-        }
-        # 2nd layer convs
-        conv2 = {
-            rel: GCNConv(hidden_dim, hidden_dim, normalize=True)
-            for rel in edge_types
-        }
+        # 1st layer convs: from in_dim to hidden_dim
+        conv1 = { rel: GATConv(
+                    in_channels=in_dim,
+                    out_channels=hidden_dim // heads,
+                    heads=heads,
+                    concat=True,
+                    dropout=0.1,
+                    add_self_loops=False
+                ) for rel in edge_types }
+        # 2nd layer convs: from hidden_dim to hidden_dim
+        conv2 = { rel: GATConv(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim // heads,
+                    heads=heads,
+                    concat=True,
+                    dropout=0.1,
+                    add_self_loops=False
+                ) for rel in edge_types }
         self.het1 = HeteroConv(conv1, aggr='sum')
         self.het2 = HeteroConv(conv2, aggr='sum')
         self.proj = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, graph: HeteroData):
         x_dict = {'Node': graph['Node'].x}
-        ew1 = {
-            rel: graph[rel].edge_attr.view(-1)
-            for rel in graph.edge_index_dict
-        }
 
-        # first heterogeneous attention
-        x_dict = self.het1(x_dict, graph.edge_index_dict, edge_weight_dict=ew1)
+        # first heterogeneous attention layer (no edge_weight)
+        x_dict = self.het1(x_dict, graph.edge_index_dict)
         x = x_dict['Node']
         x = F.softsign(x)
         x = self.norm1(x)
-        # second heterogeneous attention
-        x_dict = self.het2({'Node': x}, graph.edge_index_dict, edge_weight_dict=ew1)
+
+        # second heterogeneous attention layer (no edge_weight)
+        x_dict = self.het2({'Node': x}, graph.edge_index_dict)
         x = x_dict['Node']
         x = F.softsign(x)
         x = self.norm2(x)
 
-        # pooling to graph-level
+        # pooling to graph-level representation
         batch = graph['Node'].batch
         graph_rep = self.pool(x, batch)
         return self.proj(graph_rep)  # (B, out_dim)

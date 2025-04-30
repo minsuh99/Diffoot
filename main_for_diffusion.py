@@ -51,8 +51,8 @@ hyperparams = {
     'test_batch_size': 32,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 1e-3,
-    'self_conditioning_ratio': 0.6,
+    'learning_rate': 1e-4,
+    'self_conditioning_ratio': 0.5,
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     **csdi_config
@@ -200,7 +200,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         # loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
         
         noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss_frechet + player_loss_fde
+        loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
         
         optimizer.zero_grad()
         loss.backward()
@@ -208,7 +208,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
         train_noise_loss += (noise_loss).item()
         # train_mse_loss += (player_loss_mse).item()
-        train_frechet_loss += (player_loss_frechet).item()
+        train_frechet_loss += (player_loss_frechet * 0.2).item()
         train_fde_loss += player_loss_fde.item()
         train_loss += loss.item()
 
@@ -253,11 +253,11 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
             # val_loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
             noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
-            val_loss = noise_loss + player_loss_frechet + player_loss_fde
+            val_loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
             
             val_noise_loss += (noise_loss).item()
             # val_mse_loss += (player_loss_mse).item()
-            val_frechet_loss += (player_loss_frechet).item()
+            val_frechet_loss += (player_loss_frechet * 0.2).item()
             val_fde_loss += player_loss_fde.item()
             val_total_loss += val_loss.item()
 

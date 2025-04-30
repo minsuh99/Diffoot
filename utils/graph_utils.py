@@ -30,9 +30,18 @@ def extract_node_features(condition_tensor, condition_columns):
     column_index_map = {col: idx for idx, col in enumerate(condition_columns)}
     device = condition_tensor.device
     dtype  = condition_tensor.dtype
-    player_bases = sorted(list(set(col.rsplit("_", 1)[0] for col in condition_columns if "ball" not in col)))
-    attk_bases = [base for base in player_bases if "Attk" in base or any(f"{base}_position" in col for col in condition_columns[:22*7])][:11]
-    def_bases = [base for base in player_bases if base not in attk_bases][:11]
+
+    bases = []
+    for col in condition_columns:
+        if col.startswith("ball_"):
+            continue
+        parts = col.split("_", 2)
+        base = "_".join(parts[:2])
+        if base not in bases:
+            bases.append(base)
+
+    attk_bases = bases[:11]
+    def_bases  = bases[11:22]
 
     unified_feats = []
 
@@ -45,32 +54,14 @@ def extract_node_features(condition_tensor, condition_columns):
             else:
                 val = torch.tensor(0.0, device=device, dtype=dtype)
             feats.append(val)
-        col = f"{base}_dist"
-        if col in column_index_map:
-            feats.append(condition_tensor[column_index_map[col]])
-        else:
-            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
-        col = f"{base}_position"
-        if col in column_index_map:
-            feats.append(condition_tensor[column_index_map[col]])
-        else:
-            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
-        col = f"{base}_starter"
-        if col in column_index_map:
-            feats.append(condition_tensor[column_index_map[col]])
-        else:
-            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
-        col = f"{base}_possession_duration"
-        if col in column_index_map:
-            feats.append(condition_tensor[column_index_map[col]])
-        else:
-            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
-        col = f"{base}_neighbor_count"
-        if col in column_index_map:
-            feats.append(condition_tensor[column_index_map[col]])
-        else:
-            feats.append(torch.tensor(-1.0, device=device, dtype=dtype))
-        
+        for feat in ["dist", "position", "starter", "possession_duration", "neighbor_count"]:
+            col = f"{base}_{feat}"
+            if col in column_index_map:
+                val = condition_tensor[column_index_map[col]]
+            else:
+                val = torch.tensor(-1.0, device=device, dtype=dtype)
+            feats.append(val)
+
         feats.append(torch.tensor(float(node_type_idx), device=device, dtype=dtype))
         return torch.stack(feats)
 
@@ -85,7 +76,7 @@ def extract_node_features(condition_tensor, condition_columns):
         col = f"ball_{feat}"
         val = condition_tensor[column_index_map[col]] if col in column_index_map else torch.tensor(0.0)
         ball_feats.append(val)
-    ball_feats += [torch.tensor(-1.0, device=device, dtype=dtype)] * 4  # dist, position, starter, possession
+    ball_feats += [torch.tensor(-1.0, device=device, dtype=dtype)] * 5  # dist, position, starter, possession_duration, neighbor_counts
     ball_feats.append(torch.tensor(2.0, device=device, dtype=dtype))    # node_type
     unified_feats.append(torch.stack(ball_feats))
 
@@ -101,8 +92,6 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
     poss_dur = nodes[:, 7]
     neighbor_count = nodes[:, 8]         # (N,)
     masks = {t: (node_type == t) for t in (0, 1, 2)}
-
-    weight_thr = 0.05   # 필터 임계값
 
     def make_edges(s_t, d_t, rel):
         s_idx = torch.where(masks[s_t])[0]          # (Ns,)
@@ -161,13 +150,21 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
                 
             weight = W_dist + W_situation
 
-        else:
-            # temporal 등 기타 엣지
+        else: # Temporal edge
             weight = torch.ones_like(dist)
         
-
+        # 음수 weight 방지
+        weight = torch.relu(weight) + 1e-6
+        # Threshold
+        dist_thr = 0.1
+        situation_thr = 0.05
+        
+        if rel != "temporal":
+            connection_mask = (W_dist > dist_thr) | (W_situation > situation_thr)
+        else:
+            connection_mask = torch.ones_like(weight, dtype=torch.bool)
+            
         # weight = torch.exp(-dist * 0.15) if d_t == 2 else 1.0 / (1.0 + dist)   # (Ns, Nd)
-        mask = weight > weight_thr
         
         # # denormalization + 거리 계산
         # real_xy = (nodes[:, :2] - 0.5) * 2 * torch.tensor([x_scale, y_scale], device=nodes.device)
@@ -177,14 +174,14 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
         # weight = torch.exp(-dist * 0.25) if d_t == 2 else 1.0 / (1.0 + dist)
         # mask = weight > weight_thr
 
-        if not mask.any():
+        if not connection_mask.any():
             edge_index_dict[("Node", rel, "Node")] = torch.empty((2, 0), dtype=torch.long)
             edge_attr_dict [("Node", rel, "Node")] = torch.empty((0, 1), dtype=torch.float32)
             return
 
-        src_ids, dst_ids = mask.nonzero(as_tuple=True)          # (E,), (E,)
+        src_ids, dst_ids = connection_mask.nonzero(as_tuple=True)          # (E,), (E,)
         edge_index = torch.stack([s_idx[src_ids], d_idx[dst_ids]], dim=0)  # (2, E)
-        edge_attr  = weight[mask].unsqueeze(1).float()                        # **(E, 1)**
+        edge_attr  = weight[connection_mask].unsqueeze(1).float()                        # **(E, 1)**
 
         if rel != "temporal":
             rev_index = edge_index.flip(0)

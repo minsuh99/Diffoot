@@ -95,58 +95,55 @@ def process_match(xy, possession, ballstatus):
     return home, away
 
 def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
-    # 초기화: None으로 채운 리스트
     holder = [None] * (n_frames + offset)
-
-    # Home/Away 이벤트 합치고 시간순 정렬
     all_events = pd.concat(
         [ev_obj.events for ev_obj in event_objects[half].values()],
         ignore_index=True
-    ).sort_values(['minute', 'second']).reset_index(drop=True)
+    ).sort_values(['minute','second']).reset_index(drop=True)
 
-    current_possessor = None
+    current = None
     for _, ev in all_events.iterrows():
-        q = ev['qualifier']
-        qd = ast.literal_eval(q) if isinstance(q, str) else q
-
+        qd = ast.literal_eval(ev['qualifier']) if isinstance(ev['qualifier'], str) else ev['qualifier']
         eid = ev['eID']
         if 'Recipient' in qd:
-            new_possessor = qd['Recipient']
+            newp = qd['Recipient']
         elif eid == 'TacklingGame' and 'PossessionChange' in qd:
-            if qd['PossessionChange'] == 1 and 'Winner' in qd:
-                new_possessor = qd['Winner']
+            if qd['PossessionChange']==1 and 'Winner' in qd:
+                newp = qd['Winner']
             elif 'Loser' in qd:
-                new_possessor = qd['Loser']
+                newp = qd['Loser']
             else:
-                new_possessor = current_possessor
-        elif 'Player' in qd and eid not in ('Delete', 'FinalWhistle', 'VideoAssistantAction'):
-            new_possessor = qd['Player']
+                newp = current
+        elif 'Player' in qd and eid not in ('Delete','FinalWhistle','VideoAssistantAction'):
+            newp = qd['Player']
         else:
-            new_possessor = None
+            newp = None
 
-        if new_possessor is not None:
-            current_possessor = new_possessor
+        if newp is not None:
+            current = newp
+        frm = int((ev['minute']*60 + ev['second']) * framerate) + offset
+        if 0 <= frm < len(holder):
+            holder[frm] = current
 
-        frame = int((ev['minute'] * 60 + ev['second']) * framerate) + offset
-        if 0 <= frame < len(holder):
-            holder[frame] = current_possessor
-
-    # 결측치는 이전 소유자 값으로 채움
-    for i in range(offset + 1, offset + n_frames):
+    # forward‐fill
+    for i in range(offset+1, offset+n_frames):
         if holder[i] is None:
-            holder[i] = holder[i - 1]
+            holder[i] = holder[i-1]
 
+    # 2) durations 계산
     durations = [0.0] * (n_frames + offset)
-
     durations[offset] = 1.0 / framerate
-    for i in range(offset + 1, offset + n_frames):
-        if holder[i] == holder[i - 1]:
-            durations[i] = durations[i - 1] + 1.0 / framerate
+    for i in range(offset+1, offset+n_frames):
+        if holder[i] == holder[i-1]:
+            durations[i] = durations[i-1] + 1.0 / framerate
         else:
-            durations[i] = 1.0 / framerate
+            durations[i] = 1.0/framerate
 
-    idx = list(range(offset, offset + n_frames))
-    return pd.Series(durations[offset:offset + n_frames], index=idx, name="possession_duration")
+    # 3) 두 시리즈를 튜플로 반환
+    idx = list(range(offset, offset+n_frames))
+    holder_s = pd.Series(holder[offset:offset+n_frames], index=idx, name="holder")
+    dur_s    = pd.Series(durations[offset:offset+n_frames], index=idx, name="possession_duration")
+    return holder_s, dur_s
 
 
 
@@ -387,9 +384,10 @@ class MultiMatchSoccerDataset(Dataset):
         second_len = len(df) - first_len
         off = first_len
 
-        ball_possess_first = make_ball_holder_series(self.match_events[match_id], "firstHalf", self.framerate, first_len, offset=0)
-        ball_possess_second = make_ball_holder_series(self.match_events[match_id], "secondHalf", self.framerate, second_len, offset=off)
-        ball_possess = pd.concat([ball_possess_first, ball_possess_second])
+        holder_first, duration_first = make_ball_holder_series(self.match_events[match_id], "firstHalf", self.framerate, first_len, offset=0)
+        holder_second, duration_second = make_ball_holder_series(self.match_events[match_id], "secondHalf", self.framerate, second_len, offset=off)
+        holder = pd.concat([holder_first, holder_second])
+        poss_time = pd.concat([duration_first, duration_second])
         
         full_seq = df.iloc[start_idx:start_idx + self.segment_length]
         condition_seq = full_seq.iloc[:self.condition_length].copy()
@@ -410,25 +408,6 @@ class MultiMatchSoccerDataset(Dataset):
         def_bases = sorted({c.rsplit("_",1)[0] for c in def_cols}, key=lambda b: int(b.split("_")[1]))
         player_bases = atk_bases + def_bases
         ball_feats = ["ball_x", "ball_y", "ball_vx", "ball_vy"]
-
-        pid_map = self.match_player_pid_map[match_id]
-        poss_slice = ball_possess.iloc[start_idx : start_idx + self.condition_length].values
-        for base in player_bases:
-            pid = pid_map[base]
-            condition_seq[f"{base}_possession"] = (poss_slice == pid).astype(float)
-            
-        xs = condition_seq[[f"{b}_x" for b in player_bases]].values
-        ys = condition_seq[[f"{b}_y" for b in player_bases]].values
-        coords = np.stack([xs, ys], axis=-1)
-
-        neighbor_radius = 5
-        r2 = neighbor_radius ** 2
-
-        diff2 = ((coords[:, :, None, :] - coords[:, None, :, :])**2).sum(-1)
-        counts = (diff2 <= r2).sum(-1) - 1
-
-        for i, base in enumerate(player_bases):
-            condition_seq[f"{base}_neighbor_count"] = counts[:, i]
         
         # Collect feature columns
         condition_columns = set()
@@ -447,11 +426,10 @@ class MultiMatchSoccerDataset(Dataset):
         if not hasattr(self, "column_order"):
             self.column_order = df.columns.tolist()
         
-        
         condition_columns = sort_columns_by_original_order(condition_columns, self.column_order)
         condition_seq = condition_seq[condition_columns]
 
-        poss_seq = ball_possess.iloc[start_idx:start_idx + self.condition_length].reset_index(drop=True)
+        poss_seq = poss_time.iloc[start_idx:start_idx + self.condition_length].reset_index(drop=True)
         # Load player metadata
         if not hasattr(self, "player_info_cache"):
             self.player_info_cache = {}
@@ -498,31 +476,59 @@ class MultiMatchSoccerDataset(Dataset):
                 condition_seq[col] /= y_scale
             elif col.endswith("_dist"):
                 condition_seq[col] /= (x_scale**2 + y_scale**2) ** 0.5 
+                
+        # Calculate possession duration & neighbor opposite player count
+        Na = len(atk_bases)
+        Nd = len(def_bases)
+
+        xs = condition_seq[[f"{b}_x" for b in player_bases]].values
+        ys = condition_seq[[f"{b}_y" for b in player_bases]].values
+        
+        xs *= x_scale
+        ys *= y_scale
+        
+        coords = np.stack([xs, ys], axis=-1)
+        diff2  = ((coords[:, :, None, :] - coords[:, None, :, :])**2).sum(-1)
+
+        neighbor_radius = 5.0
+        r2 = neighbor_radius**2
+
+        T, N = diff2.shape[:2]
+        neighbor_counts = np.zeros((T, N), dtype=int)
+
+        neighbor_counts[:, :Na] = (diff2[:, :Na, Na:] <= r2).sum(axis=2)
+
+        neighbor_counts[:, Na:] = (diff2[:, Na:, :Na] <= r2).sum(axis=2)
+        
+        T = self.condition_length
+        start = start_idx
+        holder_slice = holder[start : start+T].reset_index(drop=True)
+        poss_slice = poss_time[start : start+T].reset_index(drop=True)
         
         # Add player's position, starter feature
-        enriched_condition = []
+        final_condition = []
         
         for i in range(len(condition_seq)):
             row = condition_seq.iloc[i].to_dict()
-            enriched_row = []
-            for base in player_bases:
+            final_condition_row = []
+            for j, base in enumerate(player_bases):
                 feats = [f"{base}_{f}" for f in ["x", "y", "vx", "vy", "dist"]]
-                enriched_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in feats])
+                final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in feats])
                 meta = player_info_map.get(base, {"position": -1, "starter": 0})
-                enriched_row.append(float(meta["position"]))
-                enriched_row.append(float(meta["starter"]))
+                final_condition_row.append(float(meta["position"]))
+                final_condition_row.append(float(meta["starter"]))
                 
                 # possession
-                pID_map = self.match_player_pid_map[match_id][base]
-                enriched_row.append(1.0 if poss_seq[i] == pID_map else 0.0)
+                pid = self.match_player_pid_map[match_id][base]
+                final_condition_row.append(poss_slice.iloc[i] if holder_slice.iloc[i] == pid else 0.0)
                 
-                # neighbor defensive player count
-                enriched_row.append(float(row[f"{base}_neighbor_count"]))
+                # neighbor count
+                final_condition_row.append(float(neighbor_counts[i, j]))
                 
-            enriched_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
-            enriched_condition.append(enriched_row)
+            final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
+            final_condition.append(final_condition_row)
 
-        condition_tensor = torch.tensor(enriched_condition, dtype=torch.float32)
+        condition_tensor = torch.tensor(final_condition, dtype=torch.float32)
         other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
         target_tensor = torch.tensor(target_seq.values, dtype=torch.float32)
 
