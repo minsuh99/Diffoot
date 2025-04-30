@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from models.diff_modules import diff_CSDI
+from models.diff_modules import TrajectoryUNetDenoiser
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
@@ -34,15 +34,6 @@ logging.basicConfig(
 logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
-csdi_config = {
-    "num_steps": 500,
-    "channels": 128,
-    "diffusion_embedding_dim": 128,
-    "nheads": 4,
-    "layers": 5,
-    # "side_dim": 128
-    "side_dim": 256
-}
 hyperparams = {
     'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
     'data_save_path': "match_data",
@@ -55,7 +46,13 @@ hyperparams = {
     'self_conditioning_ratio': 0.5,
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    **csdi_config
+    
+    'num_steps': 500,
+    'embedding_dim': 128,
+    'base_channels': 128,
+    'depth': 4,
+    'heads': 4,
+    'feature_dim': 2,
 }
 raw_data_path = hyperparams['raw_data_path']
 data_save_path = hyperparams['data_save_path']
@@ -138,15 +135,19 @@ target_idx = [condition_columns.index(col) for col in target_columns if col in c
 # graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
 history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
-denoiser = diff_CSDI(csdi_config)
-model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
+denoiser = TrajectoryUNetDenoiser(
+    num_steps = hyperparams['num_steps'], embedding_dim = hyperparams['embedding_dim'], feature_dim = hyperparams['feature_dim'],
+    base_channels  = hyperparams['base_channels'], depth = hyperparams['depth'], heads = hyperparams['heads']
+).to(device)
+
+model = DiffusionTrajectoryModel(denoiser, num_steps=hyperparams['num_steps']).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor = 0.5, patience = 2, threshold = 1e-4)
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
 logger.info(f"HistoryEncoder: {history_encoder}")
-logger.info(f"Denoiser (diff_CSDI): {denoiser}")
+logger.info(f"Denoiser : {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {model}")
 
 
@@ -171,17 +172,14 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
         graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
-        # graph → H
-        H = graph_encoder(graph_batch)                                       # [B, 128]
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        # graph → graph_rep
+        graph_rep = graph_encoder(graph_batch)                                       # [B, 128]
         
         # Target's history trajectories
         hist = cond[:, :, target_idx].to(device) 
         hist_rep = history_encoder(hist)  # [B, 128]
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
         
-        # Concat conditions
-        cond_info = torch.cat([cond_H, cond_hist], dim=1)
+        cond_info = (graph_rep, hist_rep)
         # Preparing Self-conditioning data
         if torch.rand(1, device=device) < self_conditioning_ratio:
             s = torch.zeros_like(target)
@@ -189,11 +187,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             with torch.no_grad():
                 t = torch.randint(0, model.num_steps, (target.size(0),), device=device)
                 x_t, noise = model.q_sample(target, t)
-                x_t = x_t.permute(0,3,2,1)
-                eps_pred1 = model.model(x_t, t, cond_info, self_cond=None)
-                a_hat = model.alpha_hat.to(device)[t].view(-1,1,1,1)
+                
+                eps_pred1 = model.model(x_t, t, cond_info)
+                
+                a_hat = model.alpha_hat.to(device)[t].view(-1, 1, 1, 1)
                 x0_hat = (x_t - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                x0_hat = x0_hat.permute(0,3,2,1)
+                
             s = x0_hat
         
         # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
@@ -234,19 +233,14 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             cond = batch["condition"].to(device)
             B, T, _ = cond.shape
             target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-            graph_batch = batch["graph"].to(device)                              # HeteroData batch
+            graph_batch = batch["graph"].to(device)
 
-            # graph → H
-            H = graph_encoder(graph_batch)                                       # [B, 128]
-            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-            
-            # Target's history trajectories
+            graph_rep = graph_encoder(graph_batch)                                       # [B, 128]            
+
             hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
             hist_rep = history_encoder(hist)  # [B, 128]
-            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
             
-            # Concat conditions
-            cond_info = torch.cat([cond_H, cond_hist], dim=1)
+            cond_info = (graph_rep, hist_rep)
             
             s = torch.zeros_like(target)
             
@@ -290,13 +284,13 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels, "
-          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers "
+plt.title(f"Train & Validation Loss, {hyperparams['num_steps']} steps, {hyperparams['base_channels']} base channels, "
+          f"{hyperparams['embedding_dim']} embedding dim, {hyperparams['depth']} depth "
           f"self-conditioning ratio: {self_conditioning_ratio}")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0430_diffusion_lr_curve.png')
+plt.savefig('results/0501_diffusion_lr_curve.png')
 
 plt.show()
 
@@ -314,13 +308,12 @@ with torch.no_grad():
         target = batch["target"].to(device).view(B, T, 11, 2)
 
         graph_batch  = batch["graph"].to(device)
-        H = graph_encoder(graph_batch)
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        graph_rep = graph_encoder(graph_batch)
         
         hist = cond[:, :, target_idx].to(device)
         hist_rep = history_encoder(hist)
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
-        cond_info = torch.cat([cond_H, cond_hist], dim=1)
+        
+        cond_info = (graph_rep, hist_rep)
 
         best_ade_t = torch.full((B,), float("inf"), device=device)
         best_pred_t = torch.zeros_like(target)

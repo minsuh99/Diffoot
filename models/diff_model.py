@@ -8,95 +8,65 @@ class DiffusionTrajectoryModel(nn.Module):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
-
+        
         ts = torch.linspace(0, 1, num_steps)
         betas = beta_start + (beta_end - beta_start) * (ts ** 2)
-        
         alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
-
-        self.betas = betas
-        self.alphas = alphas
-        self.alpha_hat = alpha_hat
+        
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alpha_hat', alpha_hat)
 
     def q_sample(self, x_0, t, noise=None):
-        device = x_0.device
-        alpha_hat = self.alpha_hat.to(device)
-        
         if noise is None:
             noise = torch.randn_like(x_0)
-        t = t.to(device)
-        a_hat = alpha_hat[t].view(-1, 1, 1, 1)
-        one_minus = 1.0 - a_hat
-        x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(one_minus) * noise
+        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
+        x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
     def forward(self, x_0, cond_info=None, self_cond=None):
-        device = x_0.device
         B = x_0.size(0)
+        device = x_0.device
+        
+        
+        
         t = torch.randint(0, self.num_steps, (B,), device=device)
-
-        # x_0 -> x_t
         x_t, noise = self.q_sample(x_0, t)
-        x_t = x_t.permute(0, 3, 2, 1)   # [B, 2, 11, T]
-        noise = noise.permute(0, 3, 2, 1)
-
-        if cond_info is not None:
-            cond_info = cond_info.to(device)
-
-        # predict noise
+        
         noise_pred = self.model(x_t, t, cond_info, self_cond)
         noise_loss = F.mse_loss(noise_pred, noise)
-
-        # x_t -> x_0
-        alpha_hat = self.alpha_hat.to(device)
-        a_hat = alpha_hat[t].view(-1, 1, 1, 1)
-        x_0_pred = (x_t - torch.sqrt(1.0 - a_hat) * noise_pred) / torch.sqrt(a_hat)
-        x_0_pred = x_0_pred.permute(0, 3, 2, 1)  # [B, T, 11, 2]
-
-        x_0 = x_0.to(device)
-
-        # player_loss_mse = F.mse_loss(x_0_pred, x_0, reduction='none')
-        # player_loss_mse = player_loss_mse.mean(dim=[1, 3]).mean()
-
-        player_frechet_loss = per_player_frechet_loss(x_0_pred, x_0)
         
-        player_fde_loss = per_player_fde_loss(x_0_pred, x_0)
+        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
+        x_0_pred = (x_t - torch.sqrt(1 - a_hat) * noise_pred) / torch.sqrt(a_hat)
         
-        # return noise_loss, player_loss_mse, player_frechet_loss
-        return noise_loss, player_frechet_loss, player_fde_loss
+        player_frechet = per_player_frechet_loss(x_0_pred, x_0)
+        player_fde = per_player_fde_loss(x_0_pred, x_0)
+        return noise_loss, player_frechet, player_fde
 
     @torch.no_grad()
     def generate(self, shape, cond_info=None, num_samples=10):
         B, T, N, D = shape
         device = next(self.parameters()).device
-
-        betas = self.betas.to(device)
-        alphas = self.alphas.to(device)
-        alpha_hat = self.alpha_hat.to(device)
-
-        sqrt_betas = torch.sqrt(betas)                               # [S]
-        coef1 = 1.0 / torch.sqrt(alphas)                        # [S]
-        coef2 = (1.0 - alphas) / torch.sqrt(1.0 - alpha_hat)    # [S]
-
+        
         if cond_info is not None:
             cond_info = cond_info.to(device).repeat(num_samples, 1, 1, 1)
-
-        # x_T ← N(0, I)
-        x_t = torch.randn((num_samples * B, T, N, D), device=device)
-        x_t = x_t.permute(0, 3, 2, 1)  # [num_samples*B, D, N, T]
-        s = torch.zeros_like(x_t)
-
+            
+        x_t = torch.randn(num_samples * B, T, N, D, device=device)
+        self_cond = None
+        
         for t in reversed(range(self.num_steps)):
-            t_tensor = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(x_t, t_tensor, cond_info, self_cond=s)
+            t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
+            noise_pred = self.model(x_t, t_batch, cond_info, self_cond)
+            
             noise = torch.randn_like(x_t) if t > 0 else torch.zeros_like(x_t)
-            x_prev = coef1[t] * (x_t - coef2[t] * noise_pred) + sqrt_betas[t] * noise
-
-            s = x_prev.clone()
+            
+            alpha = self.alphas[t]
+            alpha_hat = self.alpha_hat[t]
+            beta = self.betas[t]
+            
+            x_prev = (1.0 / torch.sqrt(alpha)) * (x_t - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * noise_pred) + torch.sqrt(beta) * noise
+            
+            self_cond = x_prev
             x_t = x_prev
-
-        x_t = x_t.permute(0, 3, 2, 1)                # [num_samples*B, T, N, D]
-        x_t = x_t.view(num_samples, B, T, N, D)
-        return x_t
-
+        return x_t.view(num_samples, B, T, N, D)
