@@ -107,14 +107,11 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
     current_possessor = None
     for _, ev in all_events.iterrows():
         q = ev['qualifier']
-        # qualifier는 문자열이므로 dict로 변환
         qd = ast.literal_eval(q) if isinstance(q, str) else q
 
         eid = ev['eID']
-        # 1) Pass 계열: 수신자(Recipient)가 새 소유자
         if 'Recipient' in qd:
             new_possessor = qd['Recipient']
-        # 2) TacklingGame: PossessionChange 확인
         elif eid == 'TacklingGame' and 'PossessionChange' in qd:
             if qd['PossessionChange'] == 1 and 'Winner' in qd:
                 new_possessor = qd['Winner']
@@ -122,17 +119,14 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
                 new_possessor = qd['Loser']
             else:
                 new_possessor = current_possessor
-        # 3) 온볼 액션: Player 키가 있으면 해당 선수가 소유
         elif 'Player' in qd and eid not in ('Delete', 'FinalWhistle', 'VideoAssistantAction'):
             new_possessor = qd['Player']
         else:
             new_possessor = None
 
-        # 소유자 갱신
         if new_possessor is not None:
             current_possessor = new_possessor
 
-        # 해당 프레임 인덱스 계산
         frame = int((ev['minute'] * 60 + ev['second']) * framerate) + offset
         if 0 <= frame < len(holder):
             holder[frame] = current_possessor
@@ -142,9 +136,17 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
         if holder[i] is None:
             holder[i] = holder[i - 1]
 
-    # Series로 변환 (offset 이후 n_frames 구간)
+    durations = [0.0] * (n_frames + offset)
+
+    durations[offset] = 1.0 / framerate
+    for i in range(offset + 1, offset + n_frames):
+        if holder[i] == holder[i - 1]:
+            durations[i] = durations[i - 1] + 1.0 / framerate
+        else:
+            durations[i] = 1.0 / framerate
+
     idx = list(range(offset, offset + n_frames))
-    return pd.Series(holder[offset:offset + n_frames], index=idx, name="possessor")
+    return pd.Series(durations[offset:offset + n_frames], index=idx, name="possession_duration")
 
 
 
@@ -414,6 +416,19 @@ class MultiMatchSoccerDataset(Dataset):
         for base in player_bases:
             pid = pid_map[base]
             condition_seq[f"{base}_possession"] = (poss_slice == pid).astype(float)
+            
+        xs = condition_seq[[f"{b}_x" for b in player_bases]].values
+        ys = condition_seq[[f"{b}_y" for b in player_bases]].values
+        coords = np.stack([xs, ys], axis=-1)
+
+        neighbor_radius = 5
+        r2 = neighbor_radius ** 2
+
+        diff2 = ((coords[:, :, None, :] - coords[:, None, :, :])**2).sum(-1)
+        counts = (diff2 <= r2).sum(-1) - 1
+
+        for i, base in enumerate(player_bases):
+            condition_seq[f"{base}_neighbor_count"] = counts[:, i]
         
         # Collect feature columns
         condition_columns = set()
@@ -422,7 +437,8 @@ class MultiMatchSoccerDataset(Dataset):
                 col = f"{base}_{feat}"
                 if col in df.columns:
                     condition_columns.add(col)
-            condition_columns.add(f"{base}_possession")
+            condition_columns.add(f"{base}_possession_duration")
+            condition_columns.add(f"{base}_neighbor_count")
         for col in ball_feats:
             if col in df.columns:
                 condition_columns.add(col)
@@ -496,8 +512,12 @@ class MultiMatchSoccerDataset(Dataset):
                 enriched_row.append(float(meta["position"]))
                 enriched_row.append(float(meta["starter"]))
                 
+                # possession
                 pID_map = self.match_player_pid_map[match_id][base]
                 enriched_row.append(1.0 if poss_seq[i] == pID_map else 0.0)
+                
+                # neighbor defensive player count
+                enriched_row.append(float(row[f"{base}_neighbor_count"]))
                 
             enriched_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
             enriched_condition.append(enriched_row)
@@ -512,7 +532,7 @@ class MultiMatchSoccerDataset(Dataset):
             "other": other_tensor,
             "target": target_tensor,
             "condition_columns": [
-                f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession"]
+                f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession_duration", "neighbor_count"]
             ] + ball_feats,
             "other_columns": other_columns,
             "target_columns": target_columns,

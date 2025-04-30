@@ -13,7 +13,7 @@ from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
-from utils.utils import set_evertyhing, worker_init_fn, generator, plot_trajectories_on_pitch
+from utils.utils import set_evertyhing, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats
 from utils.data_utils import split_dataset_indices, custom_collate_fn
 from utils.graph_utils import build_graph_sequence_from_condition
 
@@ -39,7 +39,7 @@ csdi_config = {
     "channels": 128,
     "diffusion_embedding_dim": 128,
     "nheads": 4,
-    "layers": 10,
+    "layers": 5,
     # "side_dim": 128
     "side_dim": 256
 }
@@ -51,8 +51,8 @@ hyperparams = {
     'test_batch_size': 32,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 5e-4,
-    'self_conditioning_ratio': 0.5,
+    'learning_rate': 1e-3,
+    'self_conditioning_ratio': 0.6,
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     **csdi_config
@@ -125,6 +125,9 @@ graph = build_graph_sequence_from_condition({
     "condition_columns": sample["condition_columns"],
     "pitch_scale": sample["pitch_scale"]
 }).to(device)
+
+log_graph_stats(graph, logger, prefix="InitGraphSample")
+
 in_dim = graph['Node'].x.size(1)
 
 # Extract target's history trajectories from condition
@@ -132,7 +135,8 @@ condition_columns = sample["condition_columns"]
 target_columns = sample["target_columns"]
 target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
 
-graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
+# graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
+graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
 history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
 denoiser = diff_CSDI(csdi_config)
 model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
@@ -158,6 +162,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     train_noise_loss = 0
     # train_mse_loss = 0
     train_frechet_loss = 0
+    train_fde_loss = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
@@ -194,8 +199,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
         # loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
         
-        noise_loss, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss_frechet * 0.2
+        noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
+        loss = noise_loss + player_loss_frechet + player_loss_fde
         
         optimizer.zero_grad()
         loss.backward()
@@ -203,7 +208,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
         train_noise_loss += (noise_loss).item()
         # train_mse_loss += (player_loss_mse).item()
-        train_frechet_loss += (player_loss_frechet * 0.2).item()
+        train_frechet_loss += (player_loss_frechet).item()
+        train_fde_loss += player_loss_fde.item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
@@ -211,6 +217,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     avg_noise_loss = train_noise_loss / num_batches
     # avg_mse_loss = train_mse_loss / num_batches
     avg_frechet_loss = train_frechet_loss / num_batches
+    avg_fde_loss = train_fde_loss / num_batches
     avg_train_loss = train_loss / num_batches
 
 
@@ -219,6 +226,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     val_noise_loss = 0
     # val_mse_loss = 0
     val_frechet_loss = 0
+    val_fde_loss = 0
     val_total_loss = 0
 
     with torch.no_grad():
@@ -244,17 +252,19 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             
             # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
             # val_loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
-            noise_loss, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
-            val_loss = noise_loss + player_loss_frechet * 0.2
+            noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
+            val_loss = noise_loss + player_loss_frechet + player_loss_fde
             
             val_noise_loss += (noise_loss).item()
             # val_mse_loss += (player_loss_mse).item()
-            val_frechet_loss += (player_loss_frechet * 0.2).item()
+            val_frechet_loss += (player_loss_frechet).item()
+            val_fde_loss += player_loss_fde.item()
             val_total_loss += val_loss.item()
 
     avg_val_noise_loss = val_noise_loss / len(val_dataloader)
     # avg_val_mse_loss = val_mse_loss / len(val_dataloader)
     avg_val_frechet_loss = val_frechet_loss / len(val_dataloader)
+    avg_val_fde_loss = val_fde_loss / len(val_dataloader)
     avg_val_loss = val_total_loss / len(val_dataloader)
   
     train_losses.append(avg_train_loss)
@@ -264,8 +274,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) | Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
     
     tqdm.write(f"[Epoch {epoch}]\n"
-               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | LR: {current_lr:.6f}\n"
-               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise: {avg_val_noise_loss:.6f} | Frechet: {avg_val_frechet_loss:.6f}")
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | FDE Loss: {avg_fde_loss:.6f} LR: {current_lr:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise: {avg_val_noise_loss:.6f} | Frechet: {avg_val_frechet_loss:.6f} | FDE: {avg_val_fde_loss:.6f}")
     
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:

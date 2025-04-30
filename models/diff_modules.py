@@ -6,7 +6,7 @@ import math
 
 def get_torch_trans(heads=4, layers=2, channels=256):
     encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=channels * 2, activation="gelu", dropout=0.1, batch_first=True
+        d_model=channels, nhead=heads, dim_feedforward=channels * 2, activation="gelu", dropout=0.0, batch_first=True
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 

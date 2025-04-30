@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+from torch_geometric.data import HeteroData
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -234,6 +235,12 @@ def per_player_frechet_loss(pred, target):
     return max_dists.mean(dim=1).mean()
 
 
+def per_player_fde_loss(pred, target):
+    # pred, target: [B, T, N, 2]
+    diff = pred[:, -1] - target[:, -1]     # [B, N, 2]
+    return diff.norm(dim=-1).mean()       # [B, N]→scalar
+
+
 def plot_pitch( field_dimen = (106.0,68.0), field_color ='green', linewidth=2, markersize=20):
     """ plot_pitch
     
@@ -383,3 +390,13 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
         plt.show()
 
 
+def log_graph_stats(graph: HeteroData, logger, prefix="GraphSample"):
+    for ntype in graph.node_types:
+        num = graph[ntype].x.size(0)
+        logger.info(f"[{prefix}] nodes '{ntype}': {num}")
+    for etype, eidx in graph.edge_index_dict.items():
+        num = eidx.size(1)
+        logger.info(f"[{prefix}] edges '{etype}': {num}")
+    total_nodes = sum(graph[nt].x.size(0) for nt in graph.node_types)
+    total_edges = sum(e.size(1)     for e  in graph.edge_index_dict.values())
+    logger.info(f"[{prefix}] total_nodes={total_nodes}, total_edges={total_edges}")
