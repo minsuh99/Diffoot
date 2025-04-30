@@ -296,7 +296,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0429_diffusion_lr_curve.png')
+plt.savefig('results/0430_diffusion_lr_curve.png')
 
 plt.show()
 
