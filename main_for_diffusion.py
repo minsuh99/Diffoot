@@ -47,7 +47,7 @@ hyperparams = {
     'self_conditioning_ratio': 0.5,
     
     'num_steps': 500,
-    'ddim_steps': 50,
+    'ddim_steps': 200,
     'eta': 0.0,
     'embedding_dim': 128,
     'base_channels': 128,

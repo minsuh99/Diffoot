@@ -32,7 +32,16 @@ class DiffusionTrajectoryModel(nn.Module):
         t = torch.randint(0, self.num_steps, (B,), device=device)
         x_t, noise = self.q_sample(x_0, t)
         
-        noise_pred = self.model(x_t, t, cond_info, self_cond)
+        x_in = x_t.permute(0, 3, 2, 1).contiguous()  # [B, D, N, T]
+        
+        if cond_info is not None:
+            graph_rep, hist_rep = cond_info
+            cond = (graph_rep, hist_rep)
+        else:
+            cond = None
+        
+        noise_pred = self.model(x_in, t, cond, self_cond)
+        noise_pred = noise_pred.permute(0, 3, 2, 1).contiguous()
         noise_loss = F.mse_loss(noise_pred, noise)
         
         a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
@@ -56,17 +65,21 @@ class DiffusionTrajectoryModel(nn.Module):
             graph_rep, hist_rep = cond_info
             graph_rep = graph_rep.to(device).repeat(num_samples, 1)
             hist_rep = hist_rep.to(device).repeat(num_samples, 1)
+            cond = (graph_rep, hist_rep)
+        else:
+            cond = None
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
+        x = x.permute(0, 3, 2, 1).contiguous()  # [1, D, N, T]
 
         for i, t in enumerate(reversed(timesteps)):
-            t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i+2)]
+            t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i + 2)]
 
             ah_t = alpha_hat[t]
             ah_t_prev = alpha_hat[t_prev]
             
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(x, t_batch, (graph_rep, hist_rep), self_cond=None)
+            noise_pred = self.model(x, t_batch, cond_info=cond, self_cond=None)
 
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
 
@@ -81,4 +94,5 @@ class DiffusionTrajectoryModel(nn.Module):
             else:
                 x = x_det
 
+        x = x.permute(0, 3, 2, 1).contiguous()
         return x.view(num_samples, B, T, N, D)  # [1, B, T, N, D]
