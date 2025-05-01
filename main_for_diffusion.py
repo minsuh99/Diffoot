@@ -311,9 +311,7 @@ plt.title(f"Train & Validation Loss, {num_steps} steps, {base_channels} base cha
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0501_diffusion_lr_curve.png')
-
-plt.show()
+plt.savefig('results/0502_diffusion_lr_curve.png')
 
 # 5. Inference (Best-of-N Sampling) & Visualization
 model.eval()
