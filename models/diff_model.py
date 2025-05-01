@@ -29,8 +29,6 @@ class DiffusionTrajectoryModel(nn.Module):
         B = x_0.size(0)
         device = x_0.device
         
-        
-        
         t = torch.randint(0, self.num_steps, (B,), device=device)
         x_t, noise = self.q_sample(x_0, t)
         
@@ -44,29 +42,43 @@ class DiffusionTrajectoryModel(nn.Module):
         player_fde = per_player_fde_loss(x_0_pred, x_0)
         return noise_loss, player_frechet, player_fde
 
+    # DDIM Sampling
     @torch.no_grad()
-    def generate(self, shape, cond_info=None, num_samples=10):
+    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
         B, T, N, D = shape
         device = next(self.parameters()).device
-        
+
+        timesteps = torch.linspace(0, self.num_steps - 1, ddim_steps, device=device).long()
+        alphas = self.alphas
+        alpha_hat = self.alpha_hat
+
         if cond_info is not None:
-            cond_info = cond_info.to(device).repeat(num_samples, 1, 1, 1)
+            graph_rep, hist_rep = cond_info
+            graph_rep = graph_rep.to(device).repeat(num_samples, 1)
+            hist_rep = hist_rep.to(device).repeat(num_samples, 1)
+
+        x = torch.randn(num_samples * B, T, N, D, device=device)
+
+        for i, t in enumerate(reversed(timesteps)):
+            t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i+2)]
+
+            ah_t = alpha_hat[t]
+            ah_t_prev = alpha_hat[t_prev]
             
-        x_t = torch.randn(num_samples * B, T, N, D, device=device)
-        self_cond = None
-        
-        for t in reversed(range(self.num_steps)):
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(x_t, t_batch, cond_info, self_cond)
-            
-            noise = torch.randn_like(x_t) if t > 0 else torch.zeros_like(x_t)
-            
-            alpha = self.alphas[t]
-            alpha_hat = self.alpha_hat[t]
-            beta = self.betas[t]
-            
-            x_prev = (1.0 / torch.sqrt(alpha)) * (x_t - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * noise_pred) + torch.sqrt(beta) * noise
-            
-            self_cond = x_prev
-            x_t = x_prev
-        return x_t.view(num_samples, B, T, N, D)
+            noise_pred = self.model(x, t_batch, (graph_rep, hist_rep), self_cond=None)
+
+            x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
+
+            # deterministic update
+            x_det = torch.sqrt(ah_t_prev) * x0_pred + torch.sqrt(1 - ah_t_prev) * noise_pred
+
+            # stochastic noise term
+            if eta > 0 and t_prev > 0:
+                sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t)
+                noise = torch.randn_like(x)
+                x = x_det + sigma_t * noise
+            else:
+                x = x_det
+
+        return x.view(num_samples, B, T, N, D)  # [1, B, T, N, D]

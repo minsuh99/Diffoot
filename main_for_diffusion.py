@@ -35,34 +35,52 @@ logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
 hyperparams = {
-    'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
+    'raw_data_path': "idsse-data",
     'data_save_path': "match_data",
     'train_batch_size': 32,
     'val_batch_size': 32,
     'test_batch_size': 32,
     'num_workers': 8,
+    
     'epochs': 50,
     'learning_rate': 1e-4,
     'self_conditioning_ratio': 0.5,
-    'num_samples': 10,
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
     'num_steps': 500,
+    'ddim_steps': 50,
+    'eta': 0.0,
     'embedding_dim': 128,
     'base_channels': 128,
     'depth': 4,
     'heads': 4,
     'feature_dim': 2,
+    
+    'num_samples': 10,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 }
+
 raw_data_path = hyperparams['raw_data_path']
 data_save_path = hyperparams['data_save_path']
+
 train_batch_size = hyperparams['train_batch_size']
 val_batch_size = hyperparams['val_batch_size']
 test_batch_size = hyperparams['test_batch_size']
 num_workers = hyperparams['num_workers']
+
 epochs = hyperparams['epochs']
 learning_rate = hyperparams['learning_rate']
 self_conditioning_ratio = hyperparams['self_conditioning_ratio']
+
+num_steps = hyperparams['num_steps']
+ddim_steps = hyperparams['ddim_steps']
+eta = hyperparams['eta']
+
+embedding_dim = hyperparams['embedding_dim']
+base_channels = hyperparams['base_channels']
+depth = hyperparams['depth']
+heads = hyperparams['heads']
+feature_dim = hyperparams['feature_dim']
+
 num_samples = hyperparams['num_samples']
 device = hyperparams['device']
 
@@ -117,11 +135,14 @@ print("---Data Load!---")
 # 3. Model Define
 # Extract node feature dimension
 sample = dataset[0]
+_, T, N = sample["target"].unsqueeze(0).shape
 graph = build_graph_sequence_from_condition({
     "condition": sample["condition"],
     "condition_columns": sample["condition_columns"],
     "pitch_scale": sample["pitch_scale"]
 }).to(device)
+
+after_padding_dim = ((T + 15) // 16) * 16
 
 log_graph_stats(graph, logger, prefix="InitGraphSample")
 
@@ -136,11 +157,11 @@ target_idx = [condition_columns.index(col) for col in target_columns if col in c
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
 history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
 denoiser = TrajectoryUNetDenoiser(
-    num_steps = hyperparams['num_steps'], embedding_dim = hyperparams['embedding_dim'], feature_dim = hyperparams['feature_dim'],
-    base_channels  = hyperparams['base_channels'], depth = hyperparams['depth'], heads = hyperparams['heads']
+    num_steps = num_steps, num_players = N // 2, seq_len = after_padding_dim, embedding_dim = embedding_dim, feature_dim = feature_dim,
+    base_channels = base_channels, depth = depth, heads = heads
 ).to(device)
 
-model = DiffusionTrajectoryModel(denoiser, num_steps=hyperparams['num_steps']).to(device)
+model = DiffusionTrajectoryModel(denoiser, num_steps=num_steps).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor = 0.5, patience = 2, threshold = 1e-4)
 
@@ -265,7 +286,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) | Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) , FDE={avg_fde_loss:.6f})| Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
     
     tqdm.write(f"[Epoch {epoch}]\n"
                f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | FDE Loss: {avg_fde_loss:.6f} LR: {current_lr:.6f}\n"
@@ -284,8 +305,8 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {hyperparams['num_steps']} steps, {hyperparams['base_channels']} base channels, "
-          f"{hyperparams['embedding_dim']} embedding dim, {hyperparams['depth']} depth "
+plt.title(f"Train & Validation Loss, {num_steps} steps, {base_channels} base channels, "
+          f"{embedding_dim} embedding dim, {depth} depth "
           f"self-conditioning ratio: {self_conditioning_ratio}")
 plt.legend()
 plt.tight_layout()
@@ -321,12 +342,13 @@ with torch.no_grad():
                     
         scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
         scales = scales.view(B, 1, 1, 2)
+        target_den = target * scales
 
-        for _ in tqdm(range(num_samples), desc="Generating..."):
-            pred_i = model.generate(shape=target.shape, cond_info=cond_info, num_samples=1)[0]
+        preds = model.generate(target.shape, cond_info, ddim_steps = ddim_steps, eta = eta, num_samples = num_samples)
 
+        for i in range(preds.shape[0]):
+            pred_i = preds[i]
             pred_i_den = pred_i * scales
-            target_den = target * scales
             
             ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
             fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
