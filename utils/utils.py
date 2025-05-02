@@ -351,7 +351,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
         if annotate and other_columns is not None:
             col_x = other_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]
-            x0, y0 = others[0, m, 0], others[0, m, 1]
+            x0, y0 = others[-1, m, 0], others[-1, m, 1]
             ax.text(x0 + 0.5, y0 + 0.5, jersey, color='red', fontsize=10)
     # ball
     ball_x, ball_y = others[:, 11, 0], others[:, 11, 1]
@@ -368,7 +368,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
     if annotate and target_columns is not None:
         col_x = target_columns[2 * i]  # e.g. 'Home_2_x'
         jersey = col_x.split('_')[1]
-        x0, y0 = target[0, i, 0], target[0, i, 1]
+        x0, y0 = target[-1, i, 0], target[-1, i, 1]
         ax.text(x0 + 0.5, y0 + 0.5, jersey, color='blue', fontsize=10)
     
     x, y = pred[:, i, 0], pred[:, i, 1]
@@ -378,7 +378,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
     if annotate and target_columns is not None:
         col_x = target_columns[2 * i]  # e.g. 'Home_2_x'
         jersey = col_x.split('_')[1]
-        x0, y0 = pred[0, i, 0], pred[0, i, 1]
+        x0, y0 = pred[-1, i, 0], pred[-1, i, 1]
         ax.text(x0 + 0.5, y0 + 0.5, f"{jersey}(pred)", color='blue', fontsize=10)
 
     ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=True)

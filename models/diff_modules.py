@@ -66,35 +66,45 @@ class DiffusionEmbedding(nn.Module):
 class DownsampleBlock(nn.Module):
     def __init__(self, in_channels, out_channels, groups = 8, dilation = (1, 1)):
         super().__init__()
-        self.conv = DilatedCausalConv2d(in_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
-        self.norm = nn.GroupNorm(groups, out_channels)
+        self.conv1 = DilatedCausalConv2d(in_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
+        self.norm1 = nn.GroupNorm(groups, out_channels)
+        self.conv2 = DilatedCausalConv2d(out_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
+        self.norm2 = nn.GroupNorm(groups, out_channels)
         self.act  = nn.ReLU(inplace=True)
         self.pool = nn.AvgPool2d((1, 2), ceil_mode=True)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        skip = x
-        x = self.pool(x)
-        return x, skip
+        x1 = self.conv1(x)
+        x1 = self.norm1(x1)
+        x1 = self.act(x1)
+        x2 = self.conv2(x1)
+        x2 = self.norm2(x2)
+        x2 = self.act(x2 + x1)
+        skip = x2
+        out = self.pool(x2)
+        return out, skip
 
 
 class UpsampleBlock(nn.Module):
     def __init__(self, in_channels, out_channels, groups = 8, dilation = (1, 1)):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size = (1, 2), stride = (1, 2))
-        self.conv = DilatedCausalConv2d(in_channels + out_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
-        self.norm = nn.GroupNorm(groups, out_channels)
+        self.conv1 = DilatedCausalConv2d(in_channels + out_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
+        self.norm1 = nn.GroupNorm(groups, out_channels)
+        self.conv2 = DilatedCausalConv2d(out_channels, out_channels, kernel_size = (3, 3), dilation = dilation)
+        self.norm2 = nn.GroupNorm(groups, out_channels)
         self.act  = nn.ReLU(inplace=True)
 
     def forward(self, x, skip):
         x = self.up(x)
         x = torch.cat([x, skip], dim=1)
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)                
-        return x
+        x1 = self.conv1(x)
+        x1 = self.norm1(x1)
+        x1 = self.act(x1)
+        x2 = self.conv2(x1)
+        x2 = self.norm2(x2)
+        out = self.act(x2 + x1)         
+        return out
 
 
 class CrossAttentionBlock(nn.Module):
@@ -132,11 +142,15 @@ class TrajectoryUNetDenoiser(nn.Module):
         self.diff_emb = DiffusionEmbedding(num_steps, embedding_dim, projection_dim=base_channels)
         self.input_conv2d = nn.Conv2d(feature_dim, base_channels, kernel_size=(1, 1))
         self.pos_enc = PositionalEncoding2D(num_players, seq_len, base_channels)
+        
+        # dilation schedule
+        dilations = [(1, 2**i) for i in range(depth)]
 
         self.downs = nn.ModuleList([
             DownsampleBlock(
                 in_channels = base_channels * (2 ** i) if i > 0 else base_channels,
-                out_channels = base_channels * (2 ** (i + 1))
+                out_channels = base_channels * (2 ** (i + 1)),
+                dilation = dilations[i]
             ) for i in range(depth)
         ])
 
@@ -155,7 +169,8 @@ class TrajectoryUNetDenoiser(nn.Module):
         self.ups = nn.ModuleList([
             UpsampleBlock(
                 in_channels = bottleneck_ch if i == 0 else base_channels * (2 ** (depth- i + 1)),
-                out_channels = base_channels * (2 ** (depth - i))
+                out_channels = base_channels * (2 ** (depth - i)),
+                dilation = dilations[depth - i]
             ) for i in range(1, depth+1)
         ])
 

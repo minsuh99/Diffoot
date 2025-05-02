@@ -1,6 +1,9 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_WARN_ONCE"] = "1"
+import warnings
+warnings.filterwarnings("ignore")
 import logging
 import torch
 import numpy as np
@@ -20,7 +23,7 @@ from utils.graph_utils import build_graph_sequence_from_condition
 # SEED Fix
 SEED = 42
 set_evertyhing(SEED)
-
+torch.set_float32_matmul_precision('high')
 
 # Save Log / Logger Setting
 model_save_path = './results/logs/'
@@ -131,6 +134,9 @@ test_dataloader = DataLoader(
 )
 
 print("---Data Load!---")
+print(f"Train Dataset: {len(train_dataloader)} samples | "
+      f"Validation Dataset: {len(val_dataloader)} samples | "
+      f"Test Dataset: {len(test_dataloader)} samples")
 
 # 3. Model Define
 # Extract node feature dimension
@@ -162,13 +168,13 @@ denoiser = TrajectoryUNetDenoiser(
 ).to(device)
 
 model = DiffusionTrajectoryModel(denoiser, num_steps=num_steps).to(device)
+model = torch.compile(model)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor = 0.5, patience = 2, threshold = 1e-4)
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
 logger.info(f"HistoryEncoder: {history_encoder}")
-logger.info(f"Denoiser : {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {model}")
 
 
@@ -300,12 +306,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
         
 # 4-1. Plot learning_curve
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=(12, 8))
 plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {num_steps} steps, {base_channels} base channels, "
+plt.title(f"Train & Validation Loss, {num_steps} steps, {base_channels} base channels\n"
           f"{embedding_dim} embedding dim, {depth} depth "
           f"self-conditioning ratio: {self_conditioning_ratio}")
 plt.legend()
@@ -314,6 +320,7 @@ plt.tight_layout()
 plt.savefig('results/0502_diffusion_lr_curve.png')
 
 # 5. Inference (Best-of-N Sampling) & Visualization
+model.load_state_dict(best_state_dict)
 model.eval()
 all_best_ades_test = []
 all_best_fdes_test = []
