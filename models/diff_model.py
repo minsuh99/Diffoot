@@ -25,24 +25,24 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, cond_info=None, self_cond=None):
+    def forward(self, x_0, cond_info=None, graph_batch=None, self_cond=None):
         B = x_0.size(0)
         device = x_0.device
         
         t = torch.randint(0, self.num_steps, (B,), device=device)
         x_t, noise = self.q_sample(x_0, t)
+        x_t_in = x_t.permute(0, 3, 2, 1)
+
         
-        if cond_info is not None:
-            graph_rep, hist_rep = cond_info
-            cond = (graph_rep, hist_rep)
-        else:
-            cond = None
+        noise_pred = self.model(x_t_in, cond_info, t, graph_batch, self_cond)
+        noise_true = noise.permute(0, 3, 2, 1)
         
-        noise_pred = self.model(x_t, t, cond, self_cond)
+        noise_loss = F.mse_loss(noise_pred, noise_true)
+        noise_pred = noise_pred.permute(0, 3, 2, 1)
         
-        noise_loss = F.mse_loss(noise_pred, noise)
         a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
         x_0_pred = (x_t - torch.sqrt(1 - a_hat) * noise_pred) / torch.sqrt(a_hat)
+
         player_frechet = per_player_frechet_loss(x_0_pred, x_0)
         player_fde = per_player_fde_loss(x_0_pred, x_0)
         
@@ -50,21 +50,16 @@ class DiffusionTrajectoryModel(nn.Module):
 
     # DDIM Sampling
     @torch.no_grad()
-    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
+    def generate(self, shape, cond_info=None, graph_batch=None, ddim_steps=50, eta=0.0, num_samples=1):
         B, T, N, D = shape
         device = next(self.parameters()).device
 
         timesteps = torch.linspace(0, self.num_steps - 1, ddim_steps, device=device).long()
-        alphas = self.alphas
         alpha_hat = self.alpha_hat
 
         if cond_info is not None:
-            graph_rep, hist_rep = cond_info
-            graph_rep = graph_rep.to(device).repeat(num_samples, 1)
-            hist_rep = hist_rep.to(device).repeat(num_samples, 1)
-            cond = (graph_rep, hist_rep)
-        else:
-            cond = None
+            cond_info = cond_info.to(device).unsqueeze(0).repeat(num_samples, 1, 1, 1, 1)
+            cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
 
@@ -75,7 +70,10 @@ class DiffusionTrajectoryModel(nn.Module):
             ah_t_prev = alpha_hat[t_prev]
             
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(x, t_batch, cond_info=cond, self_cond=None)
+            
+            x_in = x.permute(0, 3, 2, 1)
+            noise_pred = self.model(x_in, cond_info, t_batch, graph_batch, self_cond=None)
+            noise_pred = noise_pred.permute(0, 3, 2, 1)
 
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
 
