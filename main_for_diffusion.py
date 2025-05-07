@@ -1,24 +1,7 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_WARN_ONCE"] = "1"
-import warnings
-warnings.filterwarnings("ignore")
 import logging
-
-fx_logger = logging.getLogger("torch.fx.experimental.symbolic_shapes")
-class OnceFilter(logging.Filter):
-    def __init__(self):
-        super().__init__()
-        self.seen = set()
-    def filter(self, record):
-        msg = record.getMessage()
-        if msg in self.seen:
-            return False
-        self.seen.add(msg)
-        return True
-fx_logger.addFilter(OnceFilter())
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -26,8 +9,7 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.amp import GradScaler, autocast
-from models.diff_modules import DiffCSDI
+from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
 from make_dataset import MultiMatchSoccerDataset, organize_and_process
@@ -38,7 +20,7 @@ from utils.graph_utils import build_graph_sequence_from_condition
 # SEED Fix
 SEED = 42
 set_evertyhing(SEED)
-torch.set_float32_matmul_precision('high')
+
 
 # Save Log / Logger Setting
 model_save_path = './results/logs/'
@@ -53,64 +35,44 @@ logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
 csdi_config = {
-    'num_steps': 500,
-    'channels': 128,
-    'diffusion_embedding_dim': 128,
-    'nheads': 4,
-    'layers': 5,
-    'side_dim': 256
+    "num_steps": 500,
+    "channels": 128,
+    "diffusion_embedding_dim": 128,
+    "nheads": 4,
+    "layers": 5,
+    # "side_dim": 128
+    "side_dim": 256
 }
-
 hyperparams = {
-    'raw_data_path': "idsse-data",
+    'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
     'data_save_path': "match_data",
-    'train_batch_size': 64,
-    'val_batch_size': 64,
-    'test_batch_size': 64,
+    'train_batch_size': 32,
+    'val_batch_size': 32,
+    'test_batch_size': 32,
     'num_workers': 8,
-    
     'epochs': 50,
-    'learning_rate': 5e-4,
+    'learning_rate': 1e-4,
     'self_conditioning_ratio': 0.5,
-    
-    'num_steps': 500,
-    'ddim_steps': 200,
-    'eta': 0.0,
-    'embedding_dim': 128,
-    'base_channels': 128,
-    'depth': 4,
-    'heads': 4,
-    'feature_dim': 2,
-    
     'num_samples': 10,
-    'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+
+    'ddim_step': 50,
+    'eta': 0.0
     **csdi_config
 }
-
 raw_data_path = hyperparams['raw_data_path']
 data_save_path = hyperparams['data_save_path']
-
 train_batch_size = hyperparams['train_batch_size']
 val_batch_size = hyperparams['val_batch_size']
 test_batch_size = hyperparams['test_batch_size']
 num_workers = hyperparams['num_workers']
-
 epochs = hyperparams['epochs']
 learning_rate = hyperparams['learning_rate']
 self_conditioning_ratio = hyperparams['self_conditioning_ratio']
-
-num_steps = hyperparams['num_steps']
-ddim_steps = hyperparams['ddim_steps']
-eta = hyperparams['eta']
-
-embedding_dim = hyperparams['embedding_dim']
-base_channels = hyperparams['base_channels']
-depth = hyperparams['depth']
-heads = hyperparams['heads']
-feature_dim = hyperparams['feature_dim']
-
 num_samples = hyperparams['num_samples']
 device = hyperparams['device']
+ddim_step = hyperparams['ddim_step']
+eta = hyperparams['eta']
 
 logger.info(f"Hyperparameters: {hyperparams}")
 
@@ -159,19 +121,16 @@ test_dataloader = DataLoader(
 )
 
 print("---Data Load!---")
-print(f"Train Dataset: {len(train_dataloader.dataset)} samples | "
-      f"Validation Dataset: {len(val_dataloader.dataset)} samples | "
-      f"Test Dataset: {len(test_dataloader.dataset)} samples")
 
 # 3. Model Define
 # Extract node feature dimension
 sample = dataset[0]
-_, T, N = sample["target"].unsqueeze(0).shape
 graph = build_graph_sequence_from_condition({
     "condition": sample["condition"],
     "condition_columns": sample["condition_columns"],
     "pitch_scale": sample["pitch_scale"]
 }).to(device)
+
 log_graph_stats(graph, logger, prefix="InitGraphSample")
 
 in_dim = graph['Node'].x.size(1)
@@ -181,17 +140,18 @@ condition_columns = sample["condition_columns"]
 target_columns = sample["target_columns"]
 target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
 
-# graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
-# history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
-denoiser = DiffCSDI(csdi_config, input_dim=feature_dim).to(device)
-
-model = DiffusionTrajectoryModel(denoiser, num_steps=num_steps).to(device)
+# graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
+graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
+history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
+denoiser = diff_CSDI(csdi_config)
+model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor = 0.5, patience = 2, threshold = 1e-4)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4)
 
 logger.info(f"Device: {device}")
-# logger.info(f"GraphEncoder: {graph_encoder}")
-# logger.info(f"HistoryEncoder: {history_encoder}")
+logger.info(f"GraphEncoder: {graph_encoder}")
+logger.info(f"HistoryEncoder: {history_encoder}")
+logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {model}")
 
 
@@ -202,61 +162,68 @@ best_val_loss = float("inf")
 train_losses = []
 val_losses   = []
 
-model.train()
-scaler = GradScaler()
-
 for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
+    model.train()
     train_noise_loss = 0
     # train_mse_loss = 0
     train_frechet_loss = 0
     train_fde_loss = 0
     train_loss = 0
 
-    for batch in tqdm(train_dataloader, desc=f"Epoch {epoch} Train"):
-        cond_all=batch['condition'].to(device)  # (B,T,C_all)
-        B, T, _ = cond_all.shape
-        target = batch['target'].to(device).view(B,T,11, feature_dim)
-        graph_batch = batch['graph'].to(device)
+    for batch in tqdm(train_dataloader, desc = "Batch Training..."):
+        cond = batch["condition"].to(device)
+        B, T, _ = cond.shape
+        target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
-        # other trajectories -> cond_info
-        cols = batch['condition_columns'][0]
-        others_cols = batch['other_columns'][0]
-
-        idxs = [cols.index(c) for c in others_cols]
-        tmp = cond_all[:,:,idxs].view(B, T, len(others_cols)//2, feature_dim)
-        cond_info = tmp.permute(0,3,2,1)     # (B,2,M,T)
-
-        # Self-conditioning
+        # graph → H
+        H = graph_encoder(graph_batch)                                       # [B, 128]
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        
+        # Target's history trajectories
+        hist = cond[:, :, target_idx].to(device) 
+        hist_rep = history_encoder(hist)  # [B, 128]
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        
+        # Concat conditions
+        cond_info = torch.cat([cond_H, cond_hist], dim=1)
+        # Preparing Self-conditioning data
         if torch.rand(1, device=device) < self_conditioning_ratio:
-            s = None
+            s = torch.zeros_like(target)
         else:
-            t0 = torch.randint(0, model.num_steps, (B,), device=device)
-            x_t, _ = model.q_sample(target, t0)
-            x_t_in = x_t.permute(0, 3, 2, 1)  # [B, C, N, T] → [B, T, N, C]
             with torch.no_grad():
-                eps1 = denoiser(x_t_in, cond_info, t0, graph_batch, self_cond=None)
-            eps1 = eps1.permute(0, 3, 2, 1)  # [B, T, N, C] → [B, C, N, T]
-            a_hat0 = model.alpha_hat[t0].view(-1, 1, 1, 1)
-            s = (x_t - torch.sqrt(1 - a_hat0) * eps1) / torch.sqrt(a_hat0)
-
+                t = torch.randint(0, model.num_steps, (target.size(0),), device=device)
+                x_t, noise = model.q_sample(target, t)
+                x_t = x_t.permute(0,3,2,1)
+                eps_pred1 = model.model(x_t, t, cond_info, self_cond=None)
+                a_hat = model.alpha_hat.to(device)[t].view(-1,1,1,1)
+                x0_hat = (x_t - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
+                x0_hat = x0_hat.permute(0,3,2,1)
+            s = x0_hat
+        
+        # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
+        # loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
+        
+        noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
+        loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
+        
         optimizer.zero_grad()
-        with autocast(device_type='cuda', dtype=torch.float16):
-            noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, graph_batch=graph_batch, self_cond=s)
-            loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
 
         train_noise_loss += (noise_loss).item()
+        # train_mse_loss += (player_loss_mse).item()
         train_frechet_loss += (player_loss_frechet * 0.2).item()
         train_fde_loss += player_loss_fde.item()
         train_loss += loss.item()
 
-    avg_noise_loss = train_noise_loss / len(train_dataloader)
-    avg_frechet_loss = train_frechet_loss / len(train_dataloader)
-    avg_fde_loss = train_fde_loss / len(train_dataloader)
-    avg_train_loss = train_loss / len(train_dataloader)
+    num_batches = len(train_dataloader)
+    
+    avg_noise_loss = train_noise_loss / num_batches
+    # avg_mse_loss = train_mse_loss / num_batches
+    avg_frechet_loss = train_frechet_loss / num_batches
+    avg_fde_loss = train_fde_loss / num_batches
+    avg_train_loss = train_loss / num_batches
 
 
     # --- Validation ---
@@ -268,29 +235,39 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     val_total_loss = 0
 
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc=f"Epoch {epoch} Val"):
-            cond_all=batch['condition'].to(device)
-            B, T, _ = cond_all.shape
-            target = batch['target'].to(device).view(B,T,11,feature_dim)
-            graph_batch = batch['graph'].to(device)
+        for batch in tqdm(val_dataloader, desc="Validation"):
+            cond = batch["condition"].to(device)
+            B, T, _ = cond.shape
+            target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
-            cols = batch['condition_columns'][0]
-            others_cols = batch['other_columns'][0]
-
-            idxs = [cols.index(c) for c in others_cols]
-
-            tmp = cond_all[:,:,idxs].view(B, T, len(others_cols)//2, feature_dim)
-            cond_info = tmp.permute(0,3,2,1)
-
-            noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, graph_batch=graph_batch, self_cond=None)
+            # graph → H
+            H = graph_encoder(graph_batch)                                       # [B, 128]
+            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            
+            # Target's history trajectories
+            hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
+            hist_rep = history_encoder(hist)  # [B, 128]
+            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+            
+            # Concat conditions
+            cond_info = torch.cat([cond_H, cond_hist], dim=1)
+            
+            s = torch.zeros_like(target)
+            
+            # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
+            # val_loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
+            noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
             val_loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
             
             val_noise_loss += (noise_loss).item()
+            # val_mse_loss += (player_loss_mse).item()
             val_frechet_loss += (player_loss_frechet * 0.2).item()
             val_fde_loss += player_loss_fde.item()
             val_total_loss += val_loss.item()
 
     avg_val_noise_loss = val_noise_loss / len(val_dataloader)
+    # avg_val_mse_loss = val_mse_loss / len(val_dataloader)
     avg_val_frechet_loss = val_frechet_loss / len(val_dataloader)
     avg_val_fde_loss = val_fde_loss / len(val_dataloader)
     avg_val_loss = val_total_loss / len(val_dataloader)
@@ -299,7 +276,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) , FDE={avg_fde_loss:.6f})| Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) | Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
     
     tqdm.write(f"[Epoch {epoch}]\n"
                f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | FDE Loss: {avg_fde_loss:.6f} LR: {current_lr:.6f}\n"
@@ -313,21 +290,22 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
         
 # 4-1. Plot learning_curve
-plt.figure(figsize=(12, 8))
+plt.figure(figsize=(8, 6))
 plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {num_steps} steps, {base_channels} base channels\n"
-          f"{embedding_dim} embedding dim, {depth} depth "
+plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels, "
+          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers "
           f"self-conditioning ratio: {self_conditioning_ratio}")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0505_diffusion_lr_curve.png')
+plt.savefig('results/0430_diffusion_lr_curve.png')
+
+plt.show()
 
 # 5. Inference (Best-of-N Sampling) & Visualization
-model.load_state_dict(best_state_dict)
 model.eval()
 all_best_ades_test = []
 all_best_fdes_test = []
@@ -335,32 +313,32 @@ visualize_samples = 5
 visualized = False
 
 with torch.no_grad():
-    for batch in tqdm(test_dataloader,desc="Test"):
-        cond_all = batch['condition'].to(device)
-        B, T, _ = cond_all.shape
-        target = batch['target'].to(device).view(B, T, 11, feature_dim)
-        graph_batch = batch['graph'].to(device)
-        
-        cols = batch['condition_columns'][0]
-        others_cols = batch['other_columns'][0]
+    for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
+        cond = batch["condition"].to(device)
+        B, T, _ = cond.shape
+        target = batch["target"].to(device).view(B, T, 11, 2)
 
-        idxs = [cols.index(c) for c in others_cols]
-
-        tmp = cond_all[:,:,idxs].view(B, T, len(others_cols)//2, feature_dim)
-        cond_info = tmp.permute(0,3,2,1)
+        graph_batch  = batch["graph"].to(device)
+        H = graph_encoder(graph_batch)
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
-        best_ade_t = torch.full((B,),float('inf'),device=device)
+        hist = cond[:, :, target_idx].to(device)
+        hist_rep = history_encoder(hist)
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        cond_info = torch.cat([cond_H, cond_hist], dim=1)
+
+        best_ade_t = torch.full((B,), float("inf"), device=device)
         best_pred_t = torch.zeros_like(target)
-        best_fde_t = torch.full((B,),float('inf'),device=device)
-        
-        preds=model.generate(target.shape, cond_info=cond_info, graph_batch=graph_batch, 
-                             ddim_steps=hyperparams['ddim_steps'], eta=hyperparams['eta'],num_samples=hyperparams['num_samples'])
-        scales=torch.tensor(batch['pitch_scale'],device=device).view(B,1,1,2)
-        target_den = target * scales
+        best_fde_t = torch.full((B,), float("inf"), device=device)
+                    
+        scales = torch.tensor(batch["pitch_scale"], device=device, dtype=torch.float32)  
+        scales = scales.view(B, 1, 1, 2)
 
-        for i in range(preds.shape[0]):
-            pred_i = preds[i]
+        for _ in tqdm(range(num_samples), desc="Generating..."):
+            pred_i = model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]
+
             pred_i_den = pred_i * scales
+            target_den = target * scales
             
             ade_i = ((pred_i_den - target_den)**2).sum(-1).sqrt().mean((1,2))
             fde_i = ((pred_i_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
