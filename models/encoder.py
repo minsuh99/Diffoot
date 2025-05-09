@@ -118,17 +118,17 @@ class AttentionPooling(nn.Module):
 
     def forward(self, x, batch):
         # x: (N, C)
-        scores  = (x * self.query).sum(-1)    # (N,)
+        scores = (x * self.query).sum(-1)    # (N,)
         weights = softmax(scores, batch)      # (N,)
-        out     = weights.unsqueeze(-1) * x   # (N, C)
+        out = weights.unsqueeze(-1) * x   # (N, C)
 
         B = int(batch.max().item()) + 1
         C = x.size(-1)
 
-        graph_rep = out.new_zeros((B, C))
-        graph_rep.index_add_(0, batch, out)
+        pool = out.new_zeros((B, C))
+        pool.index_add_(0, batch, out)
 
-        return graph_rep
+        return pool
 
 
 class InteractionGraphEncoder(nn.Module):
@@ -137,7 +137,7 @@ class InteractionGraphEncoder(nn.Module):
         # normalization and pooling
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.pool  = AttentionPooling(hidden_dim)
+        self.pool = AttentionPooling(hidden_dim)
 
         # define edge types
         edge_types = [

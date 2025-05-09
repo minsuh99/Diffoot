@@ -57,7 +57,7 @@ hyperparams = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
-    'eta': 0.0
+    'eta': 0.0,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
