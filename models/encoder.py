@@ -106,7 +106,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, HeteroConv
+from torch_geometric.nn import GCNConv, HeteroConv
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import softmax
 
@@ -132,7 +132,7 @@ class AttentionPooling(nn.Module):
 
 
 class InteractionGraphEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim=128, out_dim=128, heads=4):
+    def __init__(self, in_dim, hidden_dim=128, out_dim=128):
         super().__init__()
         # normalization and pooling
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -149,21 +149,15 @@ class InteractionGraphEncoder(nn.Module):
             ('Node', 'temporal', 'Node'),
         ]
         # 1st layer convs: from in_dim to hidden_dim
-        conv1 = { rel: GATConv(
+        conv1 = { rel: GCNConv(
                     in_channels=in_dim,
-                    out_channels=hidden_dim // heads,
-                    heads=heads,
-                    concat=True,
-                    dropout=0.1,
+                    out_channels=hidden_dim,
                     add_self_loops=False
                 ) for rel in edge_types }
         # 2nd layer convs: from hidden_dim to hidden_dim
-        conv2 = { rel: GATConv(
+        conv2 = { rel: GCNConv(
                     in_channels=hidden_dim,
-                    out_channels=hidden_dim // heads,
-                    heads=heads,
-                    concat=True,
-                    dropout=0.1,
+                    out_channels=hidden_dim,
                     add_self_loops=False
                 ) for rel in edge_types }
         self.het1 = HeteroConv(conv1, aggr='sum')
@@ -173,14 +167,12 @@ class InteractionGraphEncoder(nn.Module):
     def forward(self, graph: HeteroData):
         x_dict = {'Node': graph['Node'].x}
 
-        # first heterogeneous attention layer (no edge_weight)
-        x_dict = self.het1(x_dict, graph.edge_index_dict)
+        x_dict = self.het1(x_dict, graph.edge_index_dict, edge_weight_dict = graph.edge_attr_dict)
         x = x_dict['Node']
         x = F.softsign(x)
         x = self.norm1(x)
 
-        # second heterogeneous attention layer (no edge_weight)
-        x_dict = self.het2({'Node': x}, graph.edge_index_dict)
+        x_dict = self.het2({'Node': x}, graph.edge_index_dict, edge_weight_dict = graph.edge_attr_dict)
         x = x_dict['Node']
         x = F.softsign(x)
         x = self.norm2(x)

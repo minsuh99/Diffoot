@@ -5,24 +5,17 @@ import torch.nn.functional as F
 from utils.utils import per_player_frechet_loss, per_player_fde_loss
 
 class DiffusionTrajectoryModel(nn.Module):
-    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    def __init__(self, model, num_steps=1000, cosine_s=0.008):
+    def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
         
-        # ts = torch.linspace(0, 1, num_steps)
-        # betas = beta_start + (beta_end - beta_start) * (ts ** 2)
-        # alphas = 1.0 - betas
-        # alpha_hat = torch.cumprod(alphas, dim=0)
+        ts = torch.linspace(0, 1, num_steps)
+        betas = beta_start + (beta_end - beta_start) * (ts ** 2)
+        alphas = 1.0 - betas
+        alpha_hat = torch.cumprod(alphas, dim=0)
         
-        t = torch.linspace(0, num_steps, num_steps + 1) / num_steps
-        alphas_cumprod = torch.cos((t + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
-        betas = torch.clip(betas, min=0.0001, max=0.9999)
-        
-        alphas    = 1.0 - betas
+        alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
         
         self.register_buffer('betas', betas)
@@ -45,11 +38,19 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t_in = x_t.permute(0, 3, 2, 1)
 
         
-        noise_pred = self.model(x_t_in, t, cond_info, self_cond)
-        noise_true = noise.permute(0, 3, 2, 1)
+        z = self.model(x_t_in, t, cond_info, self_cond)
+        z = z.permute(0, 3, 2, 1)
         
-        noise_loss = F.mse_loss(noise_pred, noise_true)
-        noise_pred = noise_pred.permute(0, 3, 2, 1)
+        eps_pred, log_var = z[..., :2], z[..., 2:]
+        log_var = log_var.clamp(-10, 10)
+        var = log_var.exp()
+        noise_true = noise
+        
+        # NLL loss computing
+        nll = 0.5 * ((noise_true - eps_pred) ** 2 / var + log_var)
+        noise_loss = nll.mean()
+
+        noise_pred = eps_pred
         
         a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
         x_0_pred = (x_t - torch.sqrt(1 - a_hat) * noise_pred) / torch.sqrt(a_hat)
