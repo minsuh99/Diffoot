@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+from tslearn.metrics import SoftDTWLossPyTorch
 from torch_geometric.data import HeteroData
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -228,17 +229,38 @@ def correct_all_player_jumps_adjacent(df: pd.DataFrame, framerate=25.0, maxspeed
     return corrected_df
 
 
-def per_player_frechet_loss(pred, target):
-    # pred, target (B, T, N=11, 2)
-    dists = torch.norm(pred - target, dim=-1) # (B, T, N)
-    max_dists = dists.max(dim=1).values # (B, N)
-    return max_dists.mean(dim=1).mean()
+# 공유용 Soft‐DTW 객체 (gamma, normalize 값은 필요에 따라 바꿔주세요)
+soft_dtw = SoftDTWLossPyTorch(gamma=0.1, normalize=True)
+
+def per_player_dtw_loss(pred, target, x_scale=52.5, y_scale=34.0):
+    B, T, N, _ = pred.shape
+    loss = 0.0
+    # denormalize
+    pred_den = pred.clone()
+    target_den = target.clone()
+    pred_den[..., 0] *= x_scale
+    pred_den[..., 1] *= y_scale
+    target_den[..., 0] *= x_scale
+    target_den[..., 1] *= y_scale
+
+    for i in range(N):
+        pi = pred_den[:, :, i, :]   # [B, T, 2]
+        ti = target_den[:, :, i, :]
+        loss += soft_dtw(pi, ti).mean()
+    return loss / N
 
 
-def per_player_fde_loss(pred, target):
+def per_player_fde_loss(pred, target, x_scale=52.5, y_scale=34.0):
     # pred, target: [B, T, N, 2]
-    diff = pred[:, -1] - target[:, -1]     # [B, N, 2]
-    return diff.norm(dim=-1).mean()       # [B, N]→scalar
+    pred_den = pred.clone()
+    target_den = target.clone()
+    pred_den[..., 0] *= x_scale
+    pred_den[..., 1] *= y_scale
+    target_den[...,0] *= x_scale
+    target_den[...,1] *= y_scale
+
+    diff = pred_den[:, -1] - target_den[:, -1]     # [B, N, 2]
+    return diff.norm(dim=-1).mean()       # scalar
 
 
 def plot_pitch( field_dimen = (106.0,68.0), field_color ='green', linewidth=2, markersize=20):

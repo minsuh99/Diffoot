@@ -85,7 +85,7 @@ def extract_node_features(condition_tensor, condition_columns):
 # Edge
 def build_edges_based_on_interactions(node_features, pitch_scale):
     edge_index_dict, edge_attr_dict = {}, {}
-    x_scale, _ = pitch_scale
+    x_scale, y_scale = pitch_scale
 
     nodes = node_features["Node"]        # (N, F)
     node_type = nodes[:, -1]             # 0=Attk, 1=Def, 2=Ball
@@ -102,8 +102,8 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             return
 
         # 거리 계산 시 실제 거리 사용
-        s_pos = nodes[s_idx, :2] * x_scale
-        d_pos = nodes[d_idx, :2] * x_scale
+        s_pos = nodes[s_idx, :2] * torch.tensor([x_scale, y_scale], device=nodes.device)
+        d_pos = nodes[d_idx, :2] * torch.tensor([x_scale, y_scale], device=nodes.device)
         dist = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)).norm(dim=-1)  # (Ns, Nd)
         
         # possession 플래그
@@ -125,7 +125,7 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             W_dist = 1.0 / (1.0 + dist)
             
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
-            v_real = nodes[d_idx, 2:4] * x_scale
+            v_real = nodes[d_idx, 2:4] * torch.tensor([x_scale, y_scale], device=nodes.device) 
             v_def = v_real.unsqueeze(0).expand(dist.size(0), -1, -1)                         # (Ns,Nd,2)
             W_situation = (v_def * dir_vec).sum(dim=-1)
             
@@ -135,7 +135,7 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             W_dist = torch.exp(-dist * 0.15)
             
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
-            v_s = nodes[s_idx, 2:4] * x_scale
+            v_s = nodes[s_idx, 2:4] * torch.tensor([x_scale, y_scale], device=nodes.device)
             v_s = v_s.unsqueeze(1)                  # (Ns,1,2)
             W_approach = (v_s * dir_vec).sum(dim=-1)
             

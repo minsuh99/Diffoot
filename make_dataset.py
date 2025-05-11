@@ -453,13 +453,11 @@ class MultiMatchSoccerDataset(Dataset):
             info_path = os.path.join(self.data_root, match_id, "matchinformation.xml")
             pitch = read_pitch_from_mat_info_xml(info_path)
             self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
-        
-        # x_scale로만 나누기
-        # x-coor: [-52.5, 52.5] -> [-1, 1], y-coor: [-34, 34] -> [-0.647..., 0.647...]
+            
         x_scale, y_scale = self.pitch_cache[match_id]
 
         target_seq[target_columns[0::2]] /= x_scale
-        target_seq[target_columns[1::2]] /= x_scale
+        target_seq[target_columns[1::2]] /= y_scale
 
         # other_seq[other_columns[0::2]] = other_seq[other_columns[0::2]] / x_scale
         # other_seq[other_columns[1::2]] = other_seq[other_columns[1::2]] / y_scale
@@ -467,7 +465,7 @@ class MultiMatchSoccerDataset(Dataset):
         condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
         condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
         condition_seq[condition_x_cols] /= x_scale
-        condition_seq[condition_y_cols] /= x_scale
+        condition_seq[condition_y_cols] /= y_scale
 
         # Normalization for other columns
         # suffixes 는 기존과 동일
@@ -475,9 +473,9 @@ class MultiMatchSoccerDataset(Dataset):
             if col.endswith("_vx") or col.endswith("ball_vx"):
                 condition_seq[col] /= x_scale                  # m/s → 1/s
             elif col.endswith("_vy") or col.endswith("ball_vy"):
-                condition_seq[col] /= x_scale
+                condition_seq[col] /= y_scale
             elif col.endswith("_dist"):
-                condition_seq[col] /= x_scale
+                condition_seq[col] /= (x_scale**2 + y_scale**2) ** 0.5 
                 
         # Calculate possession duration & neighbor opposite player count
         Na = len(atk_bases)
@@ -487,7 +485,7 @@ class MultiMatchSoccerDataset(Dataset):
         ys = condition_seq[[f"{b}_y" for b in player_bases]].values
         
         xs *= x_scale
-        ys *= x_scale
+        ys *= y_scale
         
         coords = np.stack([xs, ys], axis=-1)
         diff2  = ((coords[:, :, None, :] - coords[:, None, :, :])**2).sum(-1)
