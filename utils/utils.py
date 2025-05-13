@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+from tslearn.metrics import SoftDTWLossPyTorch
 from torch_geometric.data import HeteroData
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -226,6 +227,16 @@ def correct_all_player_jumps_adjacent(df: pd.DataFrame, framerate=25.0, maxspeed
         corrected_df[col_y] = corrected[:, 1]
 
     return corrected_df
+
+def per_player_soft_dtw_loss(pred, target, gamma=0.1):
+    B, T, N, D = pred.shape
+    pred_flat   = pred.permute(0, 2, 1, 3).reshape(B * N, T, D)
+    target_flat = target.permute(0, 2, 1, 3).reshape(B * N, T, D)
+    
+    sdtw_fn = SoftDTWLossPyTorch(gamma=gamma, normalize=False)
+    loss_flat = sdtw_fn(pred_flat, target_flat)
+    
+    return loss_flat.mean()
 
 def per_player_frechet_loss(pred, target):
     # pred, target (B, T, N=11, 2)
