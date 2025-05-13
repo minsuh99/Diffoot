@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
@@ -35,20 +36,20 @@ logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
 csdi_config = {
-    "num_steps": 500,
-    "channels": 128,
-    "diffusion_embedding_dim": 128,
+    "num_steps": 1000,
+    "channels": 256,
+    "diffusion_embedding_dim": 256,
     "nheads": 4,
     "layers": 5,
     # "side_dim": 128
-    "side_dim": 256
+    "side_dim": 512
 }
 hyperparams = {
     'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
     'data_save_path': "match_data",
-    'train_batch_size': 32,
-    'val_batch_size': 32,
-    'test_batch_size': 32,
+    'train_batch_size': 16,
+    'val_batch_size': 16,
+    'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 1e-4,
@@ -56,8 +57,8 @@ hyperparams = {
     'num_samples': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 
-    'ddim_step': 50,
-    'eta': 0.0,
+    'ddim_step': 200,
+    'eta': 0.1,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
@@ -73,6 +74,7 @@ num_samples = hyperparams['num_samples']
 device = hyperparams['device']
 ddim_step = hyperparams['ddim_step']
 eta = hyperparams['eta']
+side_dim = hyperparams['side_dim']
 
 logger.info(f"Hyperparameters: {hyperparams}")
 
@@ -141,19 +143,19 @@ target_columns = sample["target_columns"]
 target_idx = [condition_columns.index(col) for col in target_columns if col in condition_columns]
 
 # graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128, heads = 2).to(device)
-graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=128, out_dim=128).to(device)
-history_encoder = TargetTrajectoryEncoder(num_layers=5).to(device)
+graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim // 2, out_dim=side_dim // 2).to(device)
+history_encoder = TargetTrajectoryEncoder(num_layers=5, hidden_dim = side_dim // 4, bidirectional=True).to(device)
 denoiser = diff_CSDI(csdi_config)
 model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-4)
+scaler = GradScaler()
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
 logger.info(f"HistoryEncoder: {history_encoder}")
 logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {model}")
-
 
 # 4. Train
 best_state_dict = None
@@ -164,10 +166,12 @@ val_losses   = []
 
 for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     model.train()
-    train_noise_loss = 0
-    # train_mse_loss = 0
+    train_noise_mse = 0
+    train_noise_nll = 0
     train_frechet_loss = 0
-    train_fde_loss = 0
+    # train_mse_loss = 0
+    # train_dtw_loss = 0
+    # train_fde_loss = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
@@ -183,55 +187,69 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         # Target's history trajectories
         hist = cond[:, :, target_idx].to(device) 
         hist_rep = history_encoder(hist)  # [B, 128]
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
         # Concat conditions
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
         # Preparing Self-conditioning data
+        # timestep (consistency)
+        t = torch.randint(0, model.num_steps, (target.size(0),), device=device)
         if torch.rand(1, device=device) < self_conditioning_ratio:
-            s = torch.zeros_like(target)
-        else:
             with torch.no_grad():
-                t = torch.randint(0, model.num_steps, (target.size(0),), device=device)
                 x_t, noise = model.q_sample(target, t)
                 x_t = x_t.permute(0,3,2,1)
-                eps_pred1 = model.model(x_t, t, cond_info, self_cond=None)
+                
+                z1 = model.model(x_t, t, cond_info, self_cond=None)
+                
+                eps_pred1 = z1[:, :2, :, :]
                 a_hat = model.alpha_hat.to(device)[t].view(-1,1,1,1)
                 x0_hat = (x_t - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
                 x0_hat = x0_hat.permute(0,3,2,1)
+                                
             s = x0_hat
+        else:
+            s = torch.zeros_like(target)
+
         
         # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
         # loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
-        
-        noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
-        loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
-        
+        noise_mse, noise_nll, player_frechet_loss = model(target, t=t, cond_info=cond_info, self_cond=s)
+        loss = noise_mse + noise_nll * 0.005 + player_frechet_loss * 0.1
+            
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        train_noise_loss += (noise_loss).item()
+        # train_noise_loss += (noise_loss).item()
         # train_mse_loss += (player_loss_mse).item()
-        train_frechet_loss += (player_loss_frechet * 0.2).item()
-        train_fde_loss += player_loss_fde.item()
+        # train_dtw_loss += (player_loss_dtw).item()
+        # train_fde_loss += (player_loss_fde).item()
+        train_noise_mse += (noise_mse).item()
+        train_noise_nll += (noise_nll * 0.005).item()
+        train_frechet_loss += (player_frechet_loss * 0.1).item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
     
-    avg_noise_loss = train_noise_loss / num_batches
-    # avg_mse_loss = train_mse_loss / num_batches
-    avg_frechet_loss = train_frechet_loss / num_batches
-    avg_fde_loss = train_fde_loss / num_batches
+    # avg_noise_loss = train_noise_loss / num_batches
+    # # avg_mse_loss = train_mse_loss / num_batches
+    # avg_dtw_loss = train_dtw_loss / num_batches
+    # avg_fde_loss = train_fde_loss / num_batches
+    avg_train_noise_mse = train_noise_mse / num_batches
+    avg_train_noise_nll = train_noise_nll / num_batches
+    avg_train_frechet_loss = train_frechet_loss / num_batches
     avg_train_loss = train_loss / num_batches
 
 
     # --- Validation ---
     model.eval()
-    val_noise_loss = 0
+    # val_noise_loss = 0
     # val_mse_loss = 0
+    # val_dtw_loss = 0
+    # val_fde_loss = 0
+    val_noise_mse = 0
+    val_noise_nll = 0
     val_frechet_loss = 0
-    val_fde_loss = 0
     val_total_loss = 0
 
     with torch.no_grad():
@@ -248,7 +266,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             # Target's history trajectories
             hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
             hist_rep = history_encoder(hist)  # [B, 128]
-            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
             
             # Concat conditions
             cond_info = torch.cat([cond_H, cond_hist], dim=1)
@@ -257,30 +275,41 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             
             # noise_loss, player_loss_mse, player_loss_frechet = model(target, cond_info=cond_info, self_cond=s)
             # val_loss = noise_loss + player_loss_mse + player_loss_frechet * 0.2
-            noise_loss, player_loss_frechet, player_loss_fde = model(target, cond_info=cond_info, self_cond=s)
-            val_loss = noise_loss + player_loss_frechet * 0.2 + player_loss_fde
-            
-            val_noise_loss += (noise_loss).item()
-            # val_mse_loss += (player_loss_mse).item()
-            val_frechet_loss += (player_loss_frechet * 0.2).item()
-            val_fde_loss += player_loss_fde.item()
+            noise_mse, noise_nll, player_frechet_loss = model(target, cond_info=cond_info, self_cond=s)
+            val_loss = noise_mse + noise_nll * 0.005 + player_frechet_loss * 0.1
+        
+            # val_noise_loss += (noise_loss).item()
+            # # val_mse_loss += (player_loss_mse).item()
+            # val_dtw_loss += (player_loss_dtw).item()
+            # val_fde_loss += (player_loss_fde).item()
+            val_noise_mse += (noise_mse).item()
+            val_noise_nll += (noise_nll * 0.005).item()
+            val_frechet_loss += (player_frechet_loss * 0.1).item()
             val_total_loss += val_loss.item()
 
-    avg_val_noise_loss = val_noise_loss / len(val_dataloader)
-    # avg_val_mse_loss = val_mse_loss / len(val_dataloader)
-    avg_val_frechet_loss = val_frechet_loss / len(val_dataloader)
-    avg_val_fde_loss = val_fde_loss / len(val_dataloader)
-    avg_val_loss = val_total_loss / len(val_dataloader)
+    # avg_val_noise_loss = val_noise_loss / len(val_dataloader)
+    # # avg_val_mse_loss = val_mse_loss / len(val_dataloader)
+    # avg_val_dtw_loss = val_dtw_loss / len(val_dataloader)
+    # avg_val_fde_loss = val_fde_loss / len(val_dataloader)
+    # avg_val_loss = val_total_loss / len(val_dataloader)
+    
+    num_batches = len(val_dataloader)
+    
+    avg_val_noise_mse = val_noise_mse / num_batches
+    avg_val_noise_nll = val_noise_nll / num_batches
+    avg_val_frechet_loss = val_frechet_loss / num_batches
+    avg_val_loss = val_total_loss / num_batches
   
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise={avg_noise_loss:.6f}, Frechet={avg_frechet_loss:.6f}) | Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_noise_mse:.6f}, Noise NLL={avg_train_noise_nll:.6f}, Frechet={avg_train_frechet_loss:.6f}) |"
+                f"Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
     
     tqdm.write(f"[Epoch {epoch}]\n"
-               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_noise_loss:.6f} | Frechet Loss: {avg_frechet_loss:.6f} | FDE Loss: {avg_fde_loss:.6f} LR: {current_lr:.6f}\n"
-               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise: {avg_val_noise_loss:.6f} | Frechet: {avg_val_frechet_loss:.6f} | FDE: {avg_val_fde_loss:.6f}")
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | Frechet: {avg_train_frechet_loss:.6f} | LR: {current_lr:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f} | Frechet: {avg_val_frechet_loss:.6f} |")
     
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:
@@ -295,17 +324,19 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels, "
+plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels,\n"
           f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers "
           f"self-conditioning ratio: {self_conditioning_ratio}")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0430_diffusion_lr_curve.png')
+plt.savefig('results/0513_diffusion_lr_curve.png')
 
 plt.show()
 
+
 # 5. Inference (Best-of-N Sampling) & Visualization
+model.load_state_dict(best_state_dict)
 model.eval()
 all_best_ades_test = []
 all_best_fdes_test = []
@@ -324,7 +355,7 @@ with torch.no_grad():
         
         hist = cond[:, :, target_idx].to(device)
         hist_rep = history_encoder(hist)
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, 128, 11, T)
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
 
         best_ade_t = torch.full((B,), float("inf"), device=device)
@@ -375,8 +406,11 @@ with torch.no_grad():
                                                player_idx=idx, annotate=True, save_path=save_path)
 
             visualized = True
-
+            print(all_best_ades_test)
+            print(all_best_fdes_test)
 avg_test_ade = np.mean(all_best_ades_test)
 avg_test_fde = np.mean(all_best_fdes_test)
 print(f"[Test Best-of-{num_samples}] Average ADE: {avg_test_ade:.4f} | Average FDE: {avg_test_fde:.4f}")
 print(f"[Test Best-of-{num_samples}] Best ADE overall: {min(all_best_ades_test):.4f} | Best FDE overall: {min(all_best_fdes_test):.4f}")
+print(f"[Test Best-of-{num_samples}] Worst ADE overall: {max(all_best_ades_test):.4f} | Worst FDE overall: {max(all_best_fdes_test):.4f}")
+print(f"[Test Best-of-{num_samples}] STD of ADE overall: {np.std(all_best_ades_test):.4f} | STD FDE overall: {np.std(all_best_fdes_test):.4f}")

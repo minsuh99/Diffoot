@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.utils import per_player_dtw_loss, per_player_fde_loss
+from utils.utils import per_player_frechet_loss, per_player_fde_loss
 
 class DiffusionTrajectoryModel(nn.Module):
     def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
@@ -14,10 +14,7 @@ class DiffusionTrajectoryModel(nn.Module):
         betas = beta_start + (beta_end - beta_start) * (ts ** 2)
         alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
-        
-        alphas = 1.0 - betas
-        alpha_hat = torch.cumprod(alphas, dim=0)
-        
+
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alpha_hat', alpha_hat)
@@ -29,11 +26,12 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, cond_info=None, self_cond=None):
+    def forward(self, x_0, t=None, cond_info=None, self_cond=None):
         B = x_0.size(0)
         device = x_0.device
         
-        t = torch.randint(0, self.num_steps, (B,), device=device)
+        if t is None:
+            t = torch.randint(0, self.num_steps, (B,), device=device)
         x_t, noise = self.q_sample(x_0, t)
         x_t_in = x_t.permute(0, 3, 2, 1)
 
@@ -44,22 +42,20 @@ class DiffusionTrajectoryModel(nn.Module):
         eps_pred, log_var = z[..., :2], z[..., 2:]
         log_var = log_var.clamp(-10, 10)
         var = log_var.exp()
-        noise_true = noise
+        
+        noise_mse = F.mse_loss(eps_pred, noise)
         
         # NLL loss computing
-        nll = 0.5 * ((noise_true - eps_pred) ** 2 / var + log_var)
-        noise_loss = nll.mean()
-
-        noise_pred = eps_pred
+        nll = 0.5 * ((noise - eps_pred) ** 2 / var + log_var + math.log(2 * math.pi))
+        noise_nll = nll.mean()
         
         a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
-        x_0_pred = (x_t - torch.sqrt(1 - a_hat) * noise_pred) / torch.sqrt(a_hat)
-
-        player_dtw = per_player_dtw_loss(x_0_pred, x_0)
-        player_fde = per_player_fde_loss(x_0_pred, x_0)
+        x0_pred = (x_t - torch.sqrt(1 - a_hat) * eps_pred) / torch.sqrt(a_hat)
         
-        return noise_loss, player_dtw, player_fde
-
+        frechet_loss = per_player_frechet_loss(x0_pred, x_0)
+        
+        return noise_mse, noise_nll, frechet_loss
+    
     # DDIM Sampling
     @torch.no_grad()
     def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
