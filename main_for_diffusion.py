@@ -58,7 +58,7 @@ hyperparams = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 200,
-    'eta': 0.1,
+    'eta': 0.0,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
@@ -330,7 +330,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0513_diffusion_lr_curve.png')
+plt.savefig('results/0514_diffusion_lr_curve.png')
 
 plt.show()
 
@@ -408,6 +408,7 @@ with torch.no_grad():
             visualized = True
             print(all_best_ades_test)
             print(all_best_fdes_test)
+            
 avg_test_ade = np.mean(all_best_ades_test)
 avg_test_fde = np.mean(all_best_fdes_test)
 print(f"[Test Best-of-{num_samples}] Average ADE: {avg_test_ade:.4f} | Average FDE: {avg_test_fde:.4f}")

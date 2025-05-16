@@ -72,6 +72,8 @@ class ResidualBlock(nn.Module):
         # Projections
         self.mid_projection = Conv1d_with_init(channels, channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
+        
+        self.dropout = nn.Dropout(0.1)
 
     def forward_time(self, y, base_shape):
         B, C, K, L = base_shape
@@ -99,6 +101,7 @@ class ResidualBlock(nn.Module):
 
         # mid projection
         y = self.mid_projection(y) # C -> 2 * C
+        y = self.dropout(y)
 
         # Self-attentive pooling + FiLM
         if cond_info is not None:
@@ -133,6 +136,8 @@ class diff_CSDI(nn.Module):
         self.num_steps = config["num_steps"]
         self.diffusion_embedding_dim = config["diffusion_embedding_dim"]
         self.side_dim = config.get("side_dim", None)
+        
+        self.dropout = nn.Dropout(0.1)
 
         # Diffusion embedding module
         self.diffusion_embedding = DiffusionEmbedding(
@@ -154,7 +159,7 @@ class diff_CSDI(nn.Module):
         ])
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, 2 + 1, 1) # noise (2) + log sigma (1)
+        self.output_projection2 = Conv1d_with_init(self.channels, 2 + 2, 1) # noise (2) + log sigma (1)
         nn.init.xavier_uniform_(self.output_projection2.weight, gain=0.01)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
@@ -164,7 +169,7 @@ class diff_CSDI(nn.Module):
         # Flatten time and feature
         x = x.reshape(B, inputdim, K * L)
         x = self.input_projection(x)
-        x = torch.tanh(x)
+        x = F.silu(x)
 
         # Add self-conditioning if provided
         if self_cond is not None:
@@ -188,6 +193,10 @@ class diff_CSDI(nn.Module):
         x = x.reshape(B, self.channels, K * L)
         x = self.output_projection1(x)
         x = torch.tanh(x)
+        x = self.dropout(x)
         x = self.output_projection2(x)
-        return x.reshape(B, 3, K, L)
-
+        x = x.reshape(B, 4, K, L)
+        eps, log_sigma = x[:, :2], x[:, 2:]
+        log_sigma = torch.clamp(log_sigma, -5, 5)
+        x = torch.cat([eps, log_sigma], dim=1)
+        return x

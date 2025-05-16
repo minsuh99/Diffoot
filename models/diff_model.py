@@ -35,12 +35,11 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t, noise = self.q_sample(x_0, t)
         x_t_in = x_t.permute(0, 3, 2, 1)
 
-        
         z = self.model(x_t_in, t, cond_info, self_cond)
         z = z.permute(0, 3, 2, 1)
         
         eps_pred, log_var = z[..., :2], z[..., 2:]
-        log_var = log_var.clamp(-10, 10)
+        log_var = log_var.clamp(-5, 5)
         var = log_var.exp()
         
         noise_mse = F.mse_loss(eps_pred, noise)
@@ -49,12 +48,7 @@ class DiffusionTrajectoryModel(nn.Module):
         nll = 0.5 * ((noise - eps_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
         
-        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
-        x0_pred = (x_t - torch.sqrt(1 - a_hat) * eps_pred) / torch.sqrt(a_hat)
-        
-        frechet_loss = per_player_frechet_loss(x0_pred, x_0)
-        
-        return noise_mse, noise_nll, frechet_loss
+        return noise_mse, noise_nll
     
     # DDIM Sampling
     @torch.no_grad()
@@ -70,6 +64,7 @@ class DiffusionTrajectoryModel(nn.Module):
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
+        final_x0 = None
 
         for i, t in enumerate(reversed(timesteps)):
             t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i + 2)]
@@ -80,21 +75,23 @@ class DiffusionTrajectoryModel(nn.Module):
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
             
             x_in = x.permute(0, 3, 2, 1)
-            z = self.model(x_in, t_batch, cond_info, self_cond=None)
-            z = z.permute(0, 3, 2, 1)
+            z = self.model(x_in, t_batch, cond_info, self_cond=None).permute(0, 3, 2, 1)
             noise_pred = z[..., :2]
-
+            
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
-
-            # deterministic update
-            x_det = torch.sqrt(ah_t_prev) * x0_pred + torch.sqrt(1 - ah_t_prev) * noise_pred
-
-            # stochastic noise term
+            
+            if t_prev == 0:
+                final_x0 = x0_pred.view(num_samples, B, T, N, D)
+            
             if eta > 0 and t_prev > 0:
                 sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t)
-                noise = torch.randn_like(x)
-                x = x_det + sigma_t * noise
             else:
-                x = x_det
+                sigma_t = 0.0
+                
+            c = torch.sqrt(torch.clamp(1 - ah_t_prev - sigma_t**2, min=0.0))
+                
+            noise = torch.randn_like(x)  
+              
+            x = torch.sqrt(ah_t_prev) * x0_pred + c * noise_pred + sigma_t * noise
 
-        return x.view(num_samples, B, T, N, D)  # [1, B, T, N, D]
+        return final_x0
