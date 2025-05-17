@@ -60,6 +60,8 @@ class ResidualBlock(nn.Module):
         self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
         self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
         
+        self.norm = nn.LayerNorm(channels) 
+        
         if side_dim is not None:
             self.cond_proj = nn.Linear(side_dim, channels)
             # Cross-Attention module
@@ -107,6 +109,8 @@ class ResidualBlock(nn.Module):
         yt = self.forward_time(y, base_shape)
         yf = self.forward_feature(y, base_shape)
         y = yt + yf
+        
+        y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
 
         # Mid projection
         y = self.mid_projection(y)
@@ -131,6 +135,7 @@ class ResidualBlock(nn.Module):
             # FiLM parameters
             gamma_beta = self.film_proj(pooled)  # (B, 2C)
             gamma, beta = gamma_beta.chunk(2, dim=1)
+            y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
 
             # Apply FiLM
             y = y.reshape(B, C, K * L)
@@ -156,6 +161,7 @@ class diff_CSDI(nn.Module):
         self.side_dim = config.get("side_dim", None)
         
         self.dropout = nn.Dropout(0.1)
+        self.norm = nn.LayerNorm(self.channels)
 
         # Diffusion embedding module
         self.diffusion_embedding = DiffusionEmbedding(
@@ -187,11 +193,13 @@ class diff_CSDI(nn.Module):
         # Flatten time and feature
         x = x.reshape(B, inputdim, K * L)
         x = self.input_projection(x)
+        x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1)
         x = F.silu(x)
 
         # Add self-conditioning if provided
         if self_cond is not None:
             sc = self.self_cond_projection(self_cond.reshape(B, 2, K * L))
+            sc = self.norm(sc.permute(0, 2, 1)).permute(0, 2, 1)
             x = x + sc
 
         # Prepare diffusion embedding

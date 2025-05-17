@@ -113,6 +113,7 @@ class TargetTrajectoryEncoder(nn.Module):
         self.rnn = rnn_cls(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=bidirectional)
         
         self.dropout = nn.Dropout(0.1)
+        self.layernorm = nn.LayerNorm(hidden_dim * self.num_directions)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, h_n = self.rnn(x)
@@ -123,5 +124,6 @@ class TargetTrajectoryEncoder(nn.Module):
 
         concat = last.permute(1, 0, 2).reshape(x.size(0), -1)  # (B, hidden_dim * num_directions)
         concat = self.dropout(concat)
+        concat = self.layernorm(concat)
         
         return concat

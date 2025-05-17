@@ -242,7 +242,7 @@ def organize_and_process(data_path, save_path):
 
 
 class MultiMatchSoccerDataset(Dataset):
-    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=25):
+    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=20):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
