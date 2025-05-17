@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, HeteroConv
+from torch_geometric.nn import GATConv, HeteroConv
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import softmax
 
@@ -27,13 +27,16 @@ class AttentionPooling(nn.Module):
 
 
 class InteractionGraphEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim=128, out_dim=128):
+    def __init__(self, in_dim, pos_emb_dim=8, hidden_dim=128, out_dim=128):
         super().__init__()
         # normalization and pooling
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.pool = AttentionPooling(hidden_dim)
         self.dropout = nn.Dropout(0.1)
+        
+        self.position_emb = nn.Embedding(24, pos_emb_dim)
+        self.in_dim = in_dim - 1 + pos_emb_dim
 
         # define edge types
         edge_types = [
@@ -45,31 +48,48 @@ class InteractionGraphEncoder(nn.Module):
             ('Node', 'temporal', 'Node'),
         ]
         # 1st layer convs: from in_dim to hidden_dim
-        conv1 = { rel: GCNConv(
-                    in_channels=in_dim,
+        conv1 = { rel: GATConv(
+                    in_channels=self.in_dim,
                     out_channels=hidden_dim,
-                    add_self_loops=False
+                    heads=1,
+                    concat=False,
+                    add_self_loops=False,
+                    dropout=0.1
                 ) for rel in edge_types }
         # 2nd layer convs: from hidden_dim to hidden_dim
-        conv2 = { rel: GCNConv(
+        conv2 = { rel: GATConv(
                     in_channels=hidden_dim,
                     out_channels=hidden_dim,
-                    add_self_loops=False
+                    heads=1,
+                    concat=False,
+                    add_self_loops=False,
+                    dropout=0.1
                 ) for rel in edge_types }
         self.het1 = HeteroConv(conv1, aggr='sum')
         self.het2 = HeteroConv(conv2, aggr='sum')
         self.proj = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, graph: HeteroData):
-        x_dict = {'Node': graph['Node'].x}
+        x_all = graph['Node'].x
+        # possession index
+        pos_idx = 5                  
+        cont = torch.cat([x_all[:, :pos_idx], x_all[:, pos_idx+1:]], dim=1)
+        pos_raw = x_all[:, pos_idx].long()
+        
+        pos_idx_emb = pos_raw.clamp(min=0)
+        pos_emb = self.position_emb(pos_idx_emb)
+        
+        x = torch.cat([cont, pos_emb], dim=1)
+        
+        x_dict = {'Node': x}
 
-        x_dict = self.het1(x_dict, graph.edge_index_dict, edge_weight_dict = graph.edge_attr_dict)
+        x_dict = self.het1(x_dict, graph.edge_index_dict, edge_attr_dict=graph.edge_attr_dict)
         x = x_dict['Node']
         x = F.gelu(x)
         x = self.dropout(x)
         x = self.norm1(x)
 
-        x_dict = self.het2({'Node': x}, graph.edge_index_dict, edge_weight_dict = graph.edge_attr_dict)
+        x_dict = self.het2({'Node': x}, graph.edge_index_dict, edge_attr_dict=graph.edge_attr_dict)
         x = x_dict['Node']
         x = F.gelu(x)
         x = self.dropout(x)

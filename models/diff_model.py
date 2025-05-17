@@ -5,19 +5,43 @@ import torch.nn.functional as F
 from utils.utils import per_player_frechet_loss, per_player_fde_loss
 
 class DiffusionTrajectoryModel(nn.Module):
-    def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
+    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, model, num_steps=1000, s=0.008):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
-        
-        ts = torch.linspace(0, 1, num_steps)
-        betas = beta_start + (beta_end - beta_start) * (ts ** 2)
+    
+        # ts = torch.linspace(0, 1, num_steps)
+        # betas = beta_start + (beta_end - beta_start) * (ts ** 2)
+        # alphas = 1.0 - betas
+        # alpha_hat = torch.cumprod(alphas, dim=0)
+    
+        steps = num_steps + 1
+        t = torch.linspace(0, num_steps, steps, dtype=torch.float32) / num_steps
+        alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+
+        betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = betas.clamp(min=0.0, max=0.999)
+
         alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alpha_hat', alpha_hat)
+        
+    def q_posterior(self, x0, xt, t):
+        # compute posterior q(x_{t-1}|x_t, x0) parameters
+        betas_t = self.betas[t].view(-1,1,1,1)
+        a_hat_t = self.alpha_hat[t].view(-1,1,1,1)
+        a_hat_prev = torch.cat([torch.tensor([1.0], device=x0.device), self.alpha_hat[:-1]])[t].view(-1,1,1,1)
+        posterior_var = betas_t * (1 - a_hat_prev) / (1 - a_hat_t)
+        posterior_mean = (
+            torch.sqrt(a_hat_prev) * betas_t / (1 - a_hat_t) * x0 +
+            torch.sqrt(self.alphas[t].view(-1,1,1,1)) * (1 - a_hat_prev) / (1 - a_hat_t) * xt
+        )
+        return posterior_mean, posterior_var
 
     def q_sample(self, x_0, t, noise=None):
         if noise is None:
@@ -48,7 +72,18 @@ class DiffusionTrajectoryModel(nn.Module):
         nll = 0.5 * ((noise - eps_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
         
-        return noise_mse, noise_nll
+        # VLB term L_t (KL between q and p_theta)
+        post_mean, post_var = self.q_posterior(x_0, x_t, t)
+        # p_theta has mean=predicted_mean, var=var
+        pred_mean = torch.sqrt(self.alpha_hat[t].view(-1,1,1,1)) * x_0 - \
+                     torch.sqrt(1 - self.alpha_hat[t].view(-1,1,1,1)) * eps_pred
+        # KL divergence between two Gaussians
+        kl = 0.5 * (
+            torch.log(post_var) - log_var + post_var/var + (post_mean - pred_mean)**2/var - 1
+        )
+        vlb_loss = kl.mean()
+        
+        return noise_mse, vlb_loss
     
     # DDIM Sampling
     @torch.no_grad()

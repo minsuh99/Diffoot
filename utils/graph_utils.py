@@ -113,8 +113,8 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
         if rel == "attk_and_attk" or rel == "def_and_def":
             W_dist = 1.0 / (1.0 + dist)
             
-            Nopp_s = neighbor_count[s_idx].unsqueeze(1)
-            Nopp_d = neighbor_count[d_idx].unsqueeze(0)
+            Nopp_s = (neighbor_count[s_idx] * 11).unsqueeze(1)
+            Nopp_d = (neighbor_count[d_idx] * 11).unsqueeze(0)
             
             base_sit = torch.exp(-(Nopp_s + Nopp_d) / (dist + 1e-6))  # (Ns,Nd)
             W_situation = base_sit * (poss_s | poss_d).float()

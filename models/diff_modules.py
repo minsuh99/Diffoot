@@ -61,13 +61,20 @@ class ResidualBlock(nn.Module):
         self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
         
         if side_dim is not None:
-            self.attn_q = nn.Parameter(torch.randn(side_dim))
-            self.cond_mlp = nn.Sequential(
-                nn.Linear(side_dim, side_dim),
-                nn.SiLU(),
-                nn.Linear(side_dim, 2 * channels)
+            self.cond_proj = nn.Linear(side_dim, channels)
+            # Cross-Attention module
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=channels,
+                num_heads=nheads,
+                batch_first=True,
+                dropout=0.1
             )
-            self.film = nn.Linear(side_dim + diffusion_embedding_dim, 2 * channels)
+            # FiLM projection from attended cond_info
+            self.film_proj = nn.Sequential(
+                nn.Linear(channels, 2 * channels),
+                nn.SiLU(),
+                nn.Linear(2 * channels, 2 * channels)
+            )
 
         # Projections
         self.mid_projection = Conv1d_with_init(channels, channels, 1)
@@ -91,35 +98,46 @@ class ResidualBlock(nn.Module):
         B, C, K, L = x.shape
         base_shape = x.shape
         
+        # Flatten spatial dims and add diffusion embedding
         y = x.reshape(B, C, K * L)
         diff = self.diffusion_projection(diffusion_emb).unsqueeze(-1)
         y = y + diff
 
+        # Temporal + feature mixing
         yt = self.forward_time(y, base_shape)
         yf = self.forward_feature(y, base_shape)
         y = yt + yf
 
-        # mid projection
-        y = self.mid_projection(y) # C -> 2 * C
+        # Mid projection
+        y = self.mid_projection(y)
         y = self.dropout(y)
 
-        # Self-attentive pooling + FiLM
+        # Cross-Attention based FiLM
         if cond_info is not None:
-            c = cond_info.reshape(B, self.side_dim, K * L)
+            # Prepare Q and KV
+            x_flat = y.reshape(B, C, K * L).permute(0, 2, 1)  # (B, K*L, C)
+            c_flat = cond_info.reshape(B, self.side_dim, K * L).permute(0, 2, 1)  # (B, K*L, side_dim)
+            c_proj = self.cond_proj(c_flat)
             
-            scores = (c * self.attn_q.reshape(1,-1,1)).sum(dim=1)   # (B, K*L)
-            weights = torch.softmax(scores, dim=1).unsqueeze(1)  # (B,1,K*L)
-            pooled = (c * weights).sum(dim=2)                   # (B, side_dim)
-            film_input = torch.cat([pooled, diffusion_emb], dim=1)
-            
-            gamma_beta = self.film(film_input)                  # (B,2C)
+            attn_out, _ = self.cross_attn(
+                query=x_flat,
+                key=c_proj,
+                value=c_proj
+            )
+
+            # Pool attended output
+            pooled = attn_out.mean(dim=1)  # (B, C)
+
+            # FiLM parameters
+            gamma_beta = self.film_proj(pooled)  # (B, 2C)
             gamma, beta = gamma_beta.chunk(2, dim=1)
-            
+
+            # Apply FiLM
             y = y.reshape(B, C, K * L)
             y = gamma.unsqueeze(-1) * y + beta.unsqueeze(-1)
             y = y.reshape(B, C, K * L)
 
-        # gated activation via output_projection
+        # Gated activation and skip
         z = self.output_projection(y)
         gate, filt = z.chunk(2, dim=1)
         activated = torch.sigmoid(gate) * torch.tanh(filt)
@@ -159,7 +177,7 @@ class diff_CSDI(nn.Module):
         ])
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, 2 + 2, 1) # noise (2) + log sigma (1)
+        self.output_projection2 = Conv1d_with_init(self.channels, 4, 1)  # noise(2) + log_sigma(2 channels)
         nn.init.xavier_uniform_(self.output_projection2.weight, gain=0.01)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
@@ -179,7 +197,7 @@ class diff_CSDI(nn.Module):
         # Prepare diffusion embedding
         diffusion_emb = self.diffusion_embedding(diffusion_step)
 
-        # Reshape for blocks
+        # Apply residual blocks
         x = x.reshape(B, self.channels, K, L)
         skip_connections = []
         for block in self.residual_layers:

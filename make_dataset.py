@@ -523,7 +523,7 @@ class MultiMatchSoccerDataset(Dataset):
                 final_condition_row.append(poss_slice.iloc[i] if holder_slice.iloc[i] == pid else 0.0)
                 
                 # neighbor count
-                final_condition_row.append(float(neighbor_counts[i, j]))
+                final_condition_row.append(float(neighbor_counts[i, j]) / 11) # normalized
                 
             final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
             final_condition.append(final_condition_row)
