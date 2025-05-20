@@ -241,8 +241,8 @@ def organize_and_process(data_path, save_path):
         _convert_match(mid)
 
 
-class MultiMatchSoccerDataset(Dataset):
-    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=20):
+class CustomDataset(Dataset):
+    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=25):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -255,6 +255,7 @@ class MultiMatchSoccerDataset(Dataset):
         self.match_data = {}
         self.column_order = None
         self.load_all_matches(data_root)
+        self.graph_cache = {}
     
     # Preprocess raw match data and extract valid trajectory segments
     def load_all_matches(self, data_root):
@@ -382,10 +383,10 @@ class MultiMatchSoccerDataset(Dataset):
         
         first_len = (df["Period"] == 1).sum()
         second_len = len(df) - first_len
-        off = first_len
+        offset = first_len
 
         holder_first, duration_first = make_ball_holder_series(self.match_events[match_id], "firstHalf", self.framerate, first_len, offset=0)
-        holder_second, duration_second = make_ball_holder_series(self.match_events[match_id], "secondHalf", self.framerate, second_len, offset=off)
+        holder_second, duration_second = make_ball_holder_series(self.match_events[match_id], "secondHalf", self.framerate, second_len, offset=offset)
         holder = pd.concat([holder_first, holder_second])
         poss_time = pd.concat([duration_first, duration_second])
         
@@ -397,7 +398,6 @@ class MultiMatchSoccerDataset(Dataset):
         possession_team = df.iloc[start_idx]["possession"]
         atk_prefix, def_prefix = ("Home", "Away") if possession_team == 1 else ("Away", "Home")
 
-        # Extract 22 valid players (11 per team) from current segment
         atk_cols = get_valid_player_columns_in_order(full_seq, atk_prefix, self.column_order)
         def_cols = get_valid_player_columns_in_order(full_seq, def_prefix, self.column_order)
 
@@ -505,29 +505,64 @@ class MultiMatchSoccerDataset(Dataset):
         holder_slice = holder[start : start+T].reset_index(drop=True)
         poss_slice = poss_time[start : start+T].reset_index(drop=True)
         
-        # Add player's position, starter feature
-        final_condition = []
+        # # Add player's position, starter feature
+        # final_condition = []
         
-        for i in range(len(condition_seq)):
-            row = condition_seq.iloc[i].to_dict()
-            final_condition_row = []
-            for j, base in enumerate(player_bases):
-                feats = [f"{base}_{f}" for f in ["x", "y", "vx", "vy", "dist"]]
-                final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in feats])
-                meta = player_info_map.get(base, {"position": -1, "starter": 0})
-                final_condition_row.append(float(meta["position"]))
-                final_condition_row.append(float(meta["starter"]))
+        # for i in range(T):
+        #     row = condition_seq.iloc[i].to_dict()
+        #     final_condition_row = []
+        #     for j, base in enumerate(player_bases):
+        #         feats = [f"{base}_{f}" for f in ["x", "y", "vx", "vy", "dist"]]
+        #         final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in feats])
+        #         meta = player_info_map.get(base, {"position": -1, "starter": 0})
+        #         final_condition_row.append(float(meta["position"]))
+        #         final_condition_row.append(float(meta["starter"]))
                 
-                # possession
-                pid = self.match_player_pid_map[match_id][base]
-                final_condition_row.append(poss_slice.iloc[i] if holder_slice.iloc[i] == pid else 0.0)
+        #         # possession
+        #         pid = self.match_player_pid_map[match_id][base]
+        #         final_condition_row.append(poss_slice.iloc[i] if holder_slice.iloc[i] == pid else 0.0)
                 
-                # neighbor count
-                final_condition_row.append(float(neighbor_counts[i, j]) / 11) # normalized
+        #         # neighbor count
+        #         final_condition_row.append(float(neighbor_counts[i, j]) / 11) # normalized
                 
-            final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
-            final_condition.append(final_condition_row)
+        #     final_condition_row.extend([float(row[f]) if f in row and pd.notna(row[f]) else 0.0 for f in ball_feats])
+        #     final_condition.append(final_condition_row)
+        bases = player_bases
+        N = len(bases)
 
+        num_feats_list = []
+        for f in ["x", "y", "vx", "vy", "dist"]:
+            cols = [f"{base}_{f}" for base in bases]
+            num_feats_list.append(condition_seq[cols].fillna(0).values[..., None])
+        num_feats = np.concatenate(num_feats_list, axis=2)
+
+        # position, starter
+        pos_arr = np.array([player_info_map[b]["position"] for b in bases], dtype=np.float32)
+        starter_arr = np.array([player_info_map[b]["starter"]  for b in bases], dtype=np.float32)
+        pos_feats = np.broadcast_to(pos_arr, (T, N))[..., None]
+        starter_feats = np.broadcast_to(starter_arr, (T, N))[..., None]
+
+        # possession
+        pid_arr = np.array([self.match_player_pid_map[match_id][b] for b in bases])
+        holder_v = holder_slice.values
+        poss_v = poss_slice.values
+        mask = (holder_v[:, None] == pid_arr[None, :])
+        poss_feats = (mask * poss_v[:, None])[..., None]
+
+        # N_opp
+        neigh_feats = (neighbor_counts / 11.0)[..., None]
+
+        # Ball features
+        ball_cols = ["ball_x","ball_y","ball_vx","ball_vy"]
+        ball_arr  = condition_seq[ball_cols].fillna(0).values
+
+        # Concat
+        player_feats = np.concatenate([num_feats, pos_feats, starter_feats, poss_feats, neigh_feats], axis=2)
+        player_flat = player_feats.reshape(T, N * player_feats.shape[2])
+        cond_arr = np.concatenate([player_flat, ball_arr], axis=1)
+
+        final_condition = cond_arr
+        
         condition_tensor = torch.tensor(final_condition, dtype=torch.float32)
         other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
         target_tensor = torch.tensor(target_seq.values, dtype=torch.float32)
@@ -546,15 +581,61 @@ class MultiMatchSoccerDataset(Dataset):
             "target_frames": list(target_seq.index),
             "pitch_scale": (x_scale, y_scale)
         }
-        
-        sample["graph"] = build_graph_sequence_from_condition({
-            "condition": sample["condition"],
-            "condition_columns": sample["condition_columns"],
-            "pitch_scale": sample["pitch_scale"]
-        })
+        if idx not in self.graph_cache:
+            self.graph_cache[idx] = build_graph_sequence_from_condition({
+                "condition": condition_tensor,
+                "condition_columns": sample["condition_columns"],
+                "pitch_scale": sample["pitch_scale"]
+            })
+        sample["graph"] = self.graph_cache[idx]
         
         return sample
+    
 
+class ApplyAugmentedDataset(Dataset):
+    def __init__(self, base_dataset, flip_prob = 0.5):
+        self.base = base_dataset
+        self.N = len(base_dataset)
+        self.flip_N = int(self.N * flip_prob)
+        self.total = self.N + self.flip_N
+        self.flip_indices = random.sample(range(self.N), self.flip_N)
+        self.graph_cache = {}
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        if idx < self.N:
+            return self.base[idx]
+
+        t = idx - self.N
+        sample = self.base[self.flip_indices[t]]
+
+        cond = sample["condition"].clone()
+        cond_x = [i for i, col in enumerate(sample["condition_columns"]) if col.endswith("_x")]
+        cond[:, cond_x] *= -1
+        sample["condition"] = cond
+
+        other = sample["other"].clone()
+        other_x = [i for i, col in enumerate(sample["other_columns"]) if col.endswith("_x")]
+        other[:, other_x] *= -1
+        sample["other"] = other
+
+        target = sample["target"].clone()
+        target_x = [i for i, col in enumerate(sample["target_columns"]) if col.endswith("_x")]
+        target[:, target_x] *= -1
+        sample["target"] = target
+
+        if idx not in self.graph_cache:
+            self.graph_cache[idx] = build_graph_sequence_from_condition({
+                "condition": sample["condition"],
+                "condition_columns": sample["condition_columns"],
+                "pitch_scale": sample["pitch_scale"]
+            })
+
+        sample["graph"] = self.graph_cache[idx]
+
+        return sample
 
 if __name__ == "__main__":
     raw_data_path = "idsse-data" # Raw Data Downloaded Path
@@ -562,7 +643,7 @@ if __name__ == "__main__":
 
     organize_and_process(raw_data_path, data_save_path)
 
-    dataset = MultiMatchSoccerDataset(data_root=data_save_path)
+    dataset = CustomDataset(data_root=data_save_path)
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True

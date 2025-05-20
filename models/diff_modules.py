@@ -87,13 +87,13 @@ class ResidualBlock(nn.Module):
     def forward_time(self, y, base_shape):
         B, C, K, L = base_shape
         y_t = y.reshape(B * K, C, L)
-        y_t = self.time_layer(y_t.permute(2, 0, 1)).permute(1, 2, 0)
+        y_t = self.time_layer(y_t.permute(0, 2, 1)).permute(0, 2, 1)
         return y_t.reshape(B, C, K * L)
 
     def forward_feature(self, y, base_shape):
         B, C, K, L = base_shape
         y_f = y.reshape(B * L, C, K)
-        y_f = self.feature_layer(y_f.permute(2, 0, 1)).permute(1, 2, 0)
+        y_f = self.feature_layer(y_f.permute(0, 2, 1)).permute(0, 2, 1)
         return y_f.reshape(B, C, K * L)
 
     def forward(self, x, cond_info, diffusion_emb):
@@ -110,10 +110,9 @@ class ResidualBlock(nn.Module):
         yf = self.forward_feature(y, base_shape)
         y = yt + yf
         
-        y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
-
         # Mid projection
         y = self.mid_projection(y)
+        y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
         y = self.dropout(y)
 
         # Cross-Attention based FiLM
@@ -130,16 +129,13 @@ class ResidualBlock(nn.Module):
             )
 
             # Pool attended output
-            pooled = attn_out.mean(dim=1)  # (B, C)
-
-            # FiLM parameters
-            gamma_beta = self.film_proj(pooled)  # (B, 2C)
-            gamma, beta = gamma_beta.chunk(2, dim=1)
-            y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
+            film_params = self.film_proj(attn_out)                  # (B, K*L, 2*C)
+            film_params = film_params.permute(0, 2, 1).reshape(B, 2*C, K, L)
+            gamma, beta = film_params.chunk(2, dim=1)               # 각각 (B, C, K, L)
 
             # Apply FiLM
-            y = y.reshape(B, C, K * L)
-            y = gamma.unsqueeze(-1) * y + beta.unsqueeze(-1)
+            y = y.reshape(B, C, K, L)
+            y = gamma * y + beta
             y = y.reshape(B, C, K * L)
 
         # Gated activation and skip
@@ -184,7 +180,7 @@ class diff_CSDI(nn.Module):
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
         self.output_projection2 = Conv1d_with_init(self.channels, 4, 1)  # noise(2) + log_sigma(2 channels)
-        nn.init.xavier_uniform_(self.output_projection2.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.output_projection2.weight)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
 
@@ -199,7 +195,6 @@ class diff_CSDI(nn.Module):
         # Add self-conditioning if provided
         if self_cond is not None:
             sc = self.self_cond_projection(self_cond.reshape(B, 2, K * L))
-            sc = self.norm(sc.permute(0, 2, 1)).permute(0, 2, 1)
             x = x + sc
 
         # Prepare diffusion embedding
@@ -223,6 +218,6 @@ class diff_CSDI(nn.Module):
         x = self.output_projection2(x)
         x = x.reshape(B, 4, K, L)
         eps, log_sigma = x[:, :2], x[:, 2:]
-        log_sigma = torch.clamp(log_sigma, -5, 5)
+        log_sigma = torch.clamp(log_sigma, -10, 10)
         x = torch.cat([eps, log_sigma], dim=1)
         return x
