@@ -92,18 +92,21 @@ class DiffusionTrajectoryModel(nn.Module):
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
             
-            if t_prev == 0:
+            # 마지막 스텝에서는 예측된 x0를 저장하고 즉시 반환
+            if i == ddim_steps - 1:
                 final_x0 = x0_pred.view(num_samples, B, T, N, D)
+                return final_x0
             
-            if eta > 0 and t_prev > 0:
-                sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t)
+            if eta > 0:
+                sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t / ah_t_prev)
+                noise = torch.randn_like(x)
             else:
                 sigma_t = 0.0
+                noise = 0.0
                 
-            c = torch.sqrt(torch.clamp(1 - ah_t_prev - sigma_t**2, min=0.0))
+            c1 = torch.sqrt(ah_t_prev)
+            c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
                 
-            noise = torch.randn_like(x)  
-              
-            x = torch.sqrt(ah_t_prev) * x0_pred + c * noise_pred + sigma_t * noise
+            x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
 
         return final_x0
