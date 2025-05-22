@@ -83,7 +83,7 @@ def extract_node_features(condition_tensor, condition_columns):
     return {"Node": torch.stack(unified_feats)}
 
 # Edge
-def build_edges_based_on_interactions(node_features, pitch_scale):
+def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=None):
     edge_index_dict, edge_attr_dict = {}, {}
     x_scale, y_scale = pitch_scale
 
@@ -92,6 +92,25 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
     poss_dur = nodes[:, 7]
     neighbor_count = nodes[:, 8]         # (N,)
     masks = {t: (node_type == t) for t in (0, 1, 2)}
+    
+    def denormalize_positions(normalized_pos):
+        if zscore_stats is not None:
+            # Z-score 역정규화
+            x_real = normalized_pos[:, 0] * zscore_stats['x_std'] + zscore_stats['x_mean']
+            y_real = normalized_pos[:, 1] * zscore_stats['y_std'] + zscore_stats['y_mean']
+            return torch.stack([x_real, y_real], dim=1)
+        else:
+            x_scale, y_scale = pitch_scale
+            return normalized_pos * torch.tensor([x_scale, y_scale], device=normalized_pos.device)
+    
+    def denormalize_velocities(normalized_vel):
+        if zscore_stats is not None and 'vx_mean' in zscore_stats:
+            vx_real = normalized_vel[:, 0] * zscore_stats['vx_std'] + zscore_stats['vx_mean']
+            vy_real = normalized_vel[:, 1] * zscore_stats['vy_std'] + zscore_stats['vy_mean']
+            return torch.stack([vx_real, vy_real], dim=1)
+        else:
+            x_scale, y_scale = pitch_scale
+            return normalized_vel * torch.tensor([x_scale, y_scale], device=normalized_vel.device)
 
     def make_edges(s_t, d_t, rel):
         s_idx = torch.where(masks[s_t])[0]          # (Ns,)
@@ -102,8 +121,11 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             return
 
         # 거리 계산 시 실제 거리 사용
-        s_pos = nodes[s_idx, :2] * torch.tensor([x_scale, y_scale], device=nodes.device)
-        d_pos = nodes[d_idx, :2] * torch.tensor([x_scale, y_scale], device=nodes.device)
+        s_pos_normalized = nodes[s_idx, :2]
+        d_pos_normalized = nodes[d_idx, :2]
+        
+        s_pos = denormalize_positions(s_pos_normalized)
+        d_pos = denormalize_positions(d_pos_normalized)
         dist = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)).norm(dim=-1)  # (Ns, Nd)
         
         # possession 플래그
@@ -125,8 +147,10 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             W_dist = 1.0 / (1.0 + dist)
             
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
-            v_real = nodes[d_idx, 2:4] * torch.tensor([x_scale, y_scale], device=nodes.device) 
-            v_def = v_real.unsqueeze(0).expand(dist.size(0), -1, -1)                         # (Ns,Nd,2)
+            
+            v_normalized = nodes[d_idx, 2:4]
+            v_real = denormalize_velocities(v_normalized)
+            v_def = v_real.unsqueeze(0).expand(dist.size(0), -1, -1)                           # (Ns,Nd,2)
             W_situation = (v_def * dir_vec).sum(dim=-1)
             
             weight = W_dist + W_situation
@@ -135,8 +159,10 @@ def build_edges_based_on_interactions(node_features, pitch_scale):
             W_dist = torch.exp(-dist * 0.15)
             
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
-            v_s = nodes[s_idx, 2:4] * torch.tensor([x_scale, y_scale], device=nodes.device)
-            v_s = v_s.unsqueeze(1)                  # (Ns,1,2)
+            
+            v_s_normalized = nodes[s_idx, 2:4]
+            v_s = denormalize_velocities(v_s_normalized)
+            v_s = v_s.unsqueeze(1)                # (Ns,1,2)
             W_approach = (v_s * dir_vec).sum(dim=-1)
             
             if rel == "attk_and_ball":
@@ -214,6 +240,8 @@ def convert_to_hetero_graph(node_features, edge_index_dict, edge_attr_dict):
 def build_graph_sequence_from_condition(sample):
     condition = sample["condition"]     # [T, F]
     T = condition.shape[0]
+    
+    zscore_stats = sample.get("zscore_stats", None)
 
     full_graph = HeteroData()
     node_offset = 0
@@ -223,7 +251,9 @@ def build_graph_sequence_from_condition(sample):
     for t in range(T):
         # print(f"[Frame {t+1}/{T}] node_offset_before={node_offset}")
         node_feats = extract_node_features(condition[t], sample["condition_columns"])
-        edge_index_dict, edge_attr_dict = build_edges_based_on_interactions(node_feats, sample["pitch_scale"])
+        edge_index_dict, edge_attr_dict = build_edges_based_on_interactions(
+            node_feats, sample["pitch_scale"], zscore_stats=zscore_stats
+        )
 
         node_count = node_feats["Node"].size(0)
         if t == 0:
