@@ -98,13 +98,12 @@ class DiffusionTrajectoryModel(nn.Module):
                 else:
                     sigma_t = 0.0
                     noise = 0.0
-                    
-                # DDIM 업데이트 공식
+
                 c1 = torch.sqrt(ah_t_prev)
                 c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
                 x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
             else:
-                # 마지막 스텝에서는 x0 예측값을 직접 사용
+                # Last step
                 x = x0_pred
 
         result = x.view(num_samples, B, T, N, D)

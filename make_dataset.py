@@ -242,12 +242,13 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=25):
+    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=25, zscore_stats = None):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
         self.framerate = framerate
         self.stride = stride
+        self.zscore_stats = zscore_stats
         
         self.match_events = {}
         self.match_player_pid_map = {}
@@ -534,7 +535,8 @@ class CustomDataset(Dataset):
         
         bases = player_bases
         N = len(bases)
-
+        
+        # features
         num_feats_list = []
         for f in ["x", "y", "vx", "vy", "dist"]:
             cols = [f"{base}_{f}" for base in bases]
@@ -629,6 +631,7 @@ class CustomDataset(Dataset):
 class ApplyAugmentedDataset(Dataset):
     def __init__(self, base_dataset, flip_prob = 0.5):
         self.base = base_dataset
+        self.zscore_stats = base_dataset.dataset.zscore_stats
         self.N = len(base_dataset)
         self.flip_N = int(self.N * flip_prob)
         self.total = self.N + self.flip_N
@@ -643,7 +646,7 @@ class ApplyAugmentedDataset(Dataset):
             return self.base[idx]
 
         t = idx - self.N
-        sample = self.base[self.flip_indices[t]]
+        sample = self.base[self.flip_indices[t]].copy()
 
         cond = sample["condition"].clone()
         cond_x = [i for i, col in enumerate(sample["condition_columns"]) if col.endswith("_x")]
@@ -664,7 +667,8 @@ class ApplyAugmentedDataset(Dataset):
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": sample["condition"],
                 "condition_columns": sample["condition_columns"],
-                "pitch_scale": sample["pitch_scale"]
+                "pitch_scale": sample["pitch_scale"],
+                "zscore_stats": self.zscore_stats
             })
 
         sample["graph"] = self.graph_cache[idx]

@@ -2,6 +2,7 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from collections import defaultdict
 import random
 from torch.utils.data._utils.collate import default_collate
@@ -112,50 +113,46 @@ def split_dataset_indices(dataset, val_ratio=(1/6), test_ratio=(1/6), random_see
 def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_stats.pkl"):
     # 있으면 쓰고
     if os.path.exists(save_path):
-        print(f"Loading existing Z-score stats from {save_path}")
         with open(save_path, 'rb') as f:
             stats = pickle.load(f)
-        print(f"Loaded stats: x_mean={stats['x_mean']:.2f}, x_std={stats['x_std']:.2f}")
         return stats
     
     # 없으면 새로 계산
     from torch.utils.data import DataLoader, Subset
     train_subset = Subset(dataset, train_indices)
-    train_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=8, collate_fn=custom_collate_fn)
     
     all_x_coords = []
     all_y_coords = []
     all_vx_coords = []
     all_vy_coords = []
     
-    for batch_idx, batch in enumerate(train_loader):
-        if batch_idx % 50 == 0:
-            print(f"  Processing batch {batch_idx}/{len(train_loader)}")
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calculate Z-score...")):
+        target = batch["target"]
+        target_cols = batch["target_columns"][0]
+        pitch_scales = batch["pitch_scale"]
+        x_scale, y_scale = pitch_scales[0]
         
-        try:
-            target = batch["target"]
-            target_cols = batch["target_columns"][0]
-            pitch_scales = batch["pitch_scale"]
-            x_scale, y_scale = pitch_scales[0]
+        for i, col in enumerate(target_cols):
+            coords = target[:, :, i].flatten().cpu().numpy()
+            coords = coords[~np.isnan(coords)]
             
-            for i, col in enumerate(target_cols):
-                coords = target[:, :, i].flatten().cpu().numpy()
-                coords = coords[~np.isnan(coords)]
-                
+            if dataset.zscore_stats is None:
                 if col.endswith('_x'):
                     coords_meters = coords * x_scale
                     all_x_coords.extend(coords_meters)
                 elif col.endswith('_y'):
                     coords_meters = coords * y_scale
                     all_y_coords.extend(coords_meters)
+        
+        condition = batch["condition"]
+        cond_cols = batch["condition_columns"][0]
+        
+        for i, col in enumerate(cond_cols):
+            coords = condition[:, :, i].flatten().cpu().numpy()
+            coords = coords[~np.isnan(coords)]
             
-            condition = batch["condition"]
-            cond_cols = batch["condition_columns"][0]
-            
-            for i, col in enumerate(cond_cols):
-                coords = condition[:, :, i].flatten().cpu().numpy()
-                coords = coords[~np.isnan(coords)]
-                
+            if dataset.zscore_stats is None:
                 if col.endswith('_x') or col == 'ball_x':
                     coords_meters = coords * x_scale
                     all_x_coords.extend(coords_meters)
@@ -168,10 +165,6 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
                 elif col.endswith('_vy') or col == 'ball_vy':
                     coords_meters = coords * y_scale
                     all_vy_coords.extend(coords_meters)
-                    
-        except Exception as e:
-            print(f"Warning: Error processing batch {batch_idx}: {e}")
-            continue
     
     stats = {
         'x_mean': float(np.mean(all_x_coords)),
