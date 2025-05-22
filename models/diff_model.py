@@ -76,7 +76,6 @@ class DiffusionTrajectoryModel(nn.Module):
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
-        final_x0 = None
 
         for i, t in enumerate(reversed(timesteps)):
             t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i + 2)]
@@ -92,21 +91,21 @@ class DiffusionTrajectoryModel(nn.Module):
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
             
-            # 마지막 스텝에서는 예측된 x0를 저장하고 즉시 반환
-            if i == ddim_steps - 1:
-                final_x0 = x0_pred.view(num_samples, B, T, N, D)
-                return final_x0
-            
-            if eta > 0:
-                sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t / ah_t_prev)
-                noise = torch.randn_like(x)
+            if t_prev > 0:
+                if eta > 0:
+                    sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t / ah_t_prev)
+                    noise = torch.randn_like(x)
+                else:
+                    sigma_t = 0.0
+                    noise = 0.0
+                    
+                # DDIM 업데이트 공식
+                c1 = torch.sqrt(ah_t_prev)
+                c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
+                x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
             else:
-                sigma_t = 0.0
-                noise = 0.0
-                
-            c1 = torch.sqrt(ah_t_prev)
-            c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
-                
-            x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
+                # 마지막 스텝에서는 x0 예측값을 직접 사용
+                x = x0_pred
 
-        return final_x0
+        result = x.view(num_samples, B, T, N, D)
+        return result
