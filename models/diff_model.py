@@ -76,6 +76,7 @@ class DiffusionTrajectoryModel(nn.Module):
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
+        self_cond = None
 
         for i, t in enumerate(reversed(timesteps)):
             t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i + 2)]
@@ -86,10 +87,12 @@ class DiffusionTrajectoryModel(nn.Module):
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
             
             x_in = x.permute(0, 3, 2, 1)
-            z = self.model(x_in, t_batch, cond_info, self_cond=None).permute(0, 3, 2, 1)
+            # Apply self-conditioning 
+            z = self.model(x_in, t_batch, cond_info, self_cond).permute(0, 3, 2, 1)
             noise_pred = z[..., :2]
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
+            self_cond = x0_pred.detach()
             
             if t_prev > 0:
                 if eta > 0:

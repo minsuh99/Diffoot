@@ -53,12 +53,12 @@ hyperparams = {
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 1e-4,
-    'self_conditioning_ratio': 0.0,
+    'self_conditioning_ratio': 0.5,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
-    'eta': 0.0,
+    'eta': 0.5,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
@@ -221,7 +221,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 s = torch.zeros_like(target)
 
             noise_mse, noise_nll = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
-            loss = noise_mse + noise_nll * 0.001
+            loss = noise_mse + noise_nll * 0.01
             
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -229,7 +229,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         scaler.update()
 
         train_noise_mse += (noise_mse).item()
-        train_noise_nll += (noise_nll * 0.001).item()
+        train_noise_nll += (noise_nll * 0.01).item()
         train_loss += loss.item()
 
     num_batches = len(train_dataloader)
@@ -271,10 +271,10 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 s = torch.zeros_like(target)
 
                 noise_mse, noise_nll = diff_model(target, cond_info=cond_info, self_cond=s)
-                val_loss = noise_mse + noise_nll * 0.001
+                val_loss = noise_mse + noise_nll * 0.01
 
             val_noise_mse += (noise_mse).item()
-            val_noise_nll += (noise_nll * 0.001).item()
+            val_noise_nll += (noise_nll * 0.01).item()
             val_total_loss += val_loss.item()
     
     num_batches = len(val_dataloader)
@@ -303,6 +303,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             'history_encoder': history_encoder.state_dict(),
             'zscore_stats': zscore_stats
         }
+    
+    torch.cuda.empty_cache()
+    gc.collect()
 
 logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
         
@@ -318,7 +321,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0522_diffusion_lr_curve.png')
+plt.savefig('results/0523_diffusion_lr_curve.png')
 
 plt.show()
 
@@ -395,7 +398,7 @@ with torch.no_grad():
                 target_cols = batch["target_columns"][i]
                 defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 
-                other_seq = batch["other"][i].view(T, 12, 2)  # [T, 12, 2]
+                other_seq = batch["other"][i].view(T, 12, 2).to(device)  # [T, 12, 2]
                 other_den = other_seq.clone()
                 other_den[:, :, 0] = other_seq[:, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
                 other_den[:, :, 1] = other_seq[:, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
