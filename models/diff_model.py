@@ -5,27 +5,27 @@ import torch.nn.functional as F
 from utils.utils import per_player_frechet_loss, per_player_fde_loss
 
 class DiffusionTrajectoryModel(nn.Module):
-    def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    # def __init__(self, model, num_steps=1000, s=0.008):
+    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, model, num_steps=1000, s=0.008):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
     
-        ts = torch.linspace(0, 1, num_steps)
-        betas = beta_start + (beta_end - beta_start) * (ts ** 2)
-        alphas = 1.0 - betas
-        alpha_hat = torch.cumprod(alphas, dim=0)
-    
-        # steps = num_steps + 1
-        # t = torch.linspace(0, num_steps, steps, dtype=torch.float32) / num_steps
-        # alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
-        # alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-
-        # betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        # betas = betas.clamp(min=0.0, max=0.999)
-
+        # ts = torch.linspace(0, 1, num_steps)
+        # betas = beta_start + (beta_end - beta_start) * (ts ** 2)
         # alphas = 1.0 - betas
         # alpha_hat = torch.cumprod(alphas, dim=0)
+    
+        steps = num_steps + 1
+        t = torch.linspace(0, num_steps, steps, dtype=torch.float32) / num_steps
+        alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+
+        betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = betas.clamp(min=0.0001, max=0.9999)
+
+        alphas = 1.0 - betas
+        alpha_hat = torch.cumprod(alphas, dim=0)
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)

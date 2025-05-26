@@ -103,7 +103,7 @@ class InteractionGraphEncoder(nn.Module):
 
 
 class TargetTrajectoryEncoder(nn.Module):
-    def __init__(self, input_dim = 22, hidden_dim = 64, num_layers = 1, bidirectional = True, rnn_type = "gru"):
+    def __init__(self, input_dim = 46, hidden_dim = 64, num_layers = 1, bidirectional = True, rnn_type = "gru"):
         super().__init__()
         self.rnn_type = rnn_type.lower()
         self.num_directions = 2 if bidirectional else 1
