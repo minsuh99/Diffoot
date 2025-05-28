@@ -194,7 +194,7 @@ class diff_CSDI(nn.Module):
 
         # Add self-conditioning if provided
         if self_cond is not None:
-            sc = self.self_cond_projection(self_cond.reshape(B, 2, K * L))
+            sc = self.self_cond_projection(self_cond.permute(0, 3, 1, 2).reshape(B, 2, K * L))
             x = x + sc
 
         # Prepare diffusion embedding

@@ -95,7 +95,6 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
     
     def denormalize_positions(normalized_pos):
         if zscore_stats is not None:
-            # Z-score 역정규화
             x_real = normalized_pos[:, 0] * zscore_stats['x_std'] + zscore_stats['x_mean']
             y_real = normalized_pos[:, 1] * zscore_stats['y_std'] + zscore_stats['y_mean']
             return torch.stack([x_real, y_real], dim=1)

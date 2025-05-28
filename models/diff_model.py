@@ -92,7 +92,7 @@ class DiffusionTrajectoryModel(nn.Module):
             noise_pred = z[..., :2]
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
-            self_cond = x0_pred.detach()
+            self_cond = x0_pred.permute(0, 3, 2, 1).detach()
             
             if t_prev > 0:
                 if eta > 0:

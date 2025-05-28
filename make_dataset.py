@@ -257,6 +257,7 @@ class CustomDataset(Dataset):
         self.column_order = None
         self.load_all_matches(data_root)
         self.graph_cache = {}
+        self.max_cache_size = 2000
     
     # Preprocess raw match data and extract valid trajectory segments
     def load_all_matches(self, data_root):
@@ -483,9 +484,6 @@ class CustomDataset(Dataset):
             target_tensor = torch.tensor(target_seq_copy.values, dtype=torch.float32)
 
             other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
-            
-        # target_seq[target_columns[0::2]] /= x_scale
-        # target_seq[target_columns[1::2]] /= y_scale
 
         # condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
         # condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
@@ -508,13 +506,6 @@ class CustomDataset(Dataset):
 
         xs = condition_seq[[f"{b}_x" for b in player_bases]].values
         ys = condition_seq[[f"{b}_y" for b in player_bases]].values
-        
-        if self.zscore_stats is not None:
-            xs = xs * self.zscore_stats['x_std'] + self.zscore_stats['x_mean']  
-            ys = ys * self.zscore_stats['y_std'] + self.zscore_stats['y_mean']
-        else:
-            xs *= x_scale
-            ys *= y_scale
     
         coords = np.stack([xs, ys], axis=-1)
         diff2  = ((coords[:, :, None, :] - coords[:, None, :, :])**2).sum(-1)
@@ -617,12 +608,17 @@ class CustomDataset(Dataset):
             "zscore_stats": self.zscore_stats
         }
         if idx not in self.graph_cache:
+            if len(self.graph_cache) > self.max_cache_size:   # 캐시 크기 제한
+                oldest_key = next(iter(self.graph_cache))
+                del self.graph_cache[oldest_key]
+                
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": condition_tensor,
                 "condition_columns": sample["condition_columns"],
                 "pitch_scale": sample["pitch_scale"],
                 "zscore_stats": self.zscore_stats
             })
+            
         sample["graph"] = self.graph_cache[idx]
         
         return sample
@@ -637,6 +633,7 @@ class ApplyAugmentedDataset(Dataset):
         self.total = self.N + self.flip_N
         self.flip_indices = random.sample(range(self.N), self.flip_N)
         self.graph_cache = {}
+        self.max_cache_size = 2000
 
     def __len__(self):
         return self.total
@@ -664,6 +661,10 @@ class ApplyAugmentedDataset(Dataset):
         sample["target"] = target
 
         if idx not in self.graph_cache:
+            if len(self.graph_cache) > self.max_cache_size:
+                oldest_key = next(iter(self.graph_cache))
+                del self.graph_cache[oldest_key]
+                
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": sample["condition"],
                 "condition_columns": sample["condition_columns"],

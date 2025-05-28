@@ -49,7 +49,7 @@ hyperparams = {
     'data_save_path': "match_data",
     'train_batch_size': 16,
     'val_batch_size': 16,
-    'test_batch_size': 1,
+    'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 1e-4,
@@ -100,7 +100,7 @@ train_dataloader = DataLoader(
     num_workers=num_workers,
     pin_memory=True,
     persistent_workers=True,
-    prefetch_factor=2,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
     generator=generator(SEED)
@@ -113,7 +113,7 @@ val_dataloader = DataLoader(
     num_workers=num_workers,
     pin_memory=True,
     persistent_workers=True,
-    prefetch_factor=2,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
 )
@@ -125,7 +125,7 @@ test_dataloader = DataLoader(
     num_workers=num_workers,
     pin_memory=True,
     persistent_workers=True,
-    prefetch_factor=2,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn
 )
@@ -188,12 +188,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
         graph_batch = batch["graph"].to(device)                              # HeteroData batch
         # graph → H
-        H = graph_encoder(graph_batch)                                       # [B, 128]
+        H = graph_encoder(graph_batch)                                       # [B, 256]
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
         # All player + ball history trajectories
         hist = cond[:, :, target_idx].to(device) 
-        hist_rep = history_encoder(hist)  # [B, 128]
+        hist_rep = history_encoder(hist)  # [B, 256]
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
         # Concat conditions
@@ -216,9 +216,11 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 # x0 예측값 계산 (다음 step의 self-conditioning input)
                 a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
                 x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                x0_hat = x0_hat.permute(0, 3, 2, 1)  # [B, T, 11, 2]
+                x0_hat = x0_hat.permute(0, 3, 2, 1)
                 
-                s = x0_hat.detach()
+                s = x0_hat.detach()  # [B, T, 11, 2]
+                
+                del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
         noise_mse, noise_nll = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
         loss = noise_mse + noise_nll * 0.001
@@ -235,7 +237,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         
         del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond_info, t, s, noise_mse, noise_nll, loss
-
+        
     num_batches = len(train_dataloader)
     
     avg_train_noise_mse = train_noise_mse / num_batches
@@ -261,12 +263,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
             # with autocast(device_type='cuda'):
                 # graph → H
-            H = graph_encoder(graph_batch)                                      # [B, 128]
+            H = graph_encoder(graph_batch)                                      # [B, 256]
             cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
             
             # Target's history trajectories
-            hist = cond[:, :, target_idx].to(device)  # [B,128,11,T]
-            hist_rep = history_encoder(hist)  # [B, 128]
+            hist = cond[:, :, target_idx].to(device)  # [B,256,11,T]
+            hist_rep = history_encoder(hist)  # [B, 256]
             cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
             
             # Concat conditions
@@ -287,9 +289,11 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 # x0 예측값 계산 (다음 step의 self-conditioning input)
                 a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
                 x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                x0_hat = x0_hat.permute(0, 3, 2, 1)  # [B, T, 11, 2]
+                x0_hat = x0_hat.permute(0, 3, 2, 1)
                 
-                s = x0_hat.detach()
+                s = x0_hat.detach() # [B, T, 11, 2]
+                
+                del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
             noise_mse, noise_nll = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
             val_loss = noise_mse + noise_nll * 0.001
@@ -300,7 +304,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             
             del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
             del cond_info, t, s, noise_mse, noise_nll, val_loss
-            
+
     
     num_batches = len(val_dataloader)
     
@@ -323,9 +327,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         best_state_dict = {
-            'diff_model': diff_model.state_dict(),
-            'graph_encoder': graph_encoder.state_dict(),
-            'history_encoder': history_encoder.state_dict(),
+            'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
+            'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
+            'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
             'zscore_stats': zscore_stats
         }
     
@@ -346,9 +350,21 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0526_diffusion_lr_curve.png')
+plt.savefig('results/0527_diffusion_lr_curve.png')
 
 plt.show()
+plt.close()
+
+final_state = {
+    'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
+    'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
+    'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
+    'zscore_stats': zscore_stats,
+    'train_losses': train_losses,
+    'val_losses': val_losses
+}
+
+torch.save(final_state, './results/final_model_latest.pth')
 
 # 5. Inference (Best-of-N Sampling) & Visualization
 diff_model.load_state_dict(best_state_dict['diff_model'])
@@ -363,19 +379,19 @@ all_best_ades = []
 all_best_fdes = []
 
 visualize_samples = 5
-visualized = False
+# visualized = False
+visualized = True
 
-x_std_tensor = zscore_stats['x_std']
-x_mean_tensor = zscore_stats['x_mean']
-y_std_tensor = zscore_stats['y_std'] 
-y_mean_tensor = zscore_stats['y_mean']
+x_std_tensor = torch.tensor(zscore_stats['x_std'], device=device)
+x_mean_tensor = torch.tensor(zscore_stats['x_mean'], device=device)
+y_std_tensor = torch.tensor(zscore_stats['y_std'], device=device) 
+y_mean_tensor = torch.tensor(zscore_stats['y_mean'], device=device)
 
 with torch.no_grad():        
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target_ = batch["target"].to(device).view(B, T, 11, 2)
-        target = target_.cpu()
+        target = batch["target"].to(device).view(B, T, 11, 2)
 
         # condition 준비
         H = graph_encoder(batch["graph"].to(device))
@@ -386,21 +402,17 @@ with torch.no_grad():
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)
 
-        best_ade = torch.full((B,), float("inf"))
-        best_fde = torch.full((B,), float("inf"))
+        best_ade = torch.full((B,), float("inf"), device=device)
+        best_fde = torch.full((B,), float("inf"), device=device)
         best_pred = torch.zeros_like(target)
 
         for _ in range(num_samples):
-            pred_ = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 2)
-            pred = pred_.cpu()
-            del pred_  # GPU 메모리 해제
-            torch.cuda.empty_cache()
+            pred = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 2)
 
             pred_den = pred.clone()
             pred_den[:, :, :, 0] = pred[:, :, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
             pred_den[:, :, :, 1] = pred[:, :, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
-            
-            # Target도 역정규화
+
             target_den = target.clone()
             target_den[:, :, :, 0] = target[:, :, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
             target_den[:, :, :, 1] = target[:, :, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
@@ -413,10 +425,13 @@ with torch.no_grad():
             best_fde[mask] = fde[mask]
             best_pred[mask] = pred_den[mask]
             
-            del pred, pred_den, target_den
+            del pred, pred_den, target_den, ade, fde, mask
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        all_best_ades.extend(best_ade.tolist())
-        all_best_fdes.extend(best_fde.tolist())
+        all_best_ades.extend(best_ade.cpu().tolist())
+        all_best_fdes.extend(best_fde.cpu().tolist())
+        
         # Visualization (1st batch)
         if not visualized:
             base_dir = "results/test_trajs"
@@ -427,19 +442,19 @@ with torch.no_grad():
                 target_cols = batch["target_columns"][i]
                 defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 
-                other_seq = batch["other"][i].view(T, 12, 2)          # [T, 12, 2]
+                other_seq = batch["other"][i].view(T, 12, 2).to(device)          # [T, 12, 2]
                 other_den = other_seq.clone()
                 other_den[:, :, 0] = other_seq[:, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
                 other_den[:, :, 1] = other_seq[:, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
-                other_den = other_den.numpy()
+                other_den = other_den.cpu().numpy()
                 
                 # Target 역정규화  
                 target_den = target[i].clone()  # [T, 11, 2]
                 target_den[:, :, 0] = target[i, :, :, 0] * x_std_tensor + x_mean_tensor
                 target_den[:, :, 1] = target[i, :, :, 1] * y_std_tensor + y_mean_tensor
-                target_den = target_den.numpy()
+                target_den = target_den.cpu().numpy()
                 
-                pred_traj = best_pred[i].numpy()
+                pred_traj = best_pred[i].cpu().numpy()
                 
                 folder = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(folder, exist_ok=True)
@@ -453,7 +468,9 @@ with torch.no_grad():
                     )
 
             visualized = True
-            
+        
+        del cond, target, H, cond_H, hist, hist_rep, cond_hist, cond_info
+        del best_ade, best_fde, best_pred
         torch.cuda.empty_cache()
         gc.collect()
             
