@@ -386,7 +386,7 @@ all_best_ades = []
 all_best_fdes = []
 
 visualize_samples = 5
-# visualized = False
+# visualized = False # If you want to visualize
 visualized = True
 
 px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)

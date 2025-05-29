@@ -6,7 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 import warnings
 warnings.filterwarnings("ignore", message="The 'gameclock' column does not match the defined value range.*", category=UserWarning, module=r"floodlight\.core\.events")
@@ -462,8 +462,8 @@ class CustomDataset(Dataset):
             for i, col in enumerate(target_columns):
                 feat = col.rsplit("_", 1)[1]
                 if feat in ("x", "y"):
-                    mean = self.zscore_stats[f"player_{feat}_mean"]    # ← 수정됨
-                    std = self.zscore_stats[f"player_{feat}_std"]     # ← 수정됨
+                    mean = self.zscore_stats[f"player_{feat}_mean"]
+                    std = self.zscore_stats[f"player_{feat}_std"]
                     target_array[:, i] = (target_array[:, i] - mean) / std
             target_tensor = torch.tensor(target_array, dtype=torch.float32)
 
@@ -473,13 +473,13 @@ class CustomDataset(Dataset):
                 base, feat = col.rsplit("_", 1)
                 if feat in ("x", "y"):
                     key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]     # ← 수정됨
-                    std = self.zscore_stats[f"{key}_{feat}_std"]      # ← 수정됨
+                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
+                    std = self.zscore_stats[f"{key}_{feat}_std"]
                     other_array[:, i] = (other_array[:, i] - mean) / std
                 elif feat in ("vx", "vy"):
                     key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]     # ← 수정됨
-                    std = self.zscore_stats[f"{key}_{feat}_std"]      # ← 수정됨
+                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
+                    std = self.zscore_stats[f"{key}_{feat}_std"]
                     other_array[:, i] = (other_array[:, i] - mean) / std
             other_tensor = torch.tensor(other_array, dtype=torch.float32)
             
@@ -607,13 +607,14 @@ class CustomDataset(Dataset):
 class ApplyAugmentedDataset(Dataset):
     def __init__(self, base_dataset, flip_prob = 0.5):
         self.base = base_dataset
-        self.zscore_stats = base_dataset.dataset.zscore_stats
+        if isinstance(base_dataset, Subset):
+            self.zscore_stats = base_dataset.dataset.zscore_stats
+        else:
+            self.zscore_stats = base_dataset.zscore_stats
         self.N = len(base_dataset)
         self.flip_N = int(self.N * flip_prob)
         self.total = self.N + self.flip_N
         self.flip_indices = random.sample(range(self.N), self.flip_N)
-        self.graph_cache = {}
-        self.max_cache_size = 2000
 
     def __len__(self):
         return self.total
@@ -623,32 +624,40 @@ class ApplyAugmentedDataset(Dataset):
             return self.base[idx]
 
         t = idx - self.N
-        sample = self.base[self.flip_indices[t]].copy()
-
-        cond = sample["condition"].clone()
-        cond_x = [i for i, col in enumerate(sample["condition_columns"]) if col.endswith("_x")]
+        base_sample = self.base[self.flip_indices[t]]
+        
+        cond = base_sample["condition"].clone()
+        cond_x = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_x")]
         cond[:, cond_x] *= -1
-        sample["condition"] = cond
 
-        other = sample["other"].clone()
-        other_x = [i for i, col in enumerate(sample["other_columns"]) if col.endswith("_x")]
+        other = base_sample["other"].clone()
+        other_x = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_x")]
         other[:, other_x] *= -1
-        sample["other"] = other
 
-        target = sample["target"].clone()
-        target_x = [i for i, col in enumerate(sample["target_columns"]) if col.endswith("_x")]
+        target = base_sample["target"].clone()
+        target_x = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_x")]
         target[:, target_x] *= -1
-        sample["target"] = target
 
-        if idx not in self.graph_cache:
-            self.graph_cache[idx] = build_graph_sequence_from_condition({
-                "condition": sample["condition"],
-                "condition_columns": sample["condition_columns"],
-                "pitch_scale": sample["pitch_scale"],
-                "zscore_stats": self.zscore_stats
-            })
+        sample = {
+            "match_id": base_sample["match_id"],
+            "condition": cond,
+            "other": other,
+            "target": target,
+            "condition_columns": base_sample["condition_columns"],
+            "other_columns": base_sample["other_columns"],
+            "target_columns": base_sample["target_columns"],
+            "condition_frames": base_sample["condition_frames"],
+            "target_frames": base_sample["target_frames"],
+            "pitch_scale": base_sample["pitch_scale"],
+            "zscore_stats": base_sample["zscore_stats"]
+        }
 
-        sample["graph"] = self.graph_cache[idx]
+        sample["graph"] = build_graph_sequence_from_condition({
+            "condition": sample["condition"],
+            "condition_columns": sample["condition_columns"],
+            "pitch_scale": sample["pitch_scale"],
+            "zscore_stats": self.zscore_stats
+        })
 
         return sample
 
