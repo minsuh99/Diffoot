@@ -493,28 +493,11 @@ class CustomDataset(Dataset):
                     std  = self.zscore_stats[f"{key}_{feat}_std"]
                     cond_arr[:, i] = (cond_arr[:, i] - mean) / std
                 elif feat == "dist":
-                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]  # ← 수정됨
-            condition_tensor = torch.tensor(cond_arr, dtype=torch.float32)
+                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
             
         else:
-            target_seq_copy = target_seq.copy()
-            target_seq_copy[target_columns[0::2]] /= x_scale  # x 좌표
-            target_seq_copy[target_columns[1::2]] /= y_scale  # y 좌표
-            
-            target_tensor = torch.tensor(target_seq_copy.values, dtype=torch.float32)
+            target_tensor = torch.tensor(target_seq.values, dtype=torch.float32)
             other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
-            
-            cond_copy = condition_seq.copy()
-
-            x_cols = [c for c in condition_columns if c.endswith('_x')]
-            y_cols = [c for c in condition_columns if c.endswith('_y')]
-            cond_copy[x_cols] /= x_scale
-            cond_copy[y_cols] /= y_scale
-
-            vx_cols = [c for c in condition_columns if c.endswith('_vx')]
-            vy_cols = [c for c in condition_columns if c.endswith('_vy')]
-            cond_copy[vx_cols] /= x_scale
-            cond_copy[vy_cols] /= y_scale
 
                 
         # Calculate possession duration & neighbor opposite player count
@@ -575,6 +558,8 @@ class CustomDataset(Dataset):
         player_feats = np.concatenate([num_feats, pos_feats, starter_feats, poss_feats, neigh_feats], axis=2)
         player_flat = player_feats.reshape(T, N * player_feats.shape[2])
         cond_arr = np.concatenate([player_flat, ball_arr], axis=1)
+        
+        condition_tensor = torch.tensor(cond_arr, dtype=torch.float32)
 
         sample = {
             "match_id": match_id,
@@ -665,7 +650,10 @@ if __name__ == "__main__":
     raw_data_path = "idsse-data" # Raw Data Downloaded Path
     data_save_path = "match_data" # Saving path for preprocessed data
 
-    organize_and_process(raw_data_path, data_save_path)
+    if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
+        organize_and_process(raw_data_path, data_save_path)
+    else:
+        print("Skip organize_and_process")
 
     dataset = CustomDataset(data_root=data_save_path)
 
@@ -676,7 +664,6 @@ if __name__ == "__main__":
     sample = dataset[0]
     
     print(len(dataset), "samples loaded.")
-    sample = dataset[0]
     print("Match id:", sample["match_id"])
     print("Condition columns:", sample["condition_columns"])
     print("Condition shape:", sample["condition"].shape)
@@ -689,4 +676,11 @@ if __name__ == "__main__":
     
     print("Condition:", sample["condition"])
     print("Target:", sample["target"])
+    
+    common = [col for col in sample["target_columns"] if col in sample["condition_columns"]]
+    idxs = [sample["condition_columns"].index(col) for col in common]
+    cond_vals = sample["condition"][-1, idxs]
+    
+    print(cond_vals)
+    print(sample["target"][0])
 

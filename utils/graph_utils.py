@@ -83,10 +83,8 @@ def extract_node_features(condition_tensor, condition_columns):
     return {"Node": torch.stack(unified_feats)}
 
 # Edge
-def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=None):
+def build_edges_based_on_interactions(node_features, zscore_stats=None):
     edge_index_dict, edge_attr_dict = {}, {}
-    x_scale, y_scale = pitch_scale
-
     nodes = node_features["Node"]        # (N, F)
     node_type = nodes[:, -1]             # 0=Attk, 1=Def, 2=Ball
     poss_dur = nodes[:, 7]
@@ -105,8 +103,7 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
             y_real = normalized_pos[:, 1] * y_std + y_mean
             return torch.stack([x_real, y_real], dim=1)
         else:
-            x_scale, y_scale = pitch_scale
-            return normalized_pos * torch.tensor([x_scale, y_scale], device=normalized_pos.device)
+            return normalized_pos
     
     def denormalize_velocities(normalized_vel, node_type):
         if zscore_stats is not None:
@@ -120,9 +117,8 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
             vy_real = normalized_vel[:, 1] * vy_std + vy_mean
             return torch.stack([vx_real, vy_real], dim=1)
         else:
-            x_scale, y_scale = pitch_scale
-            return normalized_vel * torch.tensor([x_scale, y_scale], device=normalized_vel.device)
-
+            return normalized_vel
+        
     def make_edges(s_t, d_t, rel):
         s_idx = torch.where(masks[s_t])[0]          # (Ns,)
         d_idx = torch.where(masks[d_t])[0]          # (Nd,)
@@ -264,7 +260,7 @@ def build_graph_sequence_from_condition(sample):
         # print(f"[Frame {t+1}/{T}] node_offset_before={node_offset}")
         node_feats = extract_node_features(condition[t], sample["condition_columns"])
         edge_index_dict, edge_attr_dict = build_edges_based_on_interactions(
-            node_feats, sample["pitch_scale"], zscore_stats=zscore_stats
+            node_feats, zscore_stats=zscore_stats
         )
 
         node_count = node_feats["Node"].size(0)
