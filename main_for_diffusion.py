@@ -337,7 +337,14 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     gc.collect()
 
 logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
-        
+
+if epoch == epochs:
+    for loader in (train_dataloader, val_dataloader):
+        ds = loader.dataset
+        ds = ds.dataset if isinstance(ds, Subset) else ds
+        if hasattr(ds, "graph_cache"):
+            ds.graph_cache.clear()
+            
 # 4-1. Plot learning_curve
 plt.figure(figsize=(8, 6))
 plt.plot(range(1, epochs+1), train_losses, label='Train Loss')

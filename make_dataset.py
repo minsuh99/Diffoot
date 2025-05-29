@@ -255,7 +255,6 @@ class CustomDataset(Dataset):
         self.column_order = None
         self.load_all_matches(data_root)
         self.graph_cache = {}
-        self.max_cache_size = 2000
     
     # Preprocess raw match data and extract valid trajectory segments
     def load_all_matches(self, data_root):
@@ -593,10 +592,6 @@ class CustomDataset(Dataset):
             "zscore_stats": self.zscore_stats
         }
         if idx not in self.graph_cache:
-            if len(self.graph_cache) > self.max_cache_size:   # 캐시 크기 제한
-                oldest_key = next(iter(self.graph_cache))
-                del self.graph_cache[oldest_key]
-                
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": condition_tensor,
                 "condition_columns": sample["condition_columns"],
@@ -646,10 +641,6 @@ class ApplyAugmentedDataset(Dataset):
         sample["target"] = target
 
         if idx not in self.graph_cache:
-            if len(self.graph_cache) > self.max_cache_size:
-                oldest_key = next(iter(self.graph_cache))
-                del self.graph_cache[oldest_key]
-                
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": sample["condition"],
                 "condition_columns": sample["condition_columns"],
