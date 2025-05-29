@@ -93,19 +93,31 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
     neighbor_count = nodes[:, 8]         # (N,)
     masks = {t: (node_type == t) for t in (0, 1, 2)}
     
-    def denormalize_positions(normalized_pos):
+    def denormalize_positions(normalized_pos, node_type):
         if zscore_stats is not None:
-            x_real = normalized_pos[:, 0] * zscore_stats['x_std'] + zscore_stats['x_mean']
-            y_real = normalized_pos[:, 1] * zscore_stats['y_std'] + zscore_stats['y_mean']
+            if node_type == 2:
+                x_mean, x_std = zscore_stats['ball_x_mean'], zscore_stats['ball_x_std']
+                y_mean, y_std = zscore_stats['ball_y_mean'], zscore_stats['ball_y_std']
+            else:
+                x_mean, x_std = zscore_stats['player_x_mean'], zscore_stats['player_x_std']
+                y_mean, y_std = zscore_stats['player_y_mean'], zscore_stats['player_y_std']
+            x_real = normalized_pos[:, 0] * x_std + x_mean
+            y_real = normalized_pos[:, 1] * y_std + y_mean
             return torch.stack([x_real, y_real], dim=1)
         else:
             x_scale, y_scale = pitch_scale
             return normalized_pos * torch.tensor([x_scale, y_scale], device=normalized_pos.device)
     
-    def denormalize_velocities(normalized_vel):
-        if zscore_stats is not None and 'vx_mean' in zscore_stats:
-            vx_real = normalized_vel[:, 0] * zscore_stats['vx_std'] + zscore_stats['vx_mean']
-            vy_real = normalized_vel[:, 1] * zscore_stats['vy_std'] + zscore_stats['vy_mean']
+    def denormalize_velocities(normalized_vel, node_type):
+        if zscore_stats is not None:
+            if node_type == 2:
+                vx_mean, vx_std = zscore_stats['ball_vx_mean'], zscore_stats['ball_vx_std']
+                vy_mean, vy_std = zscore_stats['ball_vy_mean'], zscore_stats['ball_vy_std']
+            else:
+                vx_mean, vx_std = zscore_stats['player_vx_mean'], zscore_stats['player_vx_std']
+                vy_mean, vy_std = zscore_stats['player_vy_mean'], zscore_stats['player_vy_std']
+            vx_real = normalized_vel[:, 0] * vx_std + vx_mean
+            vy_real = normalized_vel[:, 1] * vy_std + vy_mean
             return torch.stack([vx_real, vy_real], dim=1)
         else:
             x_scale, y_scale = pitch_scale
@@ -123,8 +135,8 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
         s_pos_normalized = nodes[s_idx, :2]
         d_pos_normalized = nodes[d_idx, :2]
         
-        s_pos = denormalize_positions(s_pos_normalized)
-        d_pos = denormalize_positions(d_pos_normalized)
+        s_pos = denormalize_positions(s_pos_normalized, s_t)
+        d_pos = denormalize_positions(d_pos_normalized, d_t)
         dist = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)).norm(dim=-1)  # (Ns, Nd)
         
         # possession 플래그
@@ -148,7 +160,7 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
             
             v_normalized = nodes[d_idx, 2:4]
-            v_real = denormalize_velocities(v_normalized)
+            v_real = denormalize_velocities(v_normalized, d_t)
             v_def = v_real.unsqueeze(0).expand(dist.size(0), -1, -1)                           # (Ns,Nd,2)
             W_situation = (v_def * dir_vec).sum(dim=-1)
             
@@ -160,14 +172,15 @@ def build_edges_based_on_interactions(node_features, pitch_scale, zscore_stats=N
             dir_vec = (s_pos.unsqueeze(1) - d_pos.unsqueeze(0)) / (dist.unsqueeze(-1) + 1e-6)  # (Ns,Nd,2)
             
             v_s_normalized = nodes[s_idx, 2:4]
-            v_s = denormalize_velocities(v_s_normalized)
+            v_s = denormalize_velocities(v_s_normalized, s_t)  # (Ns,2)
             v_s = v_s.unsqueeze(1)                # (Ns,1,2)
             W_approach = (v_s * dir_vec).sum(dim=-1)
             
             if rel == "attk_and_ball":
                 t_pos = poss_dur[s_idx].unsqueeze(1)
                 sigma = (t_pos > 0).float()
-                W_possess = torch.log1p(t_pos)
+                # W_possess = torch.log1p(t_pos)
+                W_possess = t_pos  # Log-Normalized already
         
                 W_situation = sigma * W_possess + (1 - sigma) * W_approach
             else:

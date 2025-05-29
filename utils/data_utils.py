@@ -5,6 +5,7 @@ import pandas as pd
 from tqdm import tqdm
 from collections import defaultdict
 import random
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data._utils.collate import default_collate
 from torch_geometric.data import Batch as GeoBatch
 
@@ -118,77 +119,85 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         return stats
     
     # 없으면 새로 계산
-    from torch.utils.data import DataLoader, Subset
     train_subset = Subset(dataset, train_indices)
     train_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=8, collate_fn=custom_collate_fn)
     
-    all_x_coords = []
-    all_y_coords = []
-    all_vx_coords = []
-    all_vy_coords = []
+    px, py, pvx, pvy = [], [], [], []
+    bx, by, bvx, bvy = [], [], [], []
+    dists = []
     
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calculate Z-score...")):
         target = batch["target"]
         target_cols = batch["target_columns"][0]
-        pitch_scales = batch["pitch_scale"]
-        x_scale, y_scale = pitch_scales[0]
-        
         for i, col in enumerate(target_cols):
-            coords = target[:, :, i].flatten().cpu().numpy()
-            coords = coords[~np.isnan(coords)]
-            
-            if dataset.zscore_stats is None:
-                if col.endswith('_x'):
-                    coords_meters = coords * x_scale
-                    all_x_coords.extend(coords_meters)
-                elif col.endswith('_y'):
-                    coords_meters = coords * y_scale
-                    all_y_coords.extend(coords_meters)
-        
-        condition = batch["condition"]
+            arr = target[..., i].flatten().cpu().numpy()
+            arr = arr[~np.isnan(arr)]
+            if col.endswith('_x'):
+                px.extend(arr.tolist())
+            elif col.endswith('_y'):
+                py.extend(arr.tolist())
+
+
+        cond = batch["condition"]
         cond_cols = batch["condition_columns"][0]
-        
         for i, col in enumerate(cond_cols):
-            coords = condition[:, :, i].flatten().cpu().numpy()
-            coords = coords[~np.isnan(coords)]
-            
-            if dataset.zscore_stats is None:
-                if col.endswith('_x') or col == 'ball_x':
-                    coords_meters = coords * x_scale
-                    all_x_coords.extend(coords_meters)
-                elif col.endswith('_y') or col == 'ball_y':
-                    coords_meters = coords * y_scale
-                    all_y_coords.extend(coords_meters)
-                elif col.endswith('_vx') or col == 'ball_vx':
-                    coords_meters = coords * x_scale
-                    all_vx_coords.extend(coords_meters)
-                elif col.endswith('_vy') or col == 'ball_vy':
-                    coords_meters = coords * y_scale
-                    all_vy_coords.extend(coords_meters)
+            arr = cond[..., i].flatten().cpu().numpy()
+            arr = arr[~np.isnan(arr)]
+            if col.endswith('_x') and col != 'ball_x':
+                px.extend(arr.tolist())
+            elif col == 'ball_x':
+                bx.extend(arr.tolist())
+            elif col.endswith('_y') and col != 'ball_y':
+                py.extend(arr.tolist())
+            elif col == 'ball_y':
+                by.extend(arr.tolist())
+            elif col.endswith('_vx') and col != 'ball_vx':
+                pvx.extend(arr.tolist())
+            elif col == 'ball_vx':
+                bvx.extend(arr.tolist())
+            elif col.endswith('_vy') and col != 'ball_vy':
+                pvy.extend(arr.tolist())
+            elif col == 'ball_vy':
+                bvy.extend(arr.tolist())
+            elif col.endswith('_dist'):
+                dists.extend(arr.tolist())
     
-    stats = {
-        'x_mean': float(np.mean(all_x_coords)),
-        'x_std': float(np.std(all_x_coords)),
-        'y_mean': float(np.mean(all_y_coords)),
-        'y_std': float(np.std(all_y_coords)),
-    }
-    
-    if all_vx_coords and all_vy_coords:
-        stats.update({
-            'vx_mean': float(np.mean(all_vx_coords)),
-            'vx_std': float(np.std(all_vx_coords)),
-            'vy_mean': float(np.mean(all_vy_coords)),
-            'vy_std': float(np.std(all_vy_coords)),
-        })
+    stats = {}
+
+    stats['player_x_mean'], stats['player_x_std'] = float(np.mean(px)), float(np.std(px))
+    stats['player_y_mean'], stats['player_y_std'] = float(np.mean(py)), float(np.std(py))
+
+    stats['ball_x_mean'], stats['ball_x_std'] = float(np.mean(bx)), float(np.std(bx))
+    stats['ball_y_mean'], stats['ball_y_std'] = float(np.mean(by)), float(np.std(by))
+
+    if pvx and pvy:
+        stats['player_vx_mean'], stats['player_vx_std'] = float(np.mean(pvx)), float(np.std(pvx))
+        stats['player_vy_mean'], stats['player_vy_std'] = float(np.mean(pvy)), float(np.std(pvy))
+
+    if bvx and bvy:
+        stats['ball_vx_mean'], stats['ball_vx_std'] = float(np.mean(bvx)), float(np.std(bvx))
+        stats['ball_vy_mean'], stats['ball_vy_std'] = float(np.mean(bvy)), float(np.std(bvy))
+        
+    stats['dist_mean'], stats['dist_std'] = float(np.mean(dists)), float(np.std(dists))
     
     with open(save_path, 'wb') as f:
         pickle.dump(stats, f)
     
     print(f"Z-score statistics saved to {save_path}")
-    print(f"X: mean={stats['x_mean']:.2f}m, std={stats['x_std']:.2f}m")
-    print(f"Y: mean={stats['y_mean']:.2f}m, std={stats['y_std']:.2f}m")
-    
+    print(f"Player X: mean={stats['player_x_mean']:.2f}m, std={stats['player_x_std']:.2f}m")
+    print(f"Player Y: mean={stats['player_y_mean']:.2f}m, std={stats['player_y_std']:.2f}m")
+    print(f"Ball X: mean={stats['ball_x_mean']:.2f}m, std={stats['ball_x_std']:.2f}m")
+    print(f"Ball Y: mean={stats['ball_y_mean']:.2f}m, std={stats['ball_y_std']:.2f}m")
+    if 'player_vx_mean' in stats:
+        print(f"Player Vx: mean={stats['player_vx_mean']:.2f}m/s, std={stats['player_vx_std']:.2f}m/s")
+        print(f"Player Vy: mean={stats['player_vy_mean']:.2f}m/s, std={stats['player_vy_std']:.2f}m/s")
+    if 'ball_vx_mean' in stats:
+        print(f"Ball Vx: mean={stats['ball_vx_mean']:.2f}m/s, std={stats['ball_vx_std']:.2f}m/s")
+        print(f"Ball Vy: mean={stats['ball_vy_mean']:.2f}m/s, std={stats['ball_vy_std']:.2f}m/s")
+    print(f"Dist: mean={stats['dist_mean']:.2f}m, std={stats['dist_std']:.2f}m")
+
     return stats
+
 
 # Custom collate function to batch
 def custom_collate_fn(batch):

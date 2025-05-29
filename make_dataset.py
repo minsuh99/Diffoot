@@ -125,12 +125,10 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
         if 0 <= frm < len(holder):
             holder[frm] = current
 
-    # forward‐fill
     for i in range(offset+1, offset+n_frames):
         if holder[i] is None:
             holder[i] = holder[i-1]
 
-    # 2) durations 계산
     durations = [0.0] * (n_frames + offset)
     durations[offset] = 1.0 / framerate
     for i in range(offset+1, offset+n_frames):
@@ -139,10 +137,10 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
         else:
             durations[i] = 1.0/framerate
 
-    # 3) 두 시리즈를 튜플로 반환
     idx = list(range(offset, offset+n_frames))
     holder_s = pd.Series(holder[offset:offset+n_frames], index=idx, name="holder")
-    dur_s    = pd.Series(durations[offset:offset+n_frames], index=idx, name="possession_duration")
+    dur_s = pd.Series(np.log1p(durations[offset:offset+n_frames]), index=idx, name="possession_duration")
+    
     return holder_s, dur_s
 
 
@@ -328,6 +326,7 @@ class CustomDataset(Dataset):
     def extract_segments_info(self, df, match_id):
         if self.column_order is None:
             self.column_order = df.columns.tolist()
+            
         segments_info = []
         num_frames = len(df)
         possession_array = df["possession"].values
@@ -394,7 +393,7 @@ class CustomDataset(Dataset):
         
         full_seq = df.iloc[start_idx:start_idx + self.segment_length]
         condition_seq = full_seq.iloc[:self.condition_length].copy()
-        target_seq = full_seq.iloc[self.condition_length:].copy()
+        future_seq = full_seq.iloc[self.condition_length:].copy()
         
         # Determine team roles (attacking or defending) based on possession
         possession_team = df.iloc[start_idx]["possession"]
@@ -445,10 +444,10 @@ class CustomDataset(Dataset):
 
         # other: Attk + ball
         # target: Def
-        other_seq = target_seq[other_columns]
-        target_seq = target_seq[target_columns]
+        other_seq = future_seq[other_columns]
+        target_seq = future_seq[target_columns]
         
-        # Normalization
+        # --- Normalization ---
         if not hasattr(self, "pitch_cache"):
             self.pitch_cache = {}
         if match_id not in self.pitch_cache:
@@ -459,46 +458,65 @@ class CustomDataset(Dataset):
         x_scale, y_scale = self.pitch_cache[match_id]
         
         if self.zscore_stats is not None:
+            # Target
             target_array = target_seq.values.copy()
             for i, col in enumerate(target_columns):
-                if col.endswith('_x'):
-                    target_array[:, i] = (target_array[:, i] - self.zscore_stats['x_mean']) / self.zscore_stats['x_std']
-                elif col.endswith('_y'):
-                    target_array[:, i] = (target_array[:, i] - self.zscore_stats['y_mean']) / self.zscore_stats['y_std']
-            
+                feat = col.rsplit("_", 1)[1]
+                if feat in ("x", "y"):
+                    mean = self.zscore_stats[f"player_{feat}_mean"]    # ← 수정됨
+                    std = self.zscore_stats[f"player_{feat}_std"]     # ← 수정됨
+                    target_array[:, i] = (target_array[:, i] - mean) / std
             target_tensor = torch.tensor(target_array, dtype=torch.float32)
 
+            # Other
             other_array = other_seq.values.copy()
             for i, col in enumerate(other_columns):
-                if col.endswith('_x'):
-                    other_array[:, i] = (other_array[:, i] - self.zscore_stats['x_mean']) / self.zscore_stats['x_std']
-                elif col.endswith('_y'):
-                    other_array[:, i] = (other_array[:, i] - self.zscore_stats['y_mean']) / self.zscore_stats['y_std']
-            
+                base, feat = col.rsplit("_", 1)
+                if feat in ("x", "y"):
+                    key = "ball" if base == "ball" else "player"
+                    mean = self.zscore_stats[f"{key}_{feat}_mean"]     # ← 수정됨
+                    std = self.zscore_stats[f"{key}_{feat}_std"]      # ← 수정됨
+                    other_array[:, i] = (other_array[:, i] - mean) / std
+                elif feat in ("vx", "vy"):
+                    key = "ball" if base == "ball" else "player"
+                    mean = self.zscore_stats[f"{key}_{feat}_mean"]     # ← 수정됨
+                    std = self.zscore_stats[f"{key}_{feat}_std"]      # ← 수정됨
+                    other_array[:, i] = (other_array[:, i] - mean) / std
             other_tensor = torch.tensor(other_array, dtype=torch.float32)
+            
+            # Condition
+            cond_arr = condition_seq.values.copy()
+            for i, col in enumerate(condition_columns):
+                base, feat = col.rsplit("_", 1)
+                if feat in ("x", "y", "vx", "vy"):
+                    key = "ball" if base == "ball" else "player"
+                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
+                    std  = self.zscore_stats[f"{key}_{feat}_std"]
+                    cond_arr[:, i] = (cond_arr[:, i] - mean) / std
+                elif feat == "dist":
+                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]  # ← 수정됨
+            condition_tensor = torch.tensor(cond_arr, dtype=torch.float32)
             
         else:
             target_seq_copy = target_seq.copy()
             target_seq_copy[target_columns[0::2]] /= x_scale  # x 좌표
             target_seq_copy[target_columns[1::2]] /= y_scale  # y 좌표
+            
             target_tensor = torch.tensor(target_seq_copy.values, dtype=torch.float32)
-
             other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
+            
+            cond_copy = condition_seq.copy()
 
-        # condition_x_cols = [col for col in condition_seq.columns if col.endswith("_x")]
-        # condition_y_cols = [col for col in condition_seq.columns if col.endswith("_y")]
-        # condition_seq[condition_x_cols] /= x_scale
-        # condition_seq[condition_y_cols] /= y_scale
+            x_cols = [c for c in condition_columns if c.endswith('_x')]
+            y_cols = [c for c in condition_columns if c.endswith('_y')]
+            cond_copy[x_cols] /= x_scale
+            cond_copy[y_cols] /= y_scale
 
-        # # Normalization for other columns
-        # # suffixes 는 기존과 동일
-        # for col in condition_seq.columns:
-        #     if col.endswith("_vx") or col.endswith("ball_vx"):
-        #         condition_seq[col] /= x_scale                  # m/s → 1/s
-        #     elif col.endswith("_vy") or col.endswith("ball_vy"):
-        #         condition_seq[col] /= y_scale
-        #     elif col.endswith("_dist"):
-        #         condition_seq[col] /= (x_scale**2 + y_scale**2) ** 0.5 
+            vx_cols = [c for c in condition_columns if c.endswith('_vx')]
+            vy_cols = [c for c in condition_columns if c.endswith('_vy')]
+            cond_copy[vx_cols] /= x_scale
+            cond_copy[vy_cols] /= y_scale
+
                 
         # Calculate possession duration & neighbor opposite player count
         Na = len(atk_bases)
@@ -521,8 +539,8 @@ class CustomDataset(Dataset):
         
         T = self.condition_length
         start = start_idx
-        holder_slice = holder[start : start+T].reset_index(drop=True)
-        poss_slice = poss_time[start : start+T].reset_index(drop=True)
+        holder_slice = holder[start:start+T].reset_index(drop=True)
+        poss_slice = poss_time[start:start+T].reset_index(drop=True)
         
         bases = player_bases
         N = len(bases)
@@ -559,39 +577,6 @@ class CustomDataset(Dataset):
         player_flat = player_feats.reshape(T, N * player_feats.shape[2])
         cond_arr = np.concatenate([player_flat, ball_arr], axis=1)
 
-        condition_columns_final = [
-            f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession_duration", "neighbor_count"]
-        ] + ball_feats
-        
-        if self.zscore_stats is not None:
-            for i, col in enumerate(condition_columns_final):
-                if col.endswith('_x') or col == 'ball_x':
-                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats['x_mean']) / self.zscore_stats['x_std']
-                elif col.endswith('_y') or col == 'ball_y':
-                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats['y_mean']) / self.zscore_stats['y_std']
-                elif col.endswith('_vx') or col == 'ball_vx':
-                    if 'vx_mean' in self.zscore_stats:
-                        cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats['vx_mean']) / self.zscore_stats['vx_std']
-                elif col.endswith('_vy') or col == 'ball_vy':
-                    if 'vy_mean' in self.zscore_stats:
-                        cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats['vy_mean']) / self.zscore_stats['vy_std']
-                elif col.endswith('_dist'):
-                    cond_arr[:, i] /= (x_scale**2 + y_scale**2) ** 0.5
-        else:
-            for i, col in enumerate(condition_columns_final):
-                if col.endswith('_x') or col == 'ball_x':
-                    cond_arr[:, i] /= x_scale
-                elif col.endswith('_y') or col == 'ball_y':
-                    cond_arr[:, i] /= y_scale
-                elif col.endswith('_vx') or col == 'ball_vx':
-                    cond_arr[:, i] /= x_scale
-                elif col.endswith('_vy') or col == 'ball_vy':
-                    cond_arr[:, i] /= y_scale
-                elif col.endswith('_dist'):
-                    cond_arr[:, i] /= (x_scale**2 + y_scale**2) ** 0.5
-
-        condition_tensor = torch.tensor(cond_arr, dtype=torch.float32)
-
         sample = {
             "match_id": match_id,
             "condition": condition_tensor,
@@ -603,7 +588,7 @@ class CustomDataset(Dataset):
             "other_columns": other_columns,
             "target_columns": target_columns,
             "condition_frames": list(condition_seq.index),
-            "target_frames": list(target_seq.index),
+            "target_frames": list(future_seq.index),
             "pitch_scale": (x_scale, y_scale),
             "zscore_stats": self.zscore_stats
         }

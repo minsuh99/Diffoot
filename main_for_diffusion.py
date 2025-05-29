@@ -58,7 +58,7 @@ hyperparams = {
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
-    'eta': 0.5,
+    'eta': 0.0,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
@@ -99,7 +99,7 @@ train_dataloader = DataLoader(
     shuffle=True,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=True,
+    persistent_workers=False,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
@@ -112,7 +112,7 @@ val_dataloader = DataLoader(
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=True,
+    persistent_workers=False,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
@@ -124,7 +124,7 @@ test_dataloader = DataLoader(
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=True,
+    persistent_workers=False,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn
@@ -350,7 +350,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0527_diffusion_lr_curve.png')
+plt.savefig('results/0529_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
@@ -382,10 +382,15 @@ visualize_samples = 5
 # visualized = False
 visualized = True
 
-x_std_tensor = torch.tensor(zscore_stats['x_std'], device=device)
-x_mean_tensor = torch.tensor(zscore_stats['x_mean'], device=device)
-y_std_tensor = torch.tensor(zscore_stats['y_std'], device=device) 
-y_mean_tensor = torch.tensor(zscore_stats['y_mean'], device=device)
+px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
+px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
+py_mean = torch.tensor(zscore_stats['player_y_mean'], device=device)
+py_std = torch.tensor(zscore_stats['player_y_std'],  device=device)
+
+bx_mean = torch.tensor(zscore_stats['ball_x_mean'], device=device)
+bx_std = torch.tensor(zscore_stats['ball_x_std'], device=device)
+by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
+by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
 
 with torch.no_grad():        
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
@@ -401,6 +406,11 @@ with torch.no_grad():
         hist_rep = history_encoder(hist)
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)
+        
+        # Target Denormalization
+        target_den = target.clone()
+        target_den[...,0] = target[...,0] * px_std + px_mean
+        target_den[...,1] = target[...,1] * py_std + py_mean
 
         best_ade = torch.full((B,), float("inf"), device=device)
         best_fde = torch.full((B,), float("inf"), device=device)
@@ -409,14 +419,12 @@ with torch.no_grad():
         for _ in range(num_samples):
             pred = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 2)
 
+            # Prediction Denormalization
             pred_den = pred.clone()
-            pred_den[:, :, :, 0] = pred[:, :, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
-            pred_den[:, :, :, 1] = pred[:, :, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
-
-            target_den = target.clone()
-            target_den[:, :, :, 0] = target[:, :, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
-            target_den[:, :, :, 1] = target[:, :, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
-
+            pred_den[...,0] = pred[...,0] * px_std + px_mean
+            pred_den[...,1] = pred[...,1] * py_std + py_mean
+            
+            # ADE, FDE Calculation (Metetrs)
             ade = ((pred_den - target_den)**2).sum(-1).sqrt().mean((1,2))
             fde = ((pred_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
 
@@ -426,6 +434,7 @@ with torch.no_grad():
             best_pred[mask] = pred_den[mask]
             
             del pred, pred_den, target_den, ade, fde, mask
+            
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -440,25 +449,30 @@ with torch.no_grad():
             for i in range(min(B, visualize_samples)):
                 other_cols = batch["other_columns"][i]
                 target_cols = batch["target_columns"][i]
-                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 
-                other_seq = batch["other"][i].view(T, 12, 2).to(device)          # [T, 12, 2]
-                other_den = other_seq.clone()
-                other_den[:, :, 0] = other_seq[:, :, 0] * x_std_tensor + x_mean_tensor  # x 좌표
-                other_den[:, :, 1] = other_seq[:, :, 1] * y_std_tensor + y_mean_tensor  # y 좌표
-                other_den = other_den.cpu().numpy()
-                
-                # Target 역정규화  
-                target_den = target[i].clone()  # [T, 11, 2]
-                target_den[:, :, 0] = target[i, :, :, 0] * x_std_tensor + x_mean_tensor
-                target_den[:, :, 1] = target[i, :, :, 1] * y_std_tensor + y_mean_tensor
-                target_den = target_den.cpu().numpy()
+                # Other Trajectories Denormalization
+                other_seq = batch["other"][i].view(T, -1, 2).to(device)          # [T, 12, 2]
+                other_den = torch.zeros_like(other_seq)
+                for j in range(other_seq.size(1)):
+                    x_col = other_cols[2*j]    # 2*j = x, 2*j+1 = y
+                    if x_col == "ball_x":
+                        x_mean, x_std = bx_mean, bx_std
+                        y_mean, y_std = by_mean, by_std
+                    else:
+                        x_mean, x_std = px_mean, px_std
+                        y_mean, y_std = py_mean, py_std
+
+                    other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
+                    other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
                 
                 pred_traj = best_pred[i].cpu().numpy()
+                target_traj = target_den[i].cpu().numpy()
+                other_traj  = other_den.cpu().numpy()
                 
                 folder = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(folder, exist_ok=True)
                 
+                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(folder, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(

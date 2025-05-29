@@ -71,7 +71,7 @@ class InteractionGraphEncoder(nn.Module):
 
     def forward(self, graph: HeteroData):
         x_all = graph['Node'].x
-        # possession index
+        # possession Encoding (with Learnable Parameter)
         pos_idx = 5                  
         cont = torch.cat([x_all[:, :pos_idx], x_all[:, pos_idx+1:]], dim=1)
         pos_raw = x_all[:, pos_idx].long()

@@ -177,6 +177,8 @@ class diff_CSDI(nn.Module):
                 side_dim=self.side_dim
             ) for _ in range(config["layers"])
         ])
+        self.inv_sqrt_layers = 1.0 / math.sqrt(len(self.residual_layers))
+        
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
         self.output_projection2 = Conv1d_with_init(self.channels, 4, 1)  # noise(2) + log_sigma(2 channels)
@@ -201,15 +203,23 @@ class diff_CSDI(nn.Module):
         diffusion_emb = self.diffusion_embedding(diffusion_step)
 
         # Apply residual blocks
+        # x = x.reshape(B, self.channels, K, L)
+        # skip_connections = []
+        # for block in self.residual_layers:
+        #     x, skip = block(x, cond_info, diffusion_emb)
+        #     skip_connections.append(skip)
+
+        # # Aggregate skips
+        # x = torch.sum(torch.stack(skip_connections), dim=0) / math.sqrt(len(self.residual_layers))
         x = x.reshape(B, self.channels, K, L)
-        skip_connections = []
+        skip_sum = torch.zeros_like(x)
+
         for block in self.residual_layers:
             x, skip = block(x, cond_info, diffusion_emb)
-            skip_connections.append(skip)
-
-        # Aggregate skips
-        x = torch.sum(torch.stack(skip_connections), dim=0) / math.sqrt(len(self.residual_layers))
-
+            skip_sum.add_(skip)
+            del skip
+        x = skip_sum.mul_(self.inv_sqrt_layers)
+        
         # Final projections
         x = x.reshape(B, self.channels, K * L)
         x = self.output_projection1(x)
