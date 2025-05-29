@@ -55,7 +55,7 @@ hyperparams = {
     'learning_rate': 1e-4,
     'self_conditioning_ratio': 0.0,
     'num_samples': 10,
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
     'eta': 0.0,
