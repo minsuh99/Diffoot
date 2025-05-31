@@ -5,25 +5,13 @@ import torch.nn.functional as F
 from utils.utils import per_player_frechet_loss, per_player_fde_loss
 
 class DiffusionTrajectoryModel(nn.Module):
-    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    def __init__(self, model, num_steps=1000, s=0.008):
+    def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
     
-        # ts = torch.linspace(0, 1, num_steps)
-        # betas = beta_start + (beta_end - beta_start) * (ts ** 2)
-        # alphas = 1.0 - betas
-        # alpha_hat = torch.cumprod(alphas, dim=0)
-    
-        steps = num_steps + 1
-        t = torch.linspace(0, num_steps, steps, dtype=torch.float32) / num_steps
-        alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-
-        betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        betas = betas.clamp(min=0.0001, max=0.9999)
-
+        ts = torch.linspace(0, 1, num_steps)
+        betas = beta_start + (beta_end - beta_start) * (ts ** 2)
         alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
 
@@ -64,7 +52,7 @@ class DiffusionTrajectoryModel(nn.Module):
     
     # DDIM Sampling
     @torch.no_grad()
-    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
+    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1, self_conditioning_ratio=0.0):
         B, T, N, D = shape
         device = next(self.parameters()).device
 
@@ -87,12 +75,16 @@ class DiffusionTrajectoryModel(nn.Module):
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
             
             x_in = x.permute(0, 3, 2, 1)
-            # Apply self-conditioning 
-            z = self.model(x_in, t_batch, cond_info, self_cond).permute(0, 3, 2, 1)
+            use_self_cond = self_cond if torch.rand(1).item() < self_conditioning_ratio else None
+        
+            z = self.model(x_in, t_batch, cond_info, use_self_cond).permute(0, 3, 2, 1)
             noise_pred = z[..., :2]
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
-            self_cond = x0_pred.permute(0, 3, 2, 1).detach()
+            
+            # Self-conditioning 업데이트 (ratio > 0일 때만)
+            if self_conditioning_ratio > 0:
+                self_cond = x0_pred.permute(0, 3, 2, 1).detach()
             
             if t_prev > 0:
                 if eta > 0:
@@ -106,7 +98,6 @@ class DiffusionTrajectoryModel(nn.Module):
                 c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
                 x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
             else:
-                # Last step
                 x = x0_pred
 
         result = x.view(num_samples, B, T, N, D)

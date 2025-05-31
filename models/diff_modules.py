@@ -182,7 +182,7 @@ class diff_CSDI(nn.Module):
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
         self.output_projection2 = Conv1d_with_init(self.channels, 4, 1)  # noise(2) + log_sigma(2 channels)
-        nn.init.xavier_uniform_(self.output_projection2.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.output_projection2.weight)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
 
@@ -223,7 +223,7 @@ class diff_CSDI(nn.Module):
         # Final projections
         x = x.reshape(B, self.channels, K * L)
         x = self.output_projection1(x)
-        x = torch.tanh(x)
+        x = F.silu(x)
         x = self.dropout(x)
         x = self.output_projection2(x)
         x = x.reshape(B, 4, K, L)

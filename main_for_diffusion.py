@@ -99,7 +99,7 @@ train_dataloader = DataLoader(
     shuffle=True,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
@@ -112,7 +112,7 @@ val_dataloader = DataLoader(
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
@@ -124,7 +124,7 @@ test_dataloader = DataLoader(
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
     prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn
@@ -172,6 +172,8 @@ best_val_loss = float("inf")
 
 train_losses = []
 val_losses   = []
+
+first_batch_debug = True
 
 for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     diff_model.train()
@@ -357,7 +359,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0529_diffusion_lr_curve.png')
+plt.savefig('results/0531_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
@@ -431,7 +433,7 @@ with torch.no_grad():
             pred_den[...,0] = pred[...,0] * px_std + px_mean
             pred_den[...,1] = pred[...,1] * py_std + py_mean
             
-            # ADE, FDE Calculation (Metetrs)
+            # ADE, FDE Calculation (Meters)
             ade = ((pred_den - target_den)**2).sum(-1).sqrt().mean((1,2))
             fde = ((pred_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
 
@@ -440,11 +442,6 @@ with torch.no_grad():
             best_fde[mask] = fde[mask]
             best_pred[mask] = pred_den[mask]
             
-            del pred, pred_den, target_den, ade, fde, mask
-            
-        torch.cuda.empty_cache()
-        gc.collect()
-
         all_best_ades.extend(best_ade.cpu().tolist())
         all_best_fdes.extend(best_fde.cpu().tolist())
         
@@ -461,7 +458,7 @@ with torch.no_grad():
                 other_seq = batch["other"][i].view(T, -1, 2).to(device)          # [T, 12, 2]
                 other_den = torch.zeros_like(other_seq)
                 for j in range(other_seq.size(1)):
-                    x_col = other_cols[2*j]    # 2*j = x, 2*j+1 = y
+                    x_col = other_cols[2 * j]
                     if x_col == "ball_x":
                         x_mean, x_std = bx_mean, bx_std
                         y_mean, y_std = by_mean, by_std
@@ -490,6 +487,7 @@ with torch.no_grad():
 
             visualized = True
         
+        del pred, pred_den, target_den, ade, fde, mask
         del cond, target, H, cond_H, hist, hist_rep, cond_hist, cond_info
         del best_ade, best_fde, best_pred
         torch.cuda.empty_cache()
