@@ -182,12 +182,13 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     
     train_noise_mse = 0
     train_noise_nll = 0
+    train_player_mse = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
         graph_batch = batch["graph"].to(device)                              # HeteroData batch
         # graph → H
         H = graph_encoder(graph_batch)                                       # [B, 256]
@@ -213,7 +214,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 # 첫 번째 예측 (self_cond=None)
                 z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                eps_pred1 = z1[:, :2, :, :]
+                eps_pred1 = z1[:, :6, :, :]
                 
                 # x0 예측값 계산 (다음 step의 self-conditioning input)
                 a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
@@ -224,9 +225,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-        noise_mse, noise_nll = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
-        loss = noise_mse + noise_nll * 0.001
-            
+        noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+        loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()        
@@ -235,15 +236,18 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         # scaler.update()
         train_noise_mse += (noise_mse).item()
         train_noise_nll += (noise_nll * 0.001).item()
+        train_player_mse += (player_mse * 0.2).item()
+
         train_loss += loss.item()
         
         del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
-        del cond_info, t, s, noise_mse, noise_nll, loss
+        del cond_info, t, s, noise_mse, noise_nll, player_mse, loss
         
     num_batches = len(train_dataloader)
     
     avg_train_noise_mse = train_noise_mse / num_batches
     avg_train_noise_nll = train_noise_nll / num_batches
+    avg_train_player_mse = train_player_mse / num_batches
     avg_train_loss = train_loss / num_batches
 
 
@@ -254,13 +258,14 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     
     val_noise_mse = 0
     val_noise_nll = 0
+    val_player_mse = 0
     val_total_loss = 0
 
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation"):
             cond = batch["condition"].to(device)
             B, T, _ = cond.shape
-            target = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
             graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
             # with autocast(device_type='cuda'):
@@ -286,7 +291,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 # 첫 번째 예측 (self_cond=None)
                 z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                eps_pred1 = z1[:, :2, :, :]
+                eps_pred1 = z1[:, :6, :, :]
                 
                 # x0 예측값 계산 (다음 step의 self-conditioning input)
                 a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
@@ -297,33 +302,34 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-            noise_mse, noise_nll = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
-            val_loss = noise_mse + noise_nll * 0.001
+            noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+            val_loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
 
             val_noise_mse += (noise_mse).item()
             val_noise_nll += (noise_nll * 0.001).item()
+            val_player_mse += (player_mse * 0.2).item()
             val_total_loss += val_loss.item()
-            
-            del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
-            del cond_info, t, s, noise_mse, noise_nll, val_loss
 
-    
+            del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
+            del cond_info, t, s, noise_mse, noise_nll, player_mse, val_loss
+
     num_batches = len(val_dataloader)
-    
+
     avg_val_noise_mse = val_noise_mse / num_batches
     avg_val_noise_nll = val_noise_nll / num_batches
+    avg_val_player_mse = val_player_mse / num_batches
     avg_val_loss = val_total_loss / num_batches
-  
+
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_noise_mse:.6f}, Noise NLL={avg_train_noise_nll:.6f} Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_noise_mse:.6f}, Noise NLL={avg_train_noise_nll:.6f}, Player_MSE={avg_train_player_mse:.6f} Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
     
     tqdm.write(f"[Epoch {epoch}]\n"
-               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | LR: {current_lr:.6f}\n"
-               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f}")
-    
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | Player MSE: {avg_train_player_mse:.6f} LR: {current_lr:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f} | Player MSE: {avg_val_player_mse:.6f}")
+
     scheduler.step(avg_val_loss)
 
     if avg_val_loss < best_val_loss:
@@ -359,7 +365,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0531_diffusion_lr_curve.png')
+plt.savefig('results/0601_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
@@ -388,8 +394,8 @@ all_best_ades = []
 all_best_fdes = []
 
 visualize_samples = 5
-# visualized = False # If you want to visualize
-visualized = True
+visualized = False # If you want to visualize
+# visualized = True
 
 px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
 px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
@@ -405,7 +411,7 @@ with torch.no_grad():
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(B, T, 11, 2)
+        target = batch["target"].to(device).view(B, T, 11, 6)
 
         # condition 준비
         H = graph_encoder(batch["graph"].to(device))
@@ -426,7 +432,7 @@ with torch.no_grad():
         best_pred = torch.zeros_like(target)
 
         for _ in range(num_samples):
-            pred = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 2)
+            pred = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
 
             # Prediction Denormalization
             pred_den = pred.clone()
@@ -434,8 +440,8 @@ with torch.no_grad():
             pred_den[...,1] = pred[...,1] * py_std + py_mean
             
             # ADE, FDE Calculation (Meters)
-            ade = ((pred_den - target_den)**2).sum(-1).sqrt().mean((1,2))
-            fde = ((pred_den[:,-1] - target_den[:,-1])**2).sum(-1).sqrt().mean(1)
+            ade = ((pred_den[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
+            fde = ((pred_den[:,-1,:,:2] - target_den[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
 
             mask = ade < best_ade
             best_ade[mask] = ade[mask]
@@ -480,7 +486,7 @@ with torch.no_grad():
                 for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(folder, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(
-                        other_den, target_den, pred_traj,
+                        other_traj, target_traj, pred_traj,
                         other_columns=other_cols, target_columns=target_cols, player_idx=idx,
                         annotate=True, save_path=save_path
                     )

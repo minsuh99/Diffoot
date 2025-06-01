@@ -127,10 +127,10 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
     dists = []
     
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calculate Z-score...")):
-        target = batch["target"]
-        target_cols = batch["target_columns"][0]
-        for i, col in enumerate(target_cols):
-            arr = target[..., i].flatten().cpu().numpy()
+        cond = batch["condition"]
+        cond_cols = batch["condition_columns"][0]
+        for i, col in enumerate(cond_cols):
+            arr = cond[..., i].flatten().cpu().numpy()
             arr = arr[~np.isnan(arr)]
             if col.endswith('_x'):
                 px.extend(arr.tolist())

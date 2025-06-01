@@ -22,7 +22,6 @@ from utils.data_utils import (
 from utils.graph_utils import build_graph_sequence_from_condition
 
 
-
 # .xml files in DFL -> .csv with Metrica_sports format
 def convert_dfl_to_df(xy_objects, team, half, offset):
     tracking = xy_objects[half][team].xy
@@ -142,8 +141,6 @@ def make_ball_holder_series(event_objects, half, framerate, n_frames, offset=0):
     dur_s = pd.Series(np.log1p(durations[offset:offset+n_frames]), index=idx, name="possession_duration")
     
     return holder_s, dur_s
-
-
 
 
 # Save DFL .xml files as .csv format
@@ -367,8 +364,17 @@ class CustomDataset(Dataset):
                 if len(atk_cols) != 22 or len(def_cols) != 22:
                     i += 1
                     continue
+                
+                target_feats_enhanced = []
+                for j in range(0, len(def_cols), 2):
+                    base_name = def_cols[j].rsplit('_', 1)[0]  # e.g., "Away_15"
+                    target_feats_enhanced.extend([
+                        f"{base_name}_x", f"{base_name}_y",
+                        f"{base_name}_vx", f"{base_name}_vy"
+                    ])
+                    
                 input_feats = sort_columns_by_original_order(["ball_x", "ball_y"] + atk_cols, self.column_order)
-                target_feats = sort_columns_by_original_order(def_cols, self.column_order)
+                target_feats = sort_columns_by_original_order(target_feats_enhanced, self.column_order)
                 segments_info.append((match_id, i, input_feats, target_feats))
                 i += self.stride
                 
@@ -446,6 +452,60 @@ class CustomDataset(Dataset):
         other_seq = future_seq[other_columns]
         target_seq = future_seq[target_columns]
         
+        # 1. 상대좌표 계산을 위한 기준점 (condition의 마지막 프레임)
+        reference_frame = condition_seq.iloc[-1]
+        
+        # 2. Target 데이터 재구성: [절대좌표, 상대좌표, 속도]
+        target_data = []
+        enhanced_target_columns = []
+        
+        # target_columns 구조: [x,y]*11 + [vx,vy]*11
+        num_players = len(target_columns) // 4  # 11명
+        
+        for i in range(num_players):
+            # 현재 컬럼 구조에 맞춰 인덱싱
+            col_x = target_columns[i * 2]          # x 좌표
+            col_y = target_columns[i * 2 + 1]      # y 좌표  
+            col_vx = target_columns[22 + i * 2]    # vx (22번째부터 시작)
+            col_vy = target_columns[22 + i * 2 + 1] # vy
+            
+            base_name = col_x.rsplit('_', 1)[0]  # e.g., "Away_22"
+            
+            # 절대좌표
+            abs_x = target_seq[col_x].values
+            abs_y = target_seq[col_y].values
+            
+            # 상대좌표 (reference point 기준)
+            ref_x = reference_frame[col_x]
+            ref_y = reference_frame[col_y] 
+            rel_x = abs_x - ref_x
+            rel_y = abs_y - ref_y
+            
+            # 속도
+            vx = target_seq[col_vx].values
+            vy = target_seq[col_vy].values
+            
+            # 데이터 결합: [abs_x, abs_y, rel_x, rel_y, vx, vy]
+            target_data.append(np.column_stack([abs_x, abs_y, rel_x, rel_y, vx, vy]))
+        
+        # 컬럼명도 데이터 순서와 일치하도록 생성
+        # [x, y, rel_x, rel_y]*11 + [vx, vy]*11 순서로
+        for i in range(num_players):
+            base_name = target_columns[i * 2].rsplit('_', 1)[0]
+            enhanced_target_columns.extend([
+                f"{base_name}_x", f"{base_name}_y",           # 절대좌표
+                f"{base_name}_rel_x", f"{base_name}_rel_y"    # 상대좌표
+            ])
+        
+        for i in range(num_players):
+            base_name = target_columns[i * 2].rsplit('_', 1)[0]
+            enhanced_target_columns.extend([
+                f"{base_name}_vx", f"{base_name}_vy"          # 속도
+            ])
+        
+        # 3. 모든 플레이어 데이터 결합
+        target_array = np.concatenate(target_data, axis=1)  # [T, 66] (11명 * 6차원)
+            
         # --- Normalization ---
         if not hasattr(self, "pitch_cache"):
             self.pitch_cache = {}
@@ -457,17 +517,22 @@ class CustomDataset(Dataset):
         x_scale, y_scale = self.pitch_cache[match_id]
         
         if self.zscore_stats is not None:
-            # Target
-            target_array = target_seq.values.copy()
-            for i, col in enumerate(target_columns):
-                feat = col.rsplit("_", 1)[1]
-                if feat in ("x", "y"):
-                    mean = self.zscore_stats[f"player_{feat}_mean"]
-                    std = self.zscore_stats[f"player_{feat}_std"]
-                    target_array[:, i] = (target_array[:, i] - mean) / std
-            target_tensor = torch.tensor(target_array, dtype=torch.float32)
+            target_normalized = target_array.copy()
+            
+            for i in range(0, target_array.shape[1], 6):
+                # 절대좌표 정규화
+                target_normalized[:, i] = (target_array[:, i] - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
+                target_normalized[:, i+1] = (target_array[:, i+1] - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
+                
+                # 상대좌표 정규화 (평균은 빼지 않음)
+                target_normalized[:, i+2] = target_array[:, i+2] / self.zscore_stats['player_x_std']
+                target_normalized[:, i+3] = target_array[:, i+3] / self.zscore_stats['player_y_std']
+                
+                # 속도 정규화
+                target_normalized[:, i+4] = (target_array[:, i+4] - self.zscore_stats['player_vx_mean']) / self.zscore_stats['player_vx_std']
+                target_normalized[:, i+5] = (target_array[:, i+5] - self.zscore_stats['player_vy_mean']) / self.zscore_stats['player_vy_std']
 
-            # Other
+            # Other 정규화
             other_array = other_seq.values.copy()
             for i, col in enumerate(other_columns):
                 base, feat = col.rsplit("_", 1)
@@ -483,7 +548,7 @@ class CustomDataset(Dataset):
                     other_array[:, i] = (other_array[:, i] - mean) / std
             other_tensor = torch.tensor(other_array, dtype=torch.float32)
             
-            # Condition
+            # Condition 정규화
             cond_arr = condition_seq.values.copy()
             for i, col in enumerate(condition_columns):
                 base, feat = col.rsplit("_", 1)
@@ -496,9 +561,11 @@ class CustomDataset(Dataset):
                     cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
             
         else:
-            target_tensor = torch.tensor(target_seq.values, dtype=torch.float32)
+            # 피치 스케일 정규화
+            target_normalized = target_array.copy()            
             other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
 
+        target_tensor = torch.tensor(target_normalized, dtype=torch.float32)
                 
         # Calculate possession duration & neighbor opposite player count
         Na = len(atk_bases)
@@ -570,7 +637,7 @@ class CustomDataset(Dataset):
                 f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession_duration", "neighbor_count"]
             ] + ball_feats,
             "other_columns": other_columns,
-            "target_columns": target_columns,
+            "target_columns": enhanced_target_columns,  # 수정: enhanced 버전 사용
             "condition_frames": list(condition_seq.index),
             "target_frames": list(future_seq.index),
             "pitch_scale": (x_scale, y_scale),
@@ -612,16 +679,19 @@ class ApplyAugmentedDataset(Dataset):
         base_sample = self.base[self.flip_indices[t]]
         
         cond = base_sample["condition"].clone()
-        cond_x = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_x")]
-        cond[:, cond_x] *= -1
+        cond_x_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_x")]
+        cond_vx_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_vx")]
+        cond[:, cond_x_indices + cond_vx_indices] *= -1
 
         other = base_sample["other"].clone()
-        other_x = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_x")]
-        other[:, other_x] *= -1
+        other_x_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_x")]
+        other_vx_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_vx")]
+        other[:, other_x_indices + other_vx_indices] *= -1
 
-        target = base_sample["target"].clone()
-        target_x = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_x")]
-        target[:, target_x] *= -1
+        target = base_sample["target"].clone()  # [T, 11, 6]
+        target[:, :, 0] *= -1  # 절대 x 좌표
+        target[:, :, 2] *= -1  # 상대 x 좌표 (rel_x)
+        target[:, :, 4] *= -1  # x 방향 속도 (vx)
 
         sample = {
             "match_id": base_sample["match_id"],
@@ -674,13 +744,10 @@ if __name__ == "__main__":
     print("Condition frames:", sample["condition_frames"])
     print("Using frames:", sample["target_frames"])
     
-    print("Condition:", sample["condition"])
     print("Target:", sample["target"])
     
-    common = [col for col in sample["target_columns"] if col in sample["condition_columns"]]
-    idxs = [sample["condition_columns"].index(col) for col in common]
-    cond_vals = sample["condition"][-1, idxs]
-    
-    print(cond_vals)
-    print(sample["target"][0])
+    condition_last = sample["condition"][-1]
+    target_first = sample["target"][0]
 
+    print("첫 번째 플레이어 상대좌표:", target_first[2:4])
+    print("Enhanced target columns 개수:", len(sample["target_columns"]))

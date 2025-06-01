@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+import torch.nn.functional as F
 from tslearn.metrics import SoftDTWLossPyTorch
 from torch_geometric.data import HeteroData
 import pandas as pd
@@ -237,6 +238,12 @@ def per_player_soft_dtw_loss(pred, target, gamma=0.1):
     loss_flat = sdtw_fn(pred_flat, target_flat)
     
     return loss_flat.mean()
+
+def per_player_mse_loss(pred, target):
+    mse_per_timestep = F.mse_loss(pred, target, reduction='none').mean(dim=-1)
+    mse_per_player = mse_per_timestep.mean(dim=1)  # (B, N)
+
+    return mse_per_player.mean()
 
 def per_player_frechet_loss(pred, target):
     # pred, target (B, T, N=11, 2)

@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.utils import per_player_frechet_loss, per_player_fde_loss
+from utils.utils import per_player_mse_loss
 
 class DiffusionTrajectoryModel(nn.Module):
     def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
@@ -38,7 +38,7 @@ class DiffusionTrajectoryModel(nn.Module):
         z = self.model(x_t_in, t, cond_info, self_cond)
         z = z.permute(0, 3, 2, 1)
         
-        eps_pred, log_var = z[..., :2], z[..., 2:]
+        eps_pred, log_var = z[..., :6], z[..., 6:]
         log_var = log_var.clamp(-5, 5)
         var = log_var.exp()
         
@@ -48,7 +48,10 @@ class DiffusionTrajectoryModel(nn.Module):
         nll = 0.5 * ((noise - eps_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
         
-        return noise_mse, noise_nll
+        # Per-player MSE loss
+        player_mse = per_player_mse_loss(eps_pred, noise)
+        
+        return noise_mse, noise_nll, player_mse
     
     # DDIM Sampling
     @torch.no_grad()
@@ -78,7 +81,7 @@ class DiffusionTrajectoryModel(nn.Module):
             use_self_cond = self_cond if torch.rand(1).item() < self_conditioning_ratio else None
         
             z = self.model(x_in, t_batch, cond_info, use_self_cond).permute(0, 3, 2, 1)
-            noise_pred = z[..., :2]
+            noise_pred = z[..., :6]
             
             x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
             
