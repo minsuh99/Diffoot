@@ -217,7 +217,6 @@ class diff_CSDI(nn.Module):
         for block in self.residual_layers:
             x, skip = block(x, cond_info, diffusion_emb)
             skip_sum.add_(skip)
-            del skip
         x = skip_sum.mul_(self.inv_sqrt_layers)
         
         # Final projections

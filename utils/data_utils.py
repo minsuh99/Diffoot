@@ -132,17 +132,6 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         for i, col in enumerate(cond_cols):
             arr = cond[..., i].flatten().cpu().numpy()
             arr = arr[~np.isnan(arr)]
-            if col.endswith('_x'):
-                px.extend(arr.tolist())
-            elif col.endswith('_y'):
-                py.extend(arr.tolist())
-
-
-        cond = batch["condition"]
-        cond_cols = batch["condition_columns"][0]
-        for i, col in enumerate(cond_cols):
-            arr = cond[..., i].flatten().cpu().numpy()
-            arr = arr[~np.isnan(arr)]
             if col.endswith('_x') and col != 'ball_x':
                 px.extend(arr.tolist())
             elif col == 'ball_x':
