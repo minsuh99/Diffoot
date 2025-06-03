@@ -237,7 +237,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=250, condition_length=125, framerate=25, stride=25, zscore_stats = None):
+    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=25, zscore_stats = None):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -489,20 +489,15 @@ class CustomDataset(Dataset):
             target_data.append(np.column_stack([abs_x, abs_y, rel_x, rel_y, vx, vy]))
         
         # 컬럼명도 데이터 순서와 일치하도록 생성
-        # [x, y, rel_x, rel_y]*11 + [vx, vy]*11 순서로
+        # [x, y, rel_x, rel_y, vx, vy]*11 순서로
         for i in range(num_players):
             base_name = target_columns[i * 2].rsplit('_', 1)[0]
             enhanced_target_columns.extend([
                 f"{base_name}_x", f"{base_name}_y",           # 절대좌표
-                f"{base_name}_rel_x", f"{base_name}_rel_y"    # 상대좌표
-            ])
-        
-        for i in range(num_players):
-            base_name = target_columns[i * 2].rsplit('_', 1)[0]
-            enhanced_target_columns.extend([
+                f"{base_name}_rel_x", f"{base_name}_rel_y",    # 상대좌표
                 f"{base_name}_vx", f"{base_name}_vy"          # 속도
             ])
-        
+                    
         # 3. 모든 플레이어 데이터 결합
         target_array = np.concatenate(target_data, axis=1)  # [T, 66] (11명 * 6차원)
             
@@ -688,10 +683,11 @@ class ApplyAugmentedDataset(Dataset):
         other_vx_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_vx")]
         other[:, other_x_indices + other_vx_indices] *= -1
 
-        target = base_sample["target"].clone()  # [T, 11, 6]
-        target[:, :, 0] *= -1  # 절대 x 좌표
-        target[:, :, 2] *= -1  # 상대 x 좌표 (rel_x)
-        target[:, :, 4] *= -1  # x 방향 속도 (vx)
+        target = base_sample["target"].clone()
+        cond_x_indices = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_x")]
+        cond_rel_x_indices = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_rel_x")]
+        cond_vx_indices = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_vx")]
+        target[:, cond_x_indices + cond_rel_x_indices + cond_vx_indices] *= -1
 
         sample = {
             "match_id": base_sample["match_id"],

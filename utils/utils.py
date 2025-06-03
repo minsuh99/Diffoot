@@ -111,6 +111,9 @@ def calc_velocites(df, smoothing=True, filter_='Savitzky-Golay', window=7, polyo
             vx[ raw_speed>player_maxspeed ] = np.nan
             vy[ raw_speed>player_maxspeed ] = np.nan
             
+            vx = vx.interpolate(method='cubic').fillna(0.0)
+            vy = vy.interpolate(method='cubic').fillna(0.0)
+
         if smoothing:
             if filter_=='Savitzky-Golay':
                 # calculate first half velocity

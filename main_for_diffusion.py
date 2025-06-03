@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+# from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
@@ -52,7 +53,7 @@ hyperparams = {
     'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 1e-4,
+    'learning_rate': 2e-4,
     'self_conditioning_ratio': 0.0,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
@@ -157,7 +158,8 @@ history_encoder = TargetTrajectoryEncoder(num_layers=5, hidden_dim = side_dim //
 denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-5)
+# scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-5)
+scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
 scaler = GradScaler()
 
 logger.info(f"Device: {device}")
@@ -186,54 +188,57 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training..."):
+        optimizer.zero_grad()
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
         target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
         graph_batch = batch["graph"].to(device)                              # HeteroData batch
-        # graph → H
-        H = graph_encoder(graph_batch)                                       # [B, 256]
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-        
-        # All player + ball history trajectories
-        hist = cond[:, :, target_idx].to(device) 
-        hist_rep = history_encoder(hist)  # [B, 256]
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-        
-        # Concat conditions
-        cond_info = torch.cat([cond_H, cond_hist], dim=1)
-        # Preparing Self-conditioning data
-        # timestep (consistency)
-        t = torch.randint(0, diff_model.num_steps, (target.size(0),), device=device)
-        
-        s = None
-        if torch.rand(1, device=device) < self_conditioning_ratio:
-            with torch.no_grad():
-                # 첫 번째 denoising step으로 x0 예측
-                x_t, noise = diff_model.q_sample(target, t)
-                x_t_input = x_t.permute(0, 3, 2, 1)
-                
-                # 첫 번째 예측 (self_cond=None)
-                z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                eps_pred1 = z1[:, :6, :, :]
-                
-                # x0 예측값 계산 (다음 step의 self-conditioning input)
-                a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                x0_hat = x0_hat.permute(0, 3, 2, 1)
-                
-                s = x0_hat.detach()  # [B, T, 11, 2]
-                
-                del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
+        with autocast(device_type='cuda'):
+            # graph → H
+            H = graph_encoder(graph_batch)                                       # [B, 256]
+            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            
+            # All player + ball history trajectories
+            hist = cond[:, :, target_idx].to(device) 
+            hist_rep = history_encoder(hist)  # [B, 256]
+            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            
+            # Concat conditions
+            cond_info = torch.cat([cond_H, cond_hist], dim=1)
+            # Preparing Self-conditioning data
+            # timestep (consistency)
+            t = torch.randint(0, diff_model.num_steps, (target.size(0),), device=device)
+            
+            s = None
+            if torch.rand(1, device=device) < self_conditioning_ratio:
+                with torch.no_grad():
+                    # 첫 번째 denoising step으로 x0 예측
+                    x_t, noise = diff_model.q_sample(target, t)
+                    x_t_input = x_t.permute(0, 3, 2, 1)
+                    
+                    # 첫 번째 예측 (self_cond=None)
+                    z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
+                    eps_pred1 = z1[:, :6, :, :]
+                    
+                    # x0 예측값 계산 (다음 step의 self-conditioning input)
+                    a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
+                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
+                    x0_hat = x0_hat.permute(0, 3, 2, 1)
+                    
+                    s = x0_hat.detach()  # [B, T, 11, 6]
+                    
+                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-        noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
-        loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
+            noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+            loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()        
-        # scaler.scale(loss).backward()
-        # scaler.step(optimizer)
-        # scaler.update()
+        # optimizer.zero_grad()
+        # loss.backward()
+        # optimizer.step()        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
         train_noise_mse += (noise_mse).item()
         train_noise_nll += (noise_nll * 0.001).item()
         train_player_mse += (player_mse * 0.2).item()
@@ -268,42 +273,42 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
             graph_batch = batch["graph"].to(device)                              # HeteroData batch
 
-            # with autocast(device_type='cuda'):
+            with autocast(device_type='cuda'):
                 # graph → H
-            H = graph_encoder(graph_batch)                                      # [B, 256]
-            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-            
-            # Target's history trajectories
-            hist = cond[:, :, target_idx].to(device)  # [B,256,11,T]
-            hist_rep = history_encoder(hist)  # [B, 256]
-            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
-            
-            # Concat conditions
-            cond_info = torch.cat([cond_H, cond_hist], dim=1)
-            
-            t = torch.randint(0, diff_model.num_steps, (B,), device=device)
-            
-            s = None
-            if torch.rand(1, device=device) < self_conditioning_ratio:
-                # 첫 번째 denoising step으로 x0 예측
-                x_t, noise = diff_model.q_sample(target, t)
-                x_t_input = x_t.permute(0, 3, 2, 1)
+                H = graph_encoder(graph_batch)                                      # [B, 256]
+                cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
                 
-                # 첫 번째 예측 (self_cond=None)
-                z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                eps_pred1 = z1[:, :6, :, :]
+                # Target's history trajectories
+                hist = cond[:, :, target_idx].to(device)  # [B,256,11,T]
+                hist_rep = history_encoder(hist)  # [B, 256]
+                cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
                 
-                # x0 예측값 계산 (다음 step의 self-conditioning input)
-                a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                x0_hat = x0_hat.permute(0, 3, 2, 1)
+                # Concat conditions
+                cond_info = torch.cat([cond_H, cond_hist], dim=1)
                 
-                s = x0_hat.detach() # [B, T, 11, 2]
+                t = torch.randint(0, diff_model.num_steps, (B,), device=device)
                 
-                del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
+                s = None
+                if torch.rand(1, device=device) < self_conditioning_ratio:
+                    # 첫 번째 denoising step으로 x0 예측
+                    x_t, noise = diff_model.q_sample(target, t)
+                    x_t_input = x_t.permute(0, 3, 2, 1)
+                    
+                    # 첫 번째 예측 (self_cond=None)
+                    z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
+                    eps_pred1 = z1[:, :6, :, :]
+                    
+                    # x0 예측값 계산 (다음 step의 self-conditioning input)
+                    a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
+                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
+                    x0_hat = x0_hat.permute(0, 3, 2, 1)
+                    
+                    s = x0_hat.detach() # [B, T, 11, 6]
+                    
+                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-            noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
-            val_loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
+                noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+                val_loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
 
             val_noise_mse += (noise_mse).item()
             val_noise_nll += (noise_nll * 0.001).item()
@@ -330,7 +335,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | Player MSE: {avg_train_player_mse:.6f} LR: {current_lr:.6f}\n"
                f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f} | Player MSE: {avg_val_player_mse:.6f}")
 
-    scheduler.step(avg_val_loss)
+    # scheduler.step(avg_val_loss)
+    scheduler.step()
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
@@ -365,7 +371,7 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0601_diffusion_lr_curve.png')
+plt.savefig('results/0603_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
@@ -475,14 +481,14 @@ with torch.no_grad():
                     other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                     other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
                 
-                pred_traj = best_pred[i].cpu().numpy()
-                target_traj = target_den[i].cpu().numpy()
+                pred_traj = best_pred[i, :, :, :2].cpu().numpy()
+                target_traj = target_den[i, :, :, :2].cpu().numpy()
                 other_traj  = other_den.cpu().numpy()
                 
                 folder = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(folder, exist_ok=True)
                 
-                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
+                defender_nums = [int(col.split('_')[1]) for col in target_cols[::6]]
                 for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(folder, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(
