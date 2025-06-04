@@ -37,19 +37,23 @@ class DiffusionTrajectoryModel(nn.Module):
 
         z = self.model(x_t_in, t, cond_info, self_cond)
         z = z.permute(0, 3, 2, 1)
-        
+
         eps_pred, log_var = z[..., :6], z[..., 6:]
         log_var = log_var.clamp(-5, 5)
         var = log_var.exp()
         
-        noise_mse = F.mse_loss(eps_pred, noise)
+        eps_pred_rel = eps_pred[..., 2:4]  # 상대좌표 부분만
+        noise_rel = noise[..., 2:4]
+        log_var_rel = log_var[..., 2:4]
+        var_rel = var[..., 2:4]
+        
+        noise_mse = F.mse_loss(eps_pred_rel, noise_rel)
         
         # NLL loss computing
-        nll = 0.5 * ((noise - eps_pred) ** 2 / var + log_var + math.log(2 * math.pi))
+        nll = 0.5 * ((noise_rel - eps_pred_rel) ** 2 / var_rel + log_var_rel + math.log(2 * math.pi))
         noise_nll = nll.mean()
         
-        # Per-player MSE loss
-        player_mse = per_player_mse_loss(eps_pred, noise)
+        player_mse = per_player_mse_loss(eps_pred_rel, noise_rel)
         
         return noise_mse, noise_nll, player_mse
     

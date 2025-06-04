@@ -167,7 +167,7 @@ class diff_CSDI(nn.Module):
         # Input projection
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
         # Self-conditioning projection
-        self.self_cond_projection = Conv1d_with_init(2, self.channels, 1)
+        self.self_cond_projection = Conv1d_with_init(inputdim, self.channels, 1)
         # Residual blocks
         self.residual_layers = nn.ModuleList([
             ResidualBlock(
@@ -181,7 +181,7 @@ class diff_CSDI(nn.Module):
         
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, 12, 1)  # noise(2) + log_sigma(2 channels)
+        self.output_projection2 = Conv1d_with_init(self.channels, inputdim * 2, 1)  # noise(6) + log_sigma(6 channels)
         nn.init.xavier_uniform_(self.output_projection2.weight)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
@@ -196,7 +196,7 @@ class diff_CSDI(nn.Module):
 
         # Add self-conditioning if provided
         if self_cond is not None:
-            sc = self.self_cond_projection(self_cond.permute(0, 3, 1, 2).reshape(B, 6, K * L))
+            sc = self.self_cond_projection(self_cond.permute(0, 3, 1, 2).reshape(B, inputdim, K * L))
             x = x + sc
 
         # Prepare diffusion embedding
@@ -225,8 +225,8 @@ class diff_CSDI(nn.Module):
         x = F.silu(x)
         x = self.dropout(x)
         x = self.output_projection2(x)
-        x = x.reshape(B, 12, K, L)
-        eps, log_sigma = x[:, :6], x[:, 6:]
+        x = x.reshape(B, inputdim * 2, K, L)
+        eps, log_sigma = x[:, :inputdim], x[:, inputdim:]
         log_sigma = torch.clamp(log_sigma, -10, 10)
         x = torch.cat([eps, log_sigma], dim=1)
         return x

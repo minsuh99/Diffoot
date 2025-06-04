@@ -6,11 +6,12 @@ import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime
 from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 # from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
@@ -157,9 +158,10 @@ graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim // 2,
 history_encoder = TargetTrajectoryEncoder(num_layers=5, hidden_dim = side_dim // 4, bidirectional=True).to(device)
 denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
+
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate)
 # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-5)
-scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-5)
+scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate * 0.1)
 scaler = GradScaler()
 
 logger.info(f"Device: {device}")
@@ -191,8 +193,34 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         optimizer.zero_grad()
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
-        graph_batch = batch["graph"].to(device)                              # HeteroData batch
+        target_columns = batch["target_columns"][0]
+        condition_columns = batch["condition_columns"][0]
+        
+        target_x_indices = []
+        target_y_indices = []
+        
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]
+            y_col = target_columns[i + 1]
+            
+            if x_col in condition_columns and y_col in condition_columns:
+                target_x_indices.append(condition_columns.index(x_col))
+                target_y_indices.append(condition_columns.index(y_col))
+        
+        last_past_cond = batch["condition"][:, -1]
+        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+        initial_pos = torch.stack([
+            last_past_cond[:, target_x_indices],  # [B, 11]
+            last_past_cond[:, target_y_indices]   # [B, 11]
+        ], dim=-1)  # [B, 11, 2]
+
+        target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+
+        model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
+        graph_batch = batch["graph"].to(device)    
+        # HeteroData batch
         with autocast(device_type='cuda'):
             # graph → H
             H = graph_encoder(graph_batch)                                       # [B, 256]
@@ -207,13 +235,13 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             cond_info = torch.cat([cond_H, cond_hist], dim=1)
             # Preparing Self-conditioning data
             # timestep (consistency)
-            t = torch.randint(0, diff_model.num_steps, (target.size(0),), device=device)
+            t = torch.randint(0, diff_model.num_steps, (model_input.size(0),), device=device)
             
             s = None
             if torch.rand(1, device=device) < self_conditioning_ratio:
                 with torch.no_grad():
                     # 첫 번째 denoising step으로 x0 예측
-                    x_t, noise = diff_model.q_sample(target, t)
+                    x_t, noise = diff_model.q_sample(model_input, t)
                     x_t_input = x_t.permute(0, 3, 2, 1)
                     
                     # 첫 번째 예측 (self_cond=None)
@@ -229,7 +257,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                     
                     del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-            noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+            noise_mse, noise_nll, player_mse = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s)
             loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
 
         # optimizer.zero_grad()
@@ -244,9 +272,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         train_player_mse += (player_mse * 0.2).item()
 
         train_loss += loss.item()
-        
-        del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
-        del cond_info, t, s, noise_mse, noise_nll, player_mse, loss
+
+        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
+        del cond_info, t, s, noise_mse, noise_nll, player_mse
         
     num_batches = len(train_dataloader)
     
@@ -270,8 +298,33 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         for batch in tqdm(val_dataloader, desc="Validation"):
             cond = batch["condition"].to(device)
             B, T, _ = cond.shape
-            target = batch["target"].to(device).view(-1, T, 11, 6)  # [B, T, 11, 6]
-            graph_batch = batch["graph"].to(device)                              # HeteroData batch
+            target_columns = batch["target_columns"][0]
+            condition_columns = batch["condition_columns"][0]
+            
+            target_x_indices = []
+            target_y_indices = []
+            
+            for i in range(0, len(target_columns), 2):
+                x_col = target_columns[i]
+                y_col = target_columns[i + 1]
+                
+                if x_col in condition_columns and y_col in condition_columns:
+                    target_x_indices.append(condition_columns.index(x_col))
+                    target_y_indices.append(condition_columns.index(y_col))
+            
+            last_past_cond = batch["condition"][:, -1]
+            # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+            initial_pos = torch.stack([
+                last_past_cond[:, target_x_indices],  # [B, 11]
+                last_past_cond[:, target_y_indices]   # [B, 11]
+            ], dim=-1)  # [B, 11, 2]
+            
+            target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+
+            model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
+            graph_batch = batch["graph"].to(device)                        # HeteroData batch
 
             with autocast(device_type='cuda'):
                 # graph → H
@@ -291,7 +344,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 s = None
                 if torch.rand(1, device=device) < self_conditioning_ratio:
                     # 첫 번째 denoising step으로 x0 예측
-                    x_t, noise = diff_model.q_sample(target, t)
+                    x_t, noise = diff_model.q_sample(model_input, t)
                     x_t_input = x_t.permute(0, 3, 2, 1)
                     
                     # 첫 번째 예측 (self_cond=None)
@@ -307,7 +360,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                     
                     del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-                noise_mse, noise_nll, player_mse = diff_model(target, t=t, cond_info=cond_info, self_cond=s)
+                noise_mse, noise_nll, player_mse = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s)
                 val_loss = noise_mse + noise_nll * 0.001 + player_mse * 0.2
 
             val_noise_mse += (noise_mse).item()
@@ -315,9 +368,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             val_player_mse += (player_mse * 0.2).item()
             val_total_loss += val_loss.item()
 
-            del cond, target, graph_batch, H, cond_H, hist, hist_rep, cond_hist
-            del cond_info, t, s, noise_mse, noise_nll, player_mse, val_loss
-
+        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
+        del cond_info, t, s, noise_mse, noise_nll, player_mse
+        
     num_batches = len(val_dataloader)
 
     avg_val_noise_mse = val_noise_mse / num_batches
@@ -371,7 +424,9 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
 plt.legend()
 plt.tight_layout()
 
-plt.savefig('results/0603_diffusion_lr_curve.png')
+# plt.savefig('results/0603_diffusion_lr_curve.png')
+timestamp = datetime.now().strftime('%m%d')
+plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
@@ -417,7 +472,33 @@ with torch.no_grad():
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
-        target = batch["target"].to(device).view(B, T, 11, 6)
+        target_columns = batch["target_columns"][0]
+        condition_columns = batch["condition_columns"][0]
+        
+        target_x_indices = []
+        target_y_indices = []
+        
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]
+            y_col = target_columns[i + 1]
+            
+            if x_col in condition_columns and y_col in condition_columns:
+                target_x_indices.append(condition_columns.index(x_col))
+                target_y_indices.append(condition_columns.index(y_col))
+        
+        last_past_cond = batch["condition"][:, -1]
+        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+        initial_pos = torch.stack([
+            last_past_cond[:, target_x_indices],  # [B, 11]
+            last_past_cond[:, target_y_indices]   # [B, 11]
+        ], dim=-1)  # [B, 11, 2]
+        
+        target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+
+        model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
+        graph_batch = batch["graph"].to(device)
 
         # condition 준비
         H = graph_encoder(batch["graph"].to(device))
@@ -429,21 +510,25 @@ with torch.no_grad():
         cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)
         
         # Target Denormalization
-        target_den = target.clone()
-        target_den[...,0] = target[...,0] * px_std + px_mean
-        target_den[...,1] = target[...,1] * py_std + py_mean
+        target_den = target_abs.clone()
+        target_den[...,0] = target_abs[...,0] * px_std + px_mean
+        target_den[...,1] = target_abs[...,1] * py_std + py_mean
 
         best_ade = torch.full((B,), float("inf"), device=device)
         best_fde = torch.full((B,), float("inf"), device=device)
-        best_pred = torch.zeros_like(target)
+        best_pred = torch.zeros_like(target_abs)
 
         for _ in range(num_samples):
-            pred = diff_model.generate(shape=target.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
+            pred = diff_model.generate(shape=model_input.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
 
+            # 상대 좌표 예측
+            pred_rel = pred[..., 2:4]
+            # 절대 좌표 예측 = 상대 좌표 + initial_position
+            pred_abs = pred_rel + initial_pos.unsqueeze(1).to(device)
             # Prediction Denormalization
-            pred_den = pred.clone()
-            pred_den[...,0] = pred[...,0] * px_std + px_mean
-            pred_den[...,1] = pred[...,1] * py_std + py_mean
+            pred_den = pred_abs.clone()
+            pred_den[...,0] = pred_abs[...,0] * px_std + px_mean
+            pred_den[...,1] = pred_abs[...,1] * py_std + py_mean
             
             # ADE, FDE Calculation (Meters)
             ade = ((pred_den[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
@@ -488,7 +573,7 @@ with torch.no_grad():
                 folder = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(folder, exist_ok=True)
                 
-                defender_nums = [int(col.split('_')[1]) for col in target_cols[::6]]
+                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 for idx, jersey in enumerate(defender_nums):
                     save_path = os.path.join(folder, f"player_{jersey:02d}.png")
                     plot_trajectories_on_pitch(
@@ -500,7 +585,7 @@ with torch.no_grad():
             visualized = True
         
         del pred, pred_den, target_den, ade, fde, mask
-        del cond, target, H, cond_H, hist, hist_rep, cond_hist, cond_info
+        del cond, target_abs, target_rel, target_vel, H, cond_H, hist, hist_rep, cond_hist, cond_info
         del best_ade, best_fde, best_pred
         torch.cuda.empty_cache()
         gc.collect()
