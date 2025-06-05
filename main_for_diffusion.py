@@ -504,7 +504,7 @@ with torch.no_grad():
         H = graph_encoder(batch["graph"].to(device))
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         
-        hist = cond[:, :, target_idx]
+        hist = cond[:, :, target_idx].to(device)
         hist_rep = history_encoder(hist)
         cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
         cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)

@@ -85,9 +85,13 @@ class DiffusionTrajectoryModel(nn.Module):
             use_self_cond = self_cond if torch.rand(1).item() < self_conditioning_ratio else None
         
             z = self.model(x_in, t_batch, cond_info, use_self_cond).permute(0, 3, 2, 1)
-            noise_pred = z[..., :6]
+            eps_pred, log_var = z[..., :6], z[..., 6:]
             
-            x0_pred = (x - torch.sqrt(1 - ah_t) * noise_pred) / torch.sqrt(ah_t)
+            # 훈련과 동일하게 상대좌표 부분만 사용
+            noise_pred = eps_pred
+            
+            x0_pred = x.clone()
+            x0_pred[..., 2:4] = (x[..., 2:4] - torch.sqrt(1 - ah_t) * noise_pred[..., 2:4]) / torch.sqrt(ah_t)
             
             # Self-conditioning 업데이트 (ratio > 0일 때만)
             if self_conditioning_ratio > 0:
@@ -99,11 +103,13 @@ class DiffusionTrajectoryModel(nn.Module):
                     noise = torch.randn_like(x)
                 else:
                     sigma_t = 0.0
-                    noise = 0.0
+                    noise = torch.zeros_like(x)
 
                 c1 = torch.sqrt(ah_t_prev)
                 c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
-                x = c1 * x0_pred + c2 * noise_pred + sigma_t * noise
+                x_new = x.clone()
+                x_new[..., 2:4] = c1 * x0_pred[..., 2:4] + c2 * noise_pred[..., 2:4] + sigma_t * noise[..., 2:4]
+                x = x_new
             else:
                 x = x0_pred
 

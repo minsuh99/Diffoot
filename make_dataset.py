@@ -364,17 +364,9 @@ class CustomDataset(Dataset):
                 if len(atk_cols) != 22 or len(def_cols) != 22:
                     i += 1
                     continue
-                
-                target_feats_enhanced = []
-                for j in range(0, len(def_cols), 2):
-                    base_name = def_cols[j].rsplit('_', 1)[0]  # e.g., "Away_15"
-                    target_feats_enhanced.extend([
-                        f"{base_name}_x", f"{base_name}_y",
-                        f"{base_name}_vx", f"{base_name}_vy"
-                    ])
                     
                 input_feats = sort_columns_by_original_order(["ball_x", "ball_y"] + atk_cols, self.column_order)
-                target_feats = sort_columns_by_original_order(target_feats_enhanced, self.column_order)
+                target_feats = sort_columns_by_original_order(def_cols, self.column_order)
                 segments_info.append((match_id, i, input_feats, target_feats))
                 i += self.stride
                 
@@ -460,16 +452,12 @@ class CustomDataset(Dataset):
         target_rel_data = []       # 상대좌표 (rel_x, rel_y)
         target_vel_data = []       # 속도 (vx, vy)
         
-        # target_columns 구조: [x,y]*11 + [vx,vy]*11
-        num_players = len(target_columns) // 4  # 11명
+        num_players = len(target_columns) // 2  # 11명
         
         for i in range(num_players):
             # 현재 컬럼 구조에 맞춰 인덱싱
-            col_x = target_columns[i * 4]          # x 좌표
-            col_y = target_columns[i * 4 + 1]      # y 좌표  
-            col_vx = target_columns[i * 4 + 2]     # vx (22번째부터 시작)
-            col_vy = target_columns[i * 4 + 3]     # vy
-            
+            col_x = target_columns[i * 2]          # x 좌표
+            col_y = target_columns[i * 2 + 1]      # y 좌표
             # 절대좌표
             abs_x = target_seq[col_x].values
             abs_y = target_seq[col_y].values
@@ -483,8 +471,18 @@ class CustomDataset(Dataset):
             target_rel_data.append(np.column_stack([rel_x, rel_y]))
             
             # 속도
-            vx = target_seq[col_vx].values
-            vy = target_seq[col_vy].values
+            first_vx = (abs_x[0] - ref_x) * self.framerate
+            first_vy = (abs_y[0] - ref_y) * self.framerate
+            dx = np.diff(abs_x)
+            dy = np.diff(abs_y)
+            
+            _vx = dx * self.framerate
+            _vy = dy * self.framerate
+            
+            # 전체 velocity 배열 구성
+            vx = np.concatenate([[first_vx], _vx])
+            vy = np.concatenate([[first_vy], _vy])
+            
             target_vel_data.append(np.column_stack([vx, vy]))
         
         # 각각 별도 배열로 저장
@@ -538,16 +536,16 @@ class CustomDataset(Dataset):
             other_tensor = torch.tensor(other_array, dtype=torch.float32)
             
             # Condition 정규화
-            cond_arr = condition_seq.values.copy()
-            for i, col in enumerate(condition_columns):
+            condition_seq_normalized = condition_seq.copy()
+            for col in condition_columns:
                 base, feat = col.rsplit("_", 1)
                 if feat in ("x", "y", "vx", "vy"):
                     key = "ball" if base == "ball" else "player"
                     mean = self.zscore_stats[f"{key}_{feat}_mean"]
                     std  = self.zscore_stats[f"{key}_{feat}_std"]
-                    cond_arr[:, i] = (cond_arr[:, i] - mean) / std
+                    condition_seq_normalized[col] = (condition_seq[col] - mean) / std
                 elif feat == "dist":
-                    cond_arr[:, i] = (cond_arr[:, i] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
+                    condition_seq_normalized[col] = (condition_seq[col] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
             
         else:
             # 피치 스케일 정규화 (기본값)
@@ -555,6 +553,7 @@ class CustomDataset(Dataset):
             target_rel_normalized = target_rel
             target_vel_normalized = target_vel
             other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
+            condition_seq_normalized = condition_seq
 
         # 텐서로 변환
         target_abs_tensor = torch.tensor(target_abs_normalized, dtype=torch.float32)
@@ -592,7 +591,7 @@ class CustomDataset(Dataset):
         num_feats_list = []
         for f in ["x", "y", "vx", "vy", "dist"]:
             cols = [f"{base}_{f}" for base in bases]
-            num_feats_list.append(condition_seq[cols].fillna(0).values[..., None])
+            num_feats_list.append(condition_seq_normalized[cols].fillna(0).values[..., None])
         num_feats = np.concatenate(num_feats_list, axis=2)
 
         # position, starter
@@ -613,7 +612,7 @@ class CustomDataset(Dataset):
 
         # Ball features
         ball_cols = ["ball_x","ball_y","ball_vx","ball_vy"]
-        ball_arr  = condition_seq[ball_cols].fillna(0).values
+        ball_arr = condition_seq_normalized[ball_cols].fillna(0).values
 
         # Concat
         player_feats = np.concatenate([num_feats, pos_feats, starter_feats, poss_feats, neigh_feats], axis=2)
