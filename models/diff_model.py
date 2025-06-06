@@ -26,7 +26,7 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, t=None, cond_info=None, self_cond=None):
+    def forward(self, x_0, t=None, cond_info=None, self_cond=None, initial_pos=None):
         B = x_0.size(0)
         device = x_0.device
         
@@ -52,8 +52,18 @@ class DiffusionTrajectoryModel(nn.Module):
         # NLL loss computing
         nll = 0.5 * ((noise_rel - eps_pred_rel) ** 2 / var_rel + log_var_rel + math.log(2 * math.pi))
         noise_nll = nll.mean()
-        
-        player_mse = per_player_mse_loss(eps_pred_rel, noise_rel)
+
+        # Player-wise MSE
+        if initial_pos is not None:
+            target_abs = x_0[..., :2]
+
+            a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
+            x0_pred_rel = (x_t[..., 2:4] - torch.sqrt(1 - a_hat) * eps_pred_rel) / torch.sqrt(a_hat)
+
+            initial_pos_expanded = initial_pos.unsqueeze(1).expand(-1, x_0.size(1), -1, -1)  # [B, T, N, 2]
+            pred_abs = x0_pred_rel + initial_pos_expanded  # [B, T, N, 2]
+
+            player_mse = per_player_mse_loss(pred_abs, target_abs)
         
         return noise_mse, noise_nll, player_mse
     

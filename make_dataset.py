@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore", message="The 'gameclock' column does not match the defined value range.*", category=UserWarning, module=r"floodlight\.core\.events")
 
 from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_pitch_from_mat_info_xml
-from utils.utils import calc_velocites, correct_all_player_jumps_adjacent
+from utils.utils import calc_velocites, correct_nan_velocities_and_positions
 from utils.data_utils import (
     infer_starters_from_tracking,
     sort_columns_by_original_order,
@@ -290,10 +290,10 @@ class CustomDataset(Dataset):
             self.match_player_pid_map[match_id] = pid_map
             
             # 전처리
-            home = correct_all_player_jumps_adjacent(home, self.framerate)
-            away = correct_all_player_jumps_adjacent(away, self.framerate)
             home = calc_velocites(home)
             away = calc_velocites(away)
+            home = correct_nan_velocities_and_positions(home, self.framerate)
+            away = correct_nan_velocities_and_positions(away, self.framerate)
             home_dist = compute_cumulative_distances(home, "Home")
             away_dist = compute_cumulative_distances(away, "Away")
 
@@ -471,17 +471,8 @@ class CustomDataset(Dataset):
             target_rel_data.append(np.column_stack([rel_x, rel_y]))
             
             # 속도
-            first_vx = (abs_x[0] - ref_x) * self.framerate
-            first_vy = (abs_y[0] - ref_y) * self.framerate
-            dx = np.diff(abs_x)
-            dy = np.diff(abs_y)
-            
-            _vx = dx * self.framerate
-            _vy = dy * self.framerate
-            
-            # 전체 velocity 배열 구성
-            vx = np.concatenate([[first_vx], _vx])
-            vy = np.concatenate([[first_vy], _vy])
+            vx = np.concatenate([np.diff(abs_x), [0.0]])
+            vy = np.concatenate([np.diff(abs_y), [0.0]])
             
             target_vel_data.append(np.column_stack([vx, vy]))
         

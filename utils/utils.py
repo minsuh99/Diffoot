@@ -8,14 +8,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.signal as signal
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import interp1d
 from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_teamsheets_from_mat_info_xml
 
 # This code is from "https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking"
 # "https://github.com/spoho-datascience/idsse-data"
 
 # Setting seed with reproducibility
-def set_evertyhing(seed):  
+def set_everything(seed):  
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -165,72 +165,154 @@ def calc_velocites(df, smoothing=True, filter_='Savitzky-Golay', window=7, polyo
 
     return df
 
-# Detect sudden jumps (large velocity spikes) in position sequence
-def detect_jumps(xy_seq, maxspeed=12.0, fps=25.0):
-    dt = 1.0 / fps
-    # [T, 2] → [T-1]
-    velocities = np.linalg.norm(np.diff(xy_seq, axis=0), axis=1) / dt
-    jump_indices = np.where(velocities > maxspeed)[0] + 1
-    return jump_indices
-
-# Correct jump frames (and adjacent) using cubic spline interpolation
-def correct_with_cubic_spline_adjacent(xy_seq, jump_indices):
-    T = len(xy_seq)
-    valid_mask = np.ones(T, dtype=bool)
-    jump_and_adjacent = set()
-    for t in jump_indices:
-        for dt in [-2, -1, 0, 1, 2]:
-            if 0 <= t + dt < T:
-                jump_and_adjacent.add(t + dt)
-    valid_mask[list(jump_and_adjacent)] = False
-
-    if valid_mask.sum() < 4:
-        return xy_seq 
-
-    valid_t = np.where(valid_mask)[0]
-    x_spline = CubicSpline(valid_t, xy_seq[valid_mask][:, 0])
-    y_spline = CubicSpline(valid_t, xy_seq[valid_mask][:, 1])
-
-    corrected = xy_seq.copy()
-    for t in jump_and_adjacent:
-        corrected[t, 0] = x_spline(t)
-        corrected[t, 1] = y_spline(t)
-
-    return corrected
-
-
-# Apply jump correction to all players in the tracking DataFrame
-def correct_all_player_jumps_adjacent(df: pd.DataFrame, framerate=25.0, maxspeed=12.0):
+def correct_nan_velocities_and_positions(df, framerate=25, maxspeed=12.0, verbose=False):
     corrected_df = df.copy()
+    dt = 1.0 / framerate
 
     player_ids = sorted(set(
         col.rsplit("_", 1)[0] 
         for col in df.columns 
-        if ("_x" in col or "_y" in col) and "ball" not in col
+        if col.endswith("_vx") and "ball" not in col
     ))
+    
+    total_nan_fixed = 0
+    players_processed = 0
+    
+    for player_id in player_ids:
+        col_x = f"{player_id}_x"
+        col_y = f"{player_id}_y"
+        col_vx = f"{player_id}_vx"
+        col_vy = f"{player_id}_vy"
 
-    for pid in player_ids:
-        col_x = f"{pid}_x"
-        col_y = f"{pid}_y"
-
-        if col_x not in df.columns or col_y not in df.columns:
+        if not all(col in df.columns for col in [col_x, col_y, col_vx, col_vy]):
             continue
-
-        xy_seq = df[[col_x, col_y]].values  # [T, 2]
-
-        # Skip players with NaN in position
-        if np.isnan(xy_seq).any():
+        
+        vx_data = corrected_df[col_vx].values
+        vy_data = corrected_df[col_vy].values
+        nan_mask = np.isnan(vx_data) | np.isnan(vy_data)
+        
+        if not np.any(nan_mask):
             continue
+        
+        players_processed += 1
+        nan_count = np.sum(nan_mask)
+        total_nan_fixed += nan_count
+        
+        if verbose:
+            print(f"  {player_id}: NaN 속도 {nan_count}개 프레임 보간")
 
-        jump_indices = detect_jumps(xy_seq, maxspeed=maxspeed, fps=framerate)
-        if len(jump_indices) == 0:
-            continue
-
-        corrected = correct_with_cubic_spline_adjacent(xy_seq, jump_indices)
-        corrected_df[col_x] = corrected[:, 0]
-        corrected_df[col_y] = corrected[:, 1]
-
+        velocities = np.column_stack([vx_data, vy_data])
+        interpolated_vels = _interpolate_nan_velocities(velocities, maxspeed)
+        
+        corrected_positions = _integrate_velocity_for_nan_regions(
+            corrected_df[[col_x, col_y]].values, interpolated_vels, nan_mask, dt
+        )
+        
+        corrected_df[col_vx] = interpolated_vels[:, 0]
+        corrected_df[col_vy] = interpolated_vels[:, 1]
+        corrected_df[col_x] = corrected_positions[:, 0]
+        corrected_df[col_y] = corrected_positions[:, 1]
+    
+    if verbose and total_nan_fixed > 0:
+        print(f"NaN 속도 보간 완료: {players_processed}명 선수, {total_nan_fixed}개 프레임 처리")
+    
     return corrected_df
+
+def _interpolate_nan_velocities(velocities, maxspeed):
+    interpolated = velocities.copy()
+    
+    for dim in range(2):  # x, y 방향 각각
+        vel_data = velocities[:, dim]
+        nan_mask = np.isnan(vel_data)
+        
+        if np.any(nan_mask) and np.any(~nan_mask):
+            valid_indices = np.where(~nan_mask)[0]
+            valid_values = vel_data[~nan_mask]
+            
+            if len(valid_values) >= 2:
+                interp_func = interp1d(valid_indices, valid_values, 
+                                     kind='linear', fill_value='extrapolate')
+                interpolated[nan_mask, dim] = interp_func(np.where(nan_mask)[0])
+            else:
+                interpolated[nan_mask, dim] = 0.0
+    
+    for i in range(len(interpolated)):
+        vel_mag = np.linalg.norm(interpolated[i])
+        if vel_mag > maxspeed:
+            interpolated[i] = interpolated[i] * (maxspeed / vel_mag)
+    
+    return interpolated
+
+
+def _integrate_velocity_for_nan_regions(original_positions, velocities, nan_mask, dt):
+    corrected = original_positions.copy()
+    T = len(original_positions)
+    
+    nan_blocks = []
+    in_block = False
+    block_start = 0
+    
+    for i in range(len(nan_mask)):
+        if nan_mask[i] and not in_block:
+            # 새 블록 시작
+            block_start = i
+            in_block = True
+        elif not nan_mask[i] and in_block:
+            # 블록 종료
+            nan_blocks.append((block_start, i - 1))
+            in_block = False
+
+    if in_block:
+        nan_blocks.append((block_start, len(nan_mask) - 1))
+
+    for block_start, block_end in nan_blocks:
+        if block_start == 0:
+            anchor_pos = original_positions[0].copy()
+            start_frame = 1
+        else:
+            anchor_pos = original_positions[block_start].copy()
+            start_frame = block_start + 1
+
+        current_pos = anchor_pos
+        for vel_idx in range(block_start, min(block_end + 1, len(velocities))):
+            pos_idx = vel_idx + 1
+            if pos_idx < T:
+                current_pos = current_pos + velocities[vel_idx] * dt
+                corrected[pos_idx] = current_pos
+    
+    return corrected
+
+
+def analyze_nan_velocities(df, stage_name="속도 분석"):
+    print(f"\n--- {stage_name} ---")
+    
+    total_velocity_frames = 0
+    total_nan_frames = 0
+    player_count = 0
+    
+    for col in df.columns:
+        if col.endswith('_vx') and 'ball' not in col:
+            player_id = col.rsplit('_', 1)[0]
+            col_vy = f"{player_id}_vy"
+            
+            if col_vy in df.columns:
+                player_count += 1
+                vx = df[col].values
+                vy = df[col_vy].values
+                
+                nan_mask = np.isnan(vx) | np.isnan(vy)
+                total_nan_frames += np.sum(nan_mask)
+                total_velocity_frames += len(vx)
+    
+    print(f"총 선수: {player_count}명")
+    print(f"총 속도 프레임: {total_velocity_frames}개")
+    print(f"NaN 속도 프레임: {total_nan_frames}개 ({total_nan_frames/total_velocity_frames*100:.2f}%)")
+    
+    if total_nan_frames == 0:
+        print("✅ NaN 속도 없음")
+    else:
+        print(f"🔧 {total_nan_frames}개 NaN 속도 보간 필요")
+
 
 def per_player_soft_dtw_loss(pred, target, gamma=0.1):
     B, T, N, D = pred.shape
