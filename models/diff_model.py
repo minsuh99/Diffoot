@@ -52,20 +52,8 @@ class DiffusionTrajectoryModel(nn.Module):
         # NLL loss computing
         nll = 0.5 * ((noise_rel - eps_pred_rel) ** 2 / var_rel + log_var_rel + math.log(2 * math.pi))
         noise_nll = nll.mean()
-
-        # Player-wise MSE
-        if initial_pos is not None:
-            target_abs = x_0[..., :2]
-
-            a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
-            x0_pred_rel = (x_t[..., 2:4] - torch.sqrt(1 - a_hat) * eps_pred_rel) / torch.sqrt(a_hat)
-
-            initial_pos_expanded = initial_pos.unsqueeze(1).expand(-1, x_0.size(1), -1, -1)  # [B, T, N, 2]
-            pred_abs = x0_pred_rel + initial_pos_expanded  # [B, T, N, 2]
-
-            player_mse = per_player_mse_loss(pred_abs, target_abs)
         
-        return noise_mse, noise_nll, player_mse
+        return noise_mse, noise_nll
     
     # DDIM Sampling
     @torch.no_grad()

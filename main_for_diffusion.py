@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 # from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
@@ -39,9 +39,9 @@ logger = logging.getLogger()
 # 1. Model Config & Hyperparameter Setting
 csdi_config = {
     "num_steps": 1000,
-    "channels": 512,
+    "channels": 256,
     "diffusion_embedding_dim": 256,
-    "nheads": 4,
+    "nheads": 8,
     "layers": 5,
     "side_dim": 512
 }
@@ -53,7 +53,7 @@ hyperparams = {
     'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 2.5e-4,
+    'learning_rate': 2e-4,
     'self_conditioning_ratio': 0.0,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
@@ -160,7 +160,8 @@ diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps
 
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate)
 # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-5)
-scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate * 0.1)
+scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.1)
+# scheduler = CosineAnnealingWarmRestarts(optimizer, T_0 = int(epochs * 0.5), T_mult = 2, eta_min=learning_rate * 0.1)
 scaler = GradScaler()
 
 logger.info(f"Device: {device}")
@@ -254,8 +255,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-        noise_mse, noise_nll, player_mse = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
-        loss = noise_mse + noise_nll * 0.001 + player_mse * 0.05
+        noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
+        loss = noise_mse + noise_nll * 0.001
             
         # optimizer.zero_grad()
         # loss.backward()
@@ -266,18 +267,18 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
         
         train_noise_mse += (noise_mse).item()
         train_noise_nll += (noise_nll * 0.001).item()
-        train_player_mse += (player_mse * 0.05).item()
+        # train_player_mse += (player_mse * 0.05).item()
 
         train_loss += loss.item()
 
         del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist, initial_pos
-        del cond_info, t, s, noise_mse, noise_nll, player_mse
+        del cond_info, t, s, noise_mse, noise_nll
 
     num_batches = len(train_dataloader)
     
     avg_train_noise_mse = train_noise_mse / num_batches
     avg_train_noise_nll = train_noise_nll / num_batches
-    avg_train_player_mse = train_player_mse / num_batches
+    # avg_train_player_mse = train_player_mse / num_batches
     avg_train_loss = train_loss / num_batches
 
 
@@ -356,34 +357,34 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-            noise_mse, noise_nll, player_mse = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
-            val_loss = noise_mse + noise_nll * 0.001 + player_mse * 0.05
+            noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
+            val_loss = noise_mse + noise_nll * 0.001
 
             val_noise_mse += (noise_mse).item()
             val_noise_nll += (noise_nll * 0.001).item()
-            val_player_mse += (player_mse * 0.05).item()
+            # val_player_mse += (player_mse * 0.05).item()
             val_total_loss += val_loss.item()
 
         del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist, initial_pos
-        del cond_info, t, s, noise_mse, noise_nll, player_mse
+        del cond_info, t, s, noise_mse, noise_nll
 
     num_batches = len(val_dataloader)
 
     avg_val_noise_mse = val_noise_mse / num_batches
     avg_val_noise_nll = val_noise_nll / num_batches
-    avg_val_player_mse = val_player_mse / num_batches
+    # avg_val_player_mse = val_player_mse / num_batches
     avg_val_loss = val_total_loss / num_batches
 
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_noise_mse:.6f}, Noise NLL={avg_train_noise_nll:.6f}, Player MSE={avg_train_player_mse:.6f}) | "
-                f"Val Loss={avg_val_loss:.6f} (Noise simple={avg_val_noise_mse:.6f}, Noise NLL={avg_val_noise_nll:.6f}, Player MSE={avg_val_player_mse:.6f}) | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_noise_mse:.6f}, Noise NLL={avg_train_noise_nll:.6f}) | "
+                f"Val Loss={avg_val_loss:.6f} (Noise simple={avg_val_noise_mse:.6f}, Noise NLL={avg_val_noise_nll:.6f}) | LR={current_lr:.6e}")
 
     tqdm.write(f"[Epoch {epoch}]\n"
-               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | Player MSE: {avg_train_player_mse:.6f} | LR: {current_lr:.6f}\n"
-               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f} | Player MSE: {avg_val_player_mse:.6f}")
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | LR: {current_lr:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f}")
 
     # scheduler.step(avg_val_loss)
     scheduler.step()
