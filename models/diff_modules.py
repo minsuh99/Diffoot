@@ -4,12 +4,135 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_torch_trans(heads=4, layers=1, channels=128):
-    encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=channels * 2,
-        activation="gelu", dropout=0.0, batch_first=True
+# def get_torch_trans(heads=4, layers=1, channels=128):
+#     encoder_layer = nn.TransformerEncoderLayer(
+#         d_model=channels, nhead=heads, dim_feedforward=channels * 2,
+#         activation="gelu", dropout=0.0, batch_first=True
+#     )
+#     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
+
+# TransformerEncoder -> Linformer
+def get_EF(input_size, dim, bias=True):
+    """Returns the E or F matrix for Linformer projection"""
+    lin = nn.Linear(input_size, dim, bias)
+    torch.nn.init.xavier_normal_(lin.weight)
+    return lin
+
+class LinearAttentionHead(nn.Module):
+    def __init__(self, dim, dropout, E_proj, F_proj, causal=False):
+        super().__init__()
+        self.E = E_proj
+        self.F = F_proj
+        self.dim = dim
+        self.dropout = nn.Dropout(dropout)
+        self.causal = causal
+
+    def forward(self, Q, K, V):
+        K = K.transpose(1, 2)  # (B, dim, seq_len)
+        K = self.E(K)          # (B, dim, compressed_dim)
+        Q = torch.matmul(Q, K) # (B, seq_len, compressed_dim)
+
+        P_bar = Q / torch.sqrt(torch.tensor(self.dim, dtype=Q.dtype, device=Q.device))
+        
+        # Apply causal mask if needed
+        if self.causal:
+            seq_len, comp_dim = P_bar.size(1), P_bar.size(2)
+            causal_mask = torch.triu(torch.ones(seq_len, comp_dim, device=P_bar.device)) == 1
+            P_bar = P_bar.masked_fill(~causal_mask, -1e10)
+        
+        P_bar = P_bar.softmax(dim=-1)
+        P_bar = self.dropout(P_bar)
+
+        V = V.transpose(1, 2)  # (B, dim, seq_len)
+        V = self.F(V)          # (B, dim, compressed_dim)
+        V = V.transpose(1, 2)  # (B, compressed_dim, dim)
+        
+        out_tensor = torch.matmul(P_bar, V)
+        return out_tensor
+
+class LinformerMultiHead(nn.Module):
+    def __init__(self, channels, nheads, seq_len, compressed_dim=32, dropout=0.1, causal=False):
+        super().__init__()
+        self.nheads = nheads
+        self.head_dim = channels // nheads
+        self.channels = channels
+        
+        self.to_q = nn.ModuleList([nn.Linear(channels, self.head_dim, bias=False) for _ in range(nheads)])
+        self.to_k = nn.ModuleList([nn.Linear(channels, self.head_dim, bias=False) for _ in range(nheads)])
+        self.to_v = nn.ModuleList([nn.Linear(channels, self.head_dim, bias=False) for _ in range(nheads)])
+        
+        E_proj = get_EF(seq_len, compressed_dim)
+        F_proj = get_EF(seq_len, compressed_dim)
+        
+        self.heads = nn.ModuleList([
+            LinearAttentionHead(self.head_dim, dropout, E_proj, F_proj, causal)
+            for _ in range(nheads)
+        ])
+
+        self.w_o = nn.Linear(channels, channels)
+        
+    def forward(self, x):
+        # x shape: (B, seq_len, channels)     
+        head_outputs = []
+        for i, head in enumerate(self.heads):
+            Q = self.to_q[i](x)  # (B, seq_len, head_dim)
+            K = self.to_k[i](x)  # (B, seq_len, head_dim)
+            V = self.to_v[i](x)  # (B, seq_len, head_dim)
+            
+            head_out = head(Q, K, V)  # (B, seq_len, head_dim)
+            head_outputs.append(head_out)
+        
+        # Concatenate heads
+        out = torch.cat(head_outputs, dim=-1)  # (B, seq_len, channels)
+        return self.w_o(out)
+
+def get_linformer_trans(heads=4, layers=1, channels=128, seq_len=100, compressed_dim=32, causal=False):
+    return LinformerTransformer(
+        channels=channels,
+        nheads=heads,
+        seq_len=seq_len,
+        compressed_dim=compressed_dim,
+        causal=causal,
+        dropout=0.1
     )
-    return nn.TransformerEncoder(encoder_layer, num_layers=layers)
+
+class LinformerTransformer(nn.Module):
+    def __init__(self, channels, nheads, seq_len, compressed_dim=32, causal=False, dropout=0.1):
+        super().__init__()
+        self.attention = LinformerMultiHead(
+            channels=channels,
+            nheads=nheads, 
+            seq_len=seq_len,
+            compressed_dim=compressed_dim,
+            dropout=dropout,
+            causal=causal
+        )
+        
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels * 2, channels)
+        )
+        
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # x shape: (B, seq_len, channels)
+        
+        # Self-attention with residual connection
+        x = self.norm1(x)
+        attn_out = self.attention(x)
+        x = x + self.dropout(attn_out)
+        
+        # Feed-forward with residual connection
+        x = self.norm2(x)
+        ff_out = self.ff(x)
+        x = x + self.dropout(ff_out)
+        
+        return x
 
 
 def Conv1d_with_init(in_channels, out_channels, kernel_size):
@@ -50,15 +173,17 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels, diffusion_embedding_dim, nheads, side_dim=None):
+    def __init__(self, channels, diffusion_embedding_dim, nheads, side_dim=None, time_seq_len=100, feature_seq_len=11, compressed_dim=32):
         super().__init__()
         self.channels = channels
         self.side_dim = side_dim
 
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
 
-        self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-        self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
+        self.time_layer = get_linformer_trans(heads=nheads, layers=1, channels=channels, seq_len=time_seq_len, 
+                                              compressed_dim=compressed_dim, causal=True)
+        self.feature_layer = get_linformer_trans(heads=nheads, layers=1, channels=channels, seq_len=feature_seq_len, 
+                                                 compressed_dim=min(compressed_dim, feature_seq_len), causal=False)
         
         self.norm = nn.LayerNorm(channels) 
         
@@ -156,6 +281,10 @@ class diff_CSDI(nn.Module):
         self.diffusion_embedding_dim = config["diffusion_embedding_dim"]
         self.side_dim = config.get("side_dim", None)
         
+        self.time_seq_len = config.get("time_seq_len", 100)
+        self.feature_seq_len = config.get("feature_seq_len", 11) 
+        self.compressed_dim = config.get("compressed_dim", 32)
+        
         self.dropout = nn.Dropout(0.1)
         self.norm = nn.LayerNorm(self.channels)
 
@@ -174,7 +303,10 @@ class diff_CSDI(nn.Module):
                 channels=self.channels,
                 diffusion_embedding_dim=self.diffusion_embedding_dim,
                 nheads=config["nheads"],
-                side_dim=self.side_dim
+                side_dim=self.side_dim,
+                time_seq_len=self.time_seq_len,
+                feature_seq_len=self.feature_seq_len,
+                compressed_dim=self.compressed_dim
             ) for _ in range(config["layers"])
         ])
         self.inv_sqrt_layers = 1.0 / math.sqrt(len(self.residual_layers))

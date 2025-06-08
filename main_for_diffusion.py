@@ -42,8 +42,12 @@ csdi_config = {
     "channels": 256,
     "diffusion_embedding_dim": 256,
     "nheads": 8,
-    "layers": 5,
-    "side_dim": 512
+    "layers": 8,
+    "side_dim": 512,
+    
+    "time_seq_len": 100,      # 시간 길이
+    "feature_seq_len": 11,    # 선수 수
+    "compressed_dim": 32     # 압축 차원
 }
 hyperparams = {
     'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
@@ -179,7 +183,7 @@ val_losses   = []
 
 first_batch_debug = True
 
-for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
+for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     diff_model.train()
     graph_encoder.train()
     history_encoder.train()
@@ -189,7 +193,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     train_player_mse = 0
     train_loss = 0
 
-    for batch in tqdm(train_dataloader, desc = "Batch Training..."):
+    for batch in tqdm(train_dataloader, desc = "Batch Training...", leave=False):
         optimizer.zero_grad()
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
@@ -209,10 +213,10 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
         last_past_cond = cond[:, -1]
         # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-        initial_pos = torch.stack([
-            last_past_cond[:, target_x_indices],  # [B, 11]
-            last_past_cond[:, target_y_indices]   # [B, 11]
-        ], dim=-1)  # [B, 11, 2]
+        # initial_pos = torch.stack([
+        #     last_past_cond[:, target_x_indices],  # [B, 11]
+        #     last_past_cond[:, target_y_indices]   # [B, 11]
+        # ], dim=-1)  # [B, 11, 2]
 
         target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
         target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
@@ -255,7 +259,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-        noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
+        noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s)
         loss = noise_mse + noise_nll * 0.001
             
         # optimizer.zero_grad()
@@ -271,7 +275,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
 
         train_loss += loss.item()
 
-        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist, initial_pos
+        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond_info, t, s, noise_mse, noise_nll
 
     num_batches = len(train_dataloader)
@@ -293,7 +297,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
     val_total_loss = 0
 
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validation"):
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
             cond = batch["condition"].to(device)
             B, T, _ = cond.shape
             target_columns = batch["target_columns"][0]
@@ -312,10 +316,10 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             
             last_past_cond = cond[:, -1]
             # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-            initial_pos = torch.stack([
-                last_past_cond[:, target_x_indices],  # [B, 11]
-                last_past_cond[:, target_y_indices]   # [B, 11]
-            ], dim=-1)  # [B, 11, 2]
+            # initial_pos = torch.stack([
+            #     last_past_cond[:, target_x_indices],  # [B, 11]
+            #     last_past_cond[:, target_y_indices]   # [B, 11]
+            # ], dim=-1)  # [B, 11, 2]
             
             target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
             target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
@@ -357,7 +361,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
                 
                 del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
-            noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s, initial_pos=initial_pos)
+            noise_mse, noise_nll = diff_model(model_input, t=t, cond_info=cond_info, self_cond=s)
             val_loss = noise_mse + noise_nll * 0.001
 
             val_noise_mse += (noise_mse).item()
@@ -365,7 +369,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training..."):
             # val_player_mse += (player_mse * 0.05).item()
             val_total_loss += val_loss.item()
 
-        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist, initial_pos
+        del cond, last_past_cond, target_abs, target_rel, target_vel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond_info, t, s, noise_mse, noise_nll
 
     num_batches = len(val_dataloader)
@@ -467,7 +471,7 @@ by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
 by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
 
 with torch.no_grad():        
-    for batch in tqdm(test_dataloader, desc="Test Streaming Inference"):
+    for batch in tqdm(test_dataloader, desc="Test Streaming Inference", leave=True):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
         target_columns = batch["target_columns"][0]

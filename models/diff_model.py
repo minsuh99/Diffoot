@@ -26,7 +26,7 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, t=None, cond_info=None, self_cond=None, initial_pos=None):
+    def forward(self, x_0, t=None, cond_info=None, self_cond=None):
         B = x_0.size(0)
         device = x_0.device
         
