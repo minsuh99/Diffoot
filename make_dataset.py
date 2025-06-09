@@ -237,7 +237,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=25, zscore_stats = None):
+    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=25, zscore_stats=None):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -407,6 +407,16 @@ class CustomDataset(Dataset):
         player_bases = atk_bases + def_bases
         ball_feats = ["ball_x", "ball_y", "ball_vx", "ball_vy"]
         
+        # Get pitch scale
+        if not hasattr(self, "pitch_cache"):
+            self.pitch_cache = {}
+        if match_id not in self.pitch_cache:
+            info_path = os.path.join(self.data_root, match_id, "matchinformation.xml")
+            pitch = read_pitch_from_mat_info_xml(info_path)
+            self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
+            
+        x_scale, y_scale = self.pitch_cache[match_id]
+        
         # Collect feature columns
         condition_columns = set()
         for base in player_bases:
@@ -444,107 +454,84 @@ class CustomDataset(Dataset):
         other_seq = future_seq[other_columns]
         target_seq = future_seq[target_columns]
         
-        # 1. 상대좌표 계산을 위한 기준점 (condition의 마지막 프레임)
-        reference_frame = condition_seq.iloc[-1]
-        
-        # 2. Target 데이터 분리: [절대좌표], [상대좌표], [속도]
-        target_abs_data = []       # 절대좌표 (x, y)
-        target_rel_data = []       # 상대좌표 (rel_x, rel_y)
-        target_vel_data = []       # 속도 (vx, vy)
-        
+        # 1. Normalize target coordinates to [-1, 1]
+        target_abs_data = []
         num_players = len(target_columns) // 2  # 11명
         
         for i in range(num_players):
-            # 현재 컬럼 구조에 맞춰 인덱싱
             col_x = target_columns[i * 2]          # x 좌표
             col_y = target_columns[i * 2 + 1]      # y 좌표
-            # 절대좌표
+            
+            # 절대좌표 정규화: (coord / pitch_scale)
             abs_x = target_seq[col_x].values
             abs_y = target_seq[col_y].values
-            target_abs_data.append(np.column_stack([abs_x, abs_y]))
             
-            # 상대좌표 (reference point 기준)
-            ref_x = reference_frame[col_x]
-            ref_y = reference_frame[col_y] 
-            rel_x = abs_x - ref_x
-            rel_y = abs_y - ref_y
+            norm_x = (abs_x / x_scale)
+            norm_y = (abs_y / y_scale)
+            
+            target_abs_data.append(np.column_stack([norm_x, norm_y]))
+        
+        target_abs_normalized = np.concatenate(target_abs_data, axis=1)  # [T, 22]
+        
+        # 2. Normalize condition coordinates to [-1, 1] 
+        condition_seq_normalized = condition_seq.copy()
+        for col in condition_columns:
+            base, feat = col.rsplit("_", 1)
+            if feat == "x":
+                condition_seq_normalized[col] = (condition_seq[col] / x_scale)
+            elif feat == "y":
+                condition_seq_normalized[col] = (condition_seq[col] / y_scale)
+            elif feat == "vx" or feat == "vy":
+                condition_seq_normalized[col] = (condition_seq[col] / 12)
+        
+        # 3. Normalize other coordinates to [-1, 1]
+        other_array = other_seq.values.copy()
+        for i, col in enumerate(other_columns):
+            base, feat = col.rsplit("_", 1)
+            if feat == "x":
+                other_array[:, i] = (other_seq.values[:, i] / x_scale)
+            elif feat == "y":
+                other_array[:, i] = (other_seq.values[:, i] / y_scale)
+            elif feat == "vx" or feat == "vy":
+                other_array[:, i] = (other_seq.values[:, i] / 12)
+        
+        reference_frame = condition_seq_normalized.iloc[-1]
+        
+        # 5. Target 상대좌표 계산 (정규화된 좌표들 간의 차이)
+        target_rel_data = []
+        for i in range(num_players):
+            col_x = target_columns[i * 2]          
+            col_y = target_columns[i * 2 + 1]      
+            
+            # 정규화된 절대좌표에서 정규화된 기준점을 빼서 상대좌표 계산
+            abs_x_norm = target_abs_normalized[:, i*2]
+            abs_y_norm = target_abs_normalized[:, i*2 + 1]
+            
+            ref_x_norm = reference_frame[col_x]
+            ref_y_norm = reference_frame[col_y] 
+            
+            rel_x = abs_x_norm - ref_x_norm
+            rel_y = abs_y_norm - ref_y_norm
+            
             target_rel_data.append(np.column_stack([rel_x, rel_y]))
+        
+        target_rel_normalized = np.concatenate(target_rel_data, axis=1)  # [T, 22]
+        
+        # 6. Target 속도 계산 (정규화된 좌표들의 차분)
+        target_vel_data = []
+        for i in range(num_players):
+            abs_x_norm = target_abs_normalized[:, i*2]
+            abs_y_norm = target_abs_normalized[:, i*2 + 1]
             
-            # 속도
-            vx = np.concatenate([np.diff(abs_x), [0.0]])
-            vy = np.concatenate([np.diff(abs_y), [0.0]])
+            # 정규화된 좌표의 차분으로 속도 계산
+            vx = np.concatenate([np.diff(abs_x_norm), [0.0]])
+            vy = np.concatenate([np.diff(abs_y_norm), [0.0]])
             
             target_vel_data.append(np.column_stack([vx, vy]))
         
-        # 각각 별도 배열로 저장
-        target_abs = np.concatenate(target_abs_data, axis=1)  # [T, 22] (11명 * 2차원)
-        target_rel = np.concatenate(target_rel_data, axis=1)  # [T, 22] (11명 * 2차원)
-        target_vel = np.concatenate(target_vel_data, axis=1)  # [T, 22] (11명 * 2차원)
-                    
-        # --- Normalization ---
-        if not hasattr(self, "pitch_cache"):
-            self.pitch_cache = {}
-        if match_id not in self.pitch_cache:
-            info_path = os.path.join(self.data_root, match_id, "matchinformation.xml")
-            pitch = read_pitch_from_mat_info_xml(info_path)
-            self.pitch_cache[match_id] = (pitch.length / 2, pitch.width / 2)
-            
-        x_scale, y_scale = self.pitch_cache[match_id]
+        target_vel_normalized = np.concatenate(target_vel_data, axis=1)  # [T, 22]
         
-        if self.zscore_stats is not None:
-            # 절대좌표 정규화
-            target_abs_normalized = target_abs.copy()
-            for i in range(0, target_abs.shape[1], 2):
-                target_abs_normalized[:, i] = (target_abs[:, i] - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
-                target_abs_normalized[:, i+1] = (target_abs[:, i+1] - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
-            
-            # 상대좌표 정규화 (평균은 빼지 않음)
-            target_rel_normalized = target_rel.copy()
-            for i in range(0, target_rel.shape[1], 2):
-                target_rel_normalized[:, i] = target_rel[:, i] / self.zscore_stats['player_x_std']
-                target_rel_normalized[:, i+1] = target_rel[:, i+1] / self.zscore_stats['player_y_std']
-            
-            # 속도 정규화
-            target_vel_normalized = target_vel.copy()
-            for i in range(0, target_vel.shape[1], 2):
-                target_vel_normalized[:, i] = (target_vel[:, i] - self.zscore_stats['player_vx_mean']) / self.zscore_stats['player_vx_std']
-                target_vel_normalized[:, i+1] = (target_vel[:, i+1] - self.zscore_stats['player_vy_mean']) / self.zscore_stats['player_vy_std']
-
-            # Other 정규화
-            other_array = other_seq.values.copy()
-            for i, col in enumerate(other_columns):
-                base, feat = col.rsplit("_", 1)
-                if feat in ("x", "y"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std = self.zscore_stats[f"{key}_{feat}_std"]
-                    other_array[:, i] = (other_array[:, i] - mean) / std
-                elif feat in ("vx", "vy"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std = self.zscore_stats[f"{key}_{feat}_std"]
-                    other_array[:, i] = (other_array[:, i] - mean) / std
-            other_tensor = torch.tensor(other_array, dtype=torch.float32)
-            
-            # Condition 정규화
-            condition_seq_normalized = condition_seq.copy()
-            for col in condition_columns:
-                base, feat = col.rsplit("_", 1)
-                if feat in ("x", "y", "vx", "vy"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std  = self.zscore_stats[f"{key}_{feat}_std"]
-                    condition_seq_normalized[col] = (condition_seq[col] - mean) / std
-                elif feat == "dist":
-                    condition_seq_normalized[col] = (condition_seq[col] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
-            
-        else:
-            # 피치 스케일 정규화 (기본값)
-            target_abs_normalized = target_abs
-            target_rel_normalized = target_rel
-            target_vel_normalized = target_vel
-            other_tensor = torch.tensor(other_seq.values, dtype=torch.float32)
-            condition_seq_normalized = condition_seq
+        other_tensor = torch.tensor(other_array, dtype=torch.float32)
 
         # 텐서로 변환
         target_abs_tensor = torch.tensor(target_abs_normalized, dtype=torch.float32)
@@ -639,15 +626,13 @@ class CustomDataset(Dataset):
             "target_velocity_columns": target_vel_columns,  # 속도 컬럼명
             "condition_frames": list(condition_seq.index),
             "target_frames": list(future_seq.index),
-            "pitch_scale": (x_scale, y_scale),
-            "zscore_stats": self.zscore_stats
+            "pitch_scale": (x_scale, y_scale)
         }
         if idx not in self.graph_cache:
             self.graph_cache[idx] = build_graph_sequence_from_condition({
                 "condition": condition_tensor,
                 "condition_columns": sample["condition_columns"],
-                "pitch_scale": sample["pitch_scale"],
-                "zscore_stats": self.zscore_stats
+                "pitch_scale": sample["pitch_scale"]
             })
             
         sample["graph"] = self.graph_cache[idx]
@@ -714,15 +699,13 @@ class ApplyAugmentedDataset(Dataset):
             "target_velocity_columns": base_sample["target_velocity_columns"],
             "condition_frames": base_sample["condition_frames"],
             "target_frames": base_sample["target_frames"],
-            "pitch_scale": base_sample["pitch_scale"],
-            "zscore_stats": base_sample["zscore_stats"]
+            "pitch_scale": base_sample["pitch_scale"]
         }
 
         sample["graph"] = build_graph_sequence_from_condition({
             "condition": sample["condition"],
             "condition_columns": sample["condition_columns"],
             "pitch_scale": sample["pitch_scale"],
-            "zscore_stats": self.zscore_stats
         })
 
         return sample
@@ -762,3 +745,18 @@ if __name__ == "__main__":
     print("Target (absolute):", sample["target"])
     print("Target relative:", sample["target_relative"])
     print("Target velocity:", sample["target_velocity"])
+
+    print("Target abs mean:", sample["target"].mean())
+    print("Target abs min:", sample["target"].min())
+    print("Target abs max:", sample["target"].max())
+    print("Target abs std:", sample["target"].std())
+    
+    print("Target relative mean:", sample["target_relative"].mean())
+    print("Target relative min:", sample["target_relative"].min())
+    print("Target relative max:", sample["target_relative"].max())
+    print("Target relative std:", sample["target_relative"].std())
+    
+    print("Target vel mean:", sample["target_velocity"].mean())
+    print("Target vel min:", sample["target_velocity"].min())
+    print("Target vel max:", sample["target_velocity"].max())
+    print("Target vel std:", sample["target_velocity"].std())

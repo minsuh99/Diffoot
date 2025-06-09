@@ -10,8 +10,7 @@ from datetime import datetime
 from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
-# from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
@@ -39,10 +38,10 @@ logger = logging.getLogger()
 # 1. Model Config & Hyperparameter Setting
 csdi_config = {
     "num_steps": 1000,
-    "channels": 256,
+    "channels": 512,
     "diffusion_embedding_dim": 256,
     "nheads": 8,
-    "layers": 8,
+    "layers": 5,
     "side_dim": 512,
     
     "time_seq_len": 100,      # 시간 길이
@@ -57,7 +56,7 @@ hyperparams = {
     'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 2e-4,
+    'learning_rate': 1.5e-4,
     'self_conditioning_ratio': 0.0,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
@@ -90,13 +89,8 @@ if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
 else:
     print("Skip organize_and_process")
 
-temp_dataset = CustomDataset(data_root=data_save_path)
-train_idx, val_idx, test_idx = split_dataset_indices(temp_dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
-
-zscore_stats = compute_train_zscore_stats(temp_dataset, train_idx, save_path="./train_zscore_stats.pkl")
-del temp_dataset
-gc.collect()
-dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats)
+dataset = CustomDataset(data_root=data_save_path)
+train_idx, val_idx, test_idx = split_dataset_indices(dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
 
 train_dataloader = DataLoader(
     ApplyAugmentedDataset(Subset(dataset, train_idx), flip_prob=0.5),
@@ -144,8 +138,7 @@ sample = dataset[0]
 graph = build_graph_sequence_from_condition({
     "condition": sample["condition"],
     "condition_columns": sample["condition_columns"],
-    "pitch_scale": sample["pitch_scale"],
-    "zscore_stats": zscore_stats
+    "pitch_scale": sample["pitch_scale"]
 }).to(device)
 
 log_graph_stats(graph, logger, prefix="InitGraphSample")
@@ -162,9 +155,9 @@ history_encoder = TargetTrajectoryEncoder(num_layers=5, hidden_dim = side_dim //
 denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 
-optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate)
-# scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, threshold=1e-5)
-scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.1)
+optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate, weight_decay=0.0)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=3, threshold=1e-4, min_lr=learning_rate*0.01)
+# scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.1)
 # scheduler = CosineAnnealingWarmRestarts(optimizer, T_0 = int(epochs * 0.5), T_mult = 2, eta_min=learning_rate * 0.1)
 scaler = GradScaler()
 
@@ -390,16 +383,15 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_noise_mse:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | LR: {current_lr:.6f}\n"
                f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_noise_mse:.6f} | NLL Loss: {avg_val_noise_nll:.6f}")
 
-    # scheduler.step(avg_val_loss)
-    scheduler.step()
+    scheduler.step(avg_val_loss)
+    # scheduler.step()
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         best_state_dict = {
             'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
             'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
-            'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
-            'zscore_stats': zscore_stats
+            'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()}
         }
     
     torch.cuda.empty_cache()
@@ -437,7 +429,6 @@ final_state = {
     'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
     'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
     'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
-    'zscore_stats': zscore_stats,
     'train_losses': train_losses,
     'val_losses': val_losses
 }
@@ -460,22 +451,16 @@ visualize_samples = 5
 visualized = False # If you want to visualize
 # visualized = True
 
-px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
-px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
-py_mean = torch.tensor(zscore_stats['player_y_mean'], device=device)
-py_std = torch.tensor(zscore_stats['player_y_std'],  device=device)
-
-bx_mean = torch.tensor(zscore_stats['ball_x_mean'], device=device)
-bx_std = torch.tensor(zscore_stats['ball_x_std'], device=device)
-by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
-by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
-
 with torch.no_grad():        
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference", leave=True):
         cond = batch["condition"].to(device)
         B, T, _ = cond.shape
         target_columns = batch["target_columns"][0]
         condition_columns = batch["condition_columns"][0]
+        
+        pitch_scales = batch["pitch_scale"]
+        x_scale = pitch_scales[0][0]  # 첫 번째 샘플의 x_scale
+        y_scale = pitch_scales[0][1]  # 첫 번째 샘플의 y_scale
         
         target_x_indices = []
         target_y_indices = []
@@ -513,33 +498,35 @@ with torch.no_grad():
         
         # Target Denormalization
         target_den = target_abs.clone()
-        target_den[...,0] = target_abs[...,0] * px_std + px_mean
-        target_den[...,1] = target_abs[...,1] * py_std + py_mean
+        target_den[...,0] = target_abs[...,0] * x_scale
+        target_den[...,1] = target_abs[...,1] * y_scale
 
         best_ade = torch.full((B,), float("inf"), device=device)
         best_fde = torch.full((B,), float("inf"), device=device)
         best_pred = torch.zeros_like(target_abs)
 
         for _ in range(num_samples):
-            pred = diff_model.generate(shape=model_input.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
-
-            # 상대 좌표 예측
+            pred = diff_model.generate(shape=model_input.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 2)
             pred_rel = pred[..., 2:4]
-            # 절대 좌표 예측 = 상대 좌표 + initial_position
-            pred_abs = pred_rel + initial_pos.unsqueeze(1).to(device)
-            # Prediction Denormalization
-            pred_den = pred_abs.clone()
-            pred_den[...,0] = pred_abs[...,0] * px_std + px_mean
-            pred_den[...,1] = pred_abs[...,1] * py_std + py_mean
+
+            raw_init = torch.empty_like(initial_pos)
+            raw_init[...,0] = initial_pos[...,0] * x_scale
+            raw_init[...,1] = initial_pos[...,1] * y_scale
+            
+            raw_rel = torch.empty_like(pred_rel)
+            raw_rel[...,0] = pred_rel[...,0] * x_scale
+            raw_rel[...,1] = pred_rel[...,1] * y_scale
+            
+            pred_abs = raw_init.unsqueeze(1) + raw_rel
             
             # ADE, FDE Calculation (Meters)
-            ade = ((pred_den[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
-            fde = ((pred_den[:,-1,:,:2] - target_den[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
+            ade = ((pred_abs[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
+            fde = ((pred_abs[:,-1,:,:2] - target_den[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
 
             mask = ade < best_ade
             best_ade[mask] = ade[mask]
             best_fde[mask] = fde[mask]
-            best_pred[mask] = pred_den[mask]
+            best_pred[mask] = pred_abs[mask]
             
         all_best_ades.extend(best_ade.cpu().tolist())
         all_best_fdes.extend(best_fde.cpu().tolist())
@@ -557,20 +544,12 @@ with torch.no_grad():
                 other_seq = batch["other"][i].view(T, -1, 2).to(device)          # [T, 12, 2]
                 other_den = torch.zeros_like(other_seq)
                 for j in range(other_seq.size(1)):
-                    x_col = other_cols[2 * j]
-                    if x_col == "ball_x":
-                        x_mean, x_std = bx_mean, bx_std
-                        y_mean, y_std = by_mean, by_std
-                    else:
-                        x_mean, x_std = px_mean, px_std
-                        y_mean, y_std = py_mean, py_std
-
-                    other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
-                    other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
+                    other_den[:, j, 0] = other_seq[:, j, 0] * x_scale
+                    other_den[:, j, 1] = other_seq[:, j, 1] * y_scale
                 
                 pred_traj = best_pred[i, :, :, :2].cpu().numpy()
                 target_traj = target_den[i, :, :, :2].cpu().numpy()
-                other_traj  = other_den.cpu().numpy()
+                other_traj = other_den.cpu().numpy()
                 
                 folder = os.path.join(base_dir, f"sample{i:02d}")
                 os.makedirs(folder, exist_ok=True)
@@ -586,7 +565,7 @@ with torch.no_grad():
 
             visualized = True
         
-        del pred, pred_den, target_den, ade, fde, mask
+        del pred, pred_abs, target_den, ade, fde, mask
         del cond, target_abs, target_rel, target_vel, H, cond_H, hist, hist_rep, cond_hist, cond_info, initial_pos
         del best_ade, best_fde, best_pred
         torch.cuda.empty_cache()

@@ -202,6 +202,13 @@ class ResidualBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(2 * channels, 2 * channels)
             )
+            
+            # FiLM Layer Initialize
+            with torch.no_grad():
+                nn.init.zeros_(self.film_proj[-1].weight)
+                if self.film_proj[-1].bias is not None:
+                    self.film_proj[-1].bias[:channels] = 1.0  # gamma
+                    self.film_proj[-1].bias[channels:] = 0.0  # beta
 
         # Projections
         self.mid_projection = Conv1d_with_init(channels, channels, 1)
@@ -359,6 +366,6 @@ class diff_CSDI(nn.Module):
         x = self.output_projection2(x)
         x = x.reshape(B, inputdim * 2, K, L)
         eps, log_sigma = x[:, :inputdim], x[:, inputdim:]
-        log_sigma = torch.clamp(log_sigma, -10, 10)
+        log_sigma = torch.clamp(log_sigma, -2, 1) # Clamp range Fixed
         x = torch.cat([eps, log_sigma], dim=1)
         return x
