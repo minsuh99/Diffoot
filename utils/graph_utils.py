@@ -83,7 +83,7 @@ def extract_node_features(condition_tensor, condition_columns):
     return {"Node": torch.stack(unified_feats)}
 
 # Edge
-def build_edges_based_on_interactions(node_features, pitch_scale=None):
+def build_edges_based_on_interactions(node_features, zscore_stats=None):
     edge_index_dict, edge_attr_dict = {}, {}
     nodes = node_features["Node"]        # (N, F)
     node_type = nodes[:, -1]             # 0=Attk, 1=Def, 2=Ball
@@ -92,20 +92,29 @@ def build_edges_based_on_interactions(node_features, pitch_scale=None):
     masks = {t: (node_type == t) for t in (0, 1, 2)}
     
     def denormalize_positions(normalized_pos, node_type):
-        if pitch_scale is not None:
-            x_scale, y_scale = pitch_scale
-            # pitch scale 기반 정규화 해제: normalized = coord / pitch_scale
-            x_real = normalized_pos[:, 0] * x_scale
-            y_real = normalized_pos[:, 1] * y_scale
+        if zscore_stats is not None:
+            if node_type == 2:
+                x_mean, x_std = zscore_stats['ball_x_mean'], zscore_stats['ball_x_std']
+                y_mean, y_std = zscore_stats['ball_y_mean'], zscore_stats['ball_y_std']
+            else:
+                x_mean, x_std = zscore_stats['player_x_mean'], zscore_stats['player_x_std']
+                y_mean, y_std = zscore_stats['player_y_mean'], zscore_stats['player_y_std']
+            x_real = normalized_pos[:, 0] * x_std + x_mean
+            y_real = normalized_pos[:, 1] * y_std + y_mean
             return torch.stack([x_real, y_real], dim=1)
         else:
-            # 정규화가 없는 경우 그대로 반환
             return normalized_pos
     
     def denormalize_velocities(normalized_vel, node_type):
-        if pitch_scale is not None:
-            vx_real = normalized_vel[:, 0] * 12.0
-            vy_real = normalized_vel[:, 1] * 12.0
+        if zscore_stats is not None:
+            if node_type == 2:
+                vx_mean, vx_std = zscore_stats['ball_vx_mean'], zscore_stats['ball_vx_std']
+                vy_mean, vy_std = zscore_stats['ball_vy_mean'], zscore_stats['ball_vy_std']
+            else:
+                vx_mean, vx_std = zscore_stats['player_vx_mean'], zscore_stats['player_vx_std']
+                vy_mean, vy_std = zscore_stats['player_vy_mean'], zscore_stats['player_vy_std']
+            vx_real = normalized_vel[:, 0] * vx_std + vx_mean
+            vy_real = normalized_vel[:, 1] * vy_std + vy_mean
             return torch.stack([vx_real, vy_real], dim=1)
         else:
             return normalized_vel
@@ -239,9 +248,9 @@ def convert_to_hetero_graph(node_features, edge_index_dict, edge_attr_dict):
 def build_graph_sequence_from_condition(sample):
     condition = sample["condition"]     # [T, F]
     T = condition.shape[0]
-
-    pitch_scale = sample.get("pitch_scale", None)
     
+    zscore_stats = sample.get("zscore_stats", None)
+
     full_graph = HeteroData()
     node_offset = 0
 
@@ -251,7 +260,7 @@ def build_graph_sequence_from_condition(sample):
         # print(f"[Frame {t+1}/{T}] node_offset_before={node_offset}")
         node_feats = extract_node_features(condition[t], sample["condition_columns"])
         edge_index_dict, edge_attr_dict = build_edges_based_on_interactions(
-            node_feats, pitch_scale=pitch_scale
+            node_feats, zscore_stats=zscore_stats
         )
 
         node_count = node_feats["Node"].size(0)

@@ -126,10 +126,6 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
     bx, by, bvx, bvy = [], [], [], []
     dists = []
     
-    tx_abs_x, tx_abs_y = [], []
-    tx_rel_x, tx_rel_y = [], []
-    tx_vel_x, tx_vel_y = [], []
-    
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calculate Z-score...")):
         cond = batch["condition"]
         cond_cols = batch["condition_columns"][0]
@@ -154,19 +150,7 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
                 bvy.extend(arr.tolist())
             elif col.endswith('_dist'):
                 dists.extend(arr.tolist())
-
-        target_abs = batch["target"].view(-1, 2).cpu().numpy()
-        tx_abs_x.extend(target_abs[:,0].tolist())
-        tx_abs_y.extend(target_abs[:,1].tolist())
-
-        target_rel = batch["target_relative"].view(-1, 2).cpu().numpy()
-        tx_rel_x.extend(target_rel[:,0].tolist())
-        tx_rel_y.extend(target_rel[:,1].tolist())
-
-        target_vel = batch["target_velocity"].view(-1, 2).cpu().numpy()
-        tx_vel_x.extend(target_vel[:,0].tolist())
-        tx_vel_y.extend(target_vel[:,1].tolist())
-
+    
     stats = {}
 
     stats['player_x_mean'], stats['player_x_std'] = float(np.mean(px)), float(np.std(px))
@@ -185,16 +169,6 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         
     stats['dist_mean'], stats['dist_std'] = float(np.mean(dists)), float(np.std(dists))
     
-    stats['target_x_mean'], stats['target_x_std'] = float(np.mean(tx_abs_x)), float(np.std(tx_abs_x))
-    stats['target_y_mean'], stats['target_y_std'] = float(np.mean(tx_abs_y)), float(np.std(tx_abs_y))
-
-    stats['rel_x_mean'], stats['rel_x_std'] = float(np.mean(tx_rel_x)), float(np.std(tx_rel_x))
-    stats['rel_y_mean'], stats['rel_y_std'] = float(np.mean(tx_rel_y)), float(np.std(tx_rel_y))
-
-    stats['vel_x_mean'], stats['vel_x_std'] = float(np.mean(tx_vel_x)), float(np.std(tx_vel_x))
-    stats['vel_y_mean'], stats['vel_y_std'] = float(np.mean(tx_vel_y)), float(np.std(tx_vel_y))
-
-    
     with open(save_path, 'wb') as f:
         pickle.dump(stats, f)
     
@@ -210,13 +184,6 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         print(f"Ball Vx: mean={stats['ball_vx_mean']:.2f}m/s, std={stats['ball_vx_std']:.2f}m/s")
         print(f"Ball Vy: mean={stats['ball_vy_mean']:.2f}m/s, std={stats['ball_vy_std']:.2f}m/s")
     print(f"Dist: mean={stats['dist_mean']:.2f}m, std={stats['dist_std']:.2f}m")
-    
-    print(f"[Predict interval] Target X: mean={stats['target_x_mean']:.2f}m, std={stats['target_x_std']:.2f}m")
-    print(f"[Predict interval] Target Y: mean={stats['target_y_mean']:.2f}m, std={stats['target_y_std']:.2f}m")
-    print(f"[Predict interval] Target Rel_X: mean={stats['rel_x_mean']:.2f}m, std={stats['rel_x_std']:.2f}m")
-    print(f"[Predict interval] Target Rel_Y: mean={stats['rel_y_mean']:.2f}m, std={stats['rel_y_std']:.2f}m")
-    print(f"[Predict interval] Target Vx: mean={stats['vel_x_mean']:.2f}m, std={stats['vel_x_std']:.2f}m")
-    print(f"[Predict interval] Target Vy: mean={stats['vel_y_mean']:.2f}m, std={stats['vel_y_std']:.2f}m")
 
     return stats
 
