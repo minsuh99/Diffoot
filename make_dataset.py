@@ -529,13 +529,6 @@ class CustomDataset(Dataset):
             # 나머지 프레임 속도: 연속 프레임 간 차이 * framerate  
             v_rest_x = np.diff(abs_x) * self.framerate
             v_rest_y = np.diff(abs_y) * self.framerate
-            
-            if i == 0:
-                print(f"Player {i}: abs_x[0]={abs_x[0]:.4f}, ref_x={ref_x:.4f}, v0_x={v0_x:.4f}")
-                print(f"Player {i}: abs_y[0]={abs_y[0]:.4f}, ref_y={ref_y:.4f}, v0_y={v0_y:.4f}")
-                print(f"Player {i}: v_rest_x[:3]={v_rest_x[:3]}")
-            
-            
             # 전체 속도 결합
             vx = np.concatenate([[v0_x], v_rest_x])
             vy = np.concatenate([[v0_y], v_rest_y])
