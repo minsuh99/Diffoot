@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore", message="The 'gameclock' column does not match the defined value range.*", category=UserWarning, module=r"floodlight\.core\.events")
 
 from floodlight.io.dfl import read_position_data_xml, read_event_data_xml, read_pitch_from_mat_info_xml
-from utils.utils import calc_velocites, correct_nan_velocities_and_positions
+from utils.utils import calc_velocites, correct_nan_velocities_and_positions, to_single_playing_direction
 from utils.data_utils import (
     infer_starters_from_tracking,
     sort_columns_by_original_order,
@@ -72,6 +72,9 @@ def process_match(xy, possession, ballstatus):
 
     home = pd.concat([df_home_1, df_home_2])
     away = pd.concat([df_away_1, df_away_2])
+    dummy_events = pd.DataFrame(index=home.index) # empty df
+    
+    home, away, _ = to_single_playing_direction(home, away, dummy_events)
     
     # Calculate Match time
     home["match_time"] = away["match_time"] = home["Time [s]"]
@@ -237,7 +240,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=25, zscore_stats = None):
+    def __init__(self, data_root, segment_length=175, condition_length=125, framerate=25, stride=12, zscore_stats = None):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -388,6 +391,10 @@ class CustomDataset(Dataset):
         holder = pd.concat([holder_first, holder_second])
         poss_time = pd.concat([duration_first, duration_second])
         
+        # reference frame 정의
+        condition_reference_idx = start_idx - 1  # condition 바로 이전 프레임
+        target_reference_idx = start_idx + self.condition_length - 1  # condition 마지막 프레임
+
         full_seq = df.iloc[start_idx:start_idx + self.segment_length]
         condition_seq = full_seq.iloc[:self.condition_length].copy()
         future_seq = full_seq.iloc[self.condition_length:].copy()
@@ -454,89 +461,146 @@ class CustomDataset(Dataset):
         other_seq = future_seq[other_columns]
         target_seq = future_seq[target_columns]
         
-        # --- 1. CONDITION & OTHER 정규화 먼저 수행 ---
-        if self.zscore_stats is not None:
-            # Condition 정규화
-            condition_seq_normalized = condition_seq.copy()
-            for col in condition_columns:
-                base, feat = col.rsplit("_", 1)
-                if feat in ("x", "y", "vx", "vy"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std  = self.zscore_stats[f"{key}_{feat}_std"]
-                    condition_seq_normalized[col] = (condition_seq[col] - mean) / std
-                elif feat == "dist":
-                    condition_seq_normalized[col] = (condition_seq[col] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
-            
-            # Other 정규화
-            other_array = other_seq.values.copy()
-            for i, col in enumerate(other_columns):
-                base, feat = col.rsplit("_", 1)
-                if feat in ("x", "y"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std = self.zscore_stats[f"{key}_{feat}_std"]
-                    other_array[:, i] = (other_array[:, i] - mean) / std
-                elif feat in ("vx", "vy"):
-                    key = "ball" if base == "ball" else "player"
-                    mean = self.zscore_stats[f"{key}_{feat}_mean"]
-                    std = self.zscore_stats[f"{key}_{feat}_std"]
-                    other_array[:, i] = (other_array[:, i] - mean) / std
-        else:
-            # 피치 스케일 정규화 (기본값)
-            condition_seq_normalized = condition_seq
-            other_array = other_seq.values
+        num_players = len(target_columns) // 2  # 11명
         
-        other_tensor = torch.tensor(other_array, dtype=torch.float32)
-
-        reference_frame = condition_seq_normalized.iloc[-1]
+        # Target reference (condition 마지막 프레임)
+        target_reference_frame = df.iloc[target_reference_idx]
+        target_ref_coords = []
+        for i in range(num_players):
+            col_x = target_columns[i * 2]
+            col_y = target_columns[i * 2 + 1]
+            target_ref_x = target_reference_frame[col_x]
+            target_ref_y = target_reference_frame[col_y]
+            target_ref_coords.extend([target_ref_x, target_ref_y])
+        
+        target_reference_tensor = torch.tensor(target_ref_coords, dtype=torch.float32)  # [22]
+        
+        # Condition reference (start_idx - 1 프레임)
+        condition_reference_tensor = None
+        if condition_reference_idx >= 0:
+            condition_reference_frame = df.iloc[condition_reference_idx]
+            condition_ref_coords = []
+            for i in range(num_players):
+                col_x = target_columns[i * 2]
+                col_y = target_columns[i * 2 + 1]
+                cond_ref_x = condition_reference_frame[col_x]
+                cond_ref_y = condition_reference_frame[col_y]
+                condition_ref_coords.extend([cond_ref_x, cond_ref_y])
+            
+            condition_reference_tensor = torch.tensor(condition_ref_coords, dtype=torch.float32)  # [22]
+        else:
+            # 첫 번째 세그먼트인 경우 - condition의 첫 프레임을 기준으로 사용
+            first_frame = condition_seq.iloc[0]
+            condition_ref_coords = []
+            for i in range(num_players):
+                col_x = target_columns[i * 2]
+                col_y = target_columns[i * 2 + 1]
+                cond_ref_x = first_frame[col_x] if col_x in first_frame.index else 0.0
+                cond_ref_y = first_frame[col_y] if col_y in first_frame.index else 0.0
+                condition_ref_coords.extend([cond_ref_x, cond_ref_y])
+        
+            condition_reference_tensor = torch.tensor(condition_ref_coords, dtype=torch.float32)
 
         target_abs_data = []
         target_rel_data = []
         target_vel_data = []
         
-        num_players = len(target_columns) // 2  # 11명
-
-        if self.zscore_stats is not None:
-            target_abs_normalized = np.zeros((len(target_seq), len(target_columns)))
-            for i in range(0, len(target_columns), 2):
-                col_x = target_columns[i]
-                col_y = target_columns[i + 1]
-
-                target_abs_normalized[:, i] = (target_seq[col_x].values - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
-                target_abs_normalized[:, i+1] = (target_seq[col_y].values - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
-        else:
-            target_abs_normalized = target_seq.values
-
         for i in range(num_players):
-            abs_x = target_abs_normalized[:, i * 2]
-            abs_y = target_abs_normalized[:, i * 2 + 1]
-            target_abs_data.append(np.column_stack([abs_x, abs_y]))
-
             col_x = target_columns[i * 2]
             col_y = target_columns[i * 2 + 1]
-            ref_x = reference_frame[col_x]
-            ref_y = reference_frame[col_y] 
-            rel_x = (abs_x - ref_x)
-            rel_y = (abs_y - ref_y)
-            
-            target_rel_data.append(np.column_stack([rel_x, rel_y]))
 
-            # 첫 번째 프레임 속도: (첫 프레임 위치 - 기준점) * framerate
-            v0_x = (abs_x[0] - ref_x) * self.framerate
-            v0_y = (abs_y[0] - ref_y) * self.framerate
-            
-            # 나머지 프레임 속도: 연속 프레임 간 차이 * framerate  
-            v_rest_x = np.diff(abs_x) * self.framerate
-            v_rest_y = np.diff(abs_y) * self.framerate
-            # 전체 속도 결합
-            vx = np.concatenate([[v0_x], v_rest_x])
-            vy = np.concatenate([[v0_y], v_rest_y])
-            target_vel_data.append(np.column_stack([vx, vy]))
+            abs_x_raw = target_seq[col_x].values
+            abs_y_raw = target_seq[col_y].values
 
-        target_abs = np.concatenate(target_abs_data, axis=1)  # [T, 22] (11명 * 2차원)
+            # Target reference 사용 (기존과 동일)
+            ref_x_raw = target_reference_tensor[i * 2].item()
+            ref_y_raw = target_reference_tensor[i * 2 + 1].item()
+            rel_x_raw = abs_x_raw - ref_x_raw
+            rel_y_raw = abs_y_raw - ref_y_raw
+                
+            v0_x_raw = (abs_x_raw[0] - ref_x_raw) * self.framerate
+            v0_y_raw = (abs_y_raw[0] - ref_y_raw) * self.framerate
+            v_rest_x_raw = np.diff(abs_x_raw) * self.framerate
+            v_rest_y_raw = np.diff(abs_y_raw) * self.framerate
+            vx_raw = np.concatenate([[v0_x_raw], v_rest_x_raw])
+            vy_raw = np.concatenate([[v0_y_raw], v_rest_y_raw])
+
+            if self.zscore_stats is not None:
+                # 정규화 적용
+                abs_x_norm = (abs_x_raw - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
+                abs_y_norm = (abs_y_raw - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
+                
+                # 상대좌표 정규화 (통계가 있는 경우에만)
+                if 'rel_x_mean' in self.zscore_stats and 'rel_x_std' in self.zscore_stats:
+                    rel_x_norm = (rel_x_raw - self.zscore_stats['rel_x_mean']) / self.zscore_stats['rel_x_std']
+                    rel_y_norm = (rel_y_raw - self.zscore_stats['rel_y_mean']) / self.zscore_stats['rel_y_std']
+                else:
+                    rel_x_norm = rel_x_raw
+                    rel_y_norm = rel_y_raw
+
+                # 속도 정규화 (통계가 있는 경우에만)
+                if 'player_vx_mean' in self.zscore_stats and 'player_vx_std' in self.zscore_stats:
+                    vx_norm = (vx_raw - self.zscore_stats['player_vx_mean']) / self.zscore_stats['player_vx_std']
+                    vy_norm = (vy_raw - self.zscore_stats['player_vy_mean']) / self.zscore_stats['player_vy_std']
+                else:
+                    vx_norm = vx_raw
+                    vy_norm = vy_raw
+            else:
+                # zscore_stats가 None인 경우 원본 데이터 사용
+                abs_x_norm = abs_x_raw
+                abs_y_norm = abs_y_raw
+                rel_x_norm = rel_x_raw
+                rel_y_norm = rel_y_raw
+                vx_norm = vx_raw
+                vy_norm = vy_raw
+                
+            target_abs_data.append(np.column_stack([abs_x_norm, abs_y_norm]))
+            target_rel_data.append(np.column_stack([rel_x_norm, rel_y_norm]))
+            target_vel_data.append(np.column_stack([vx_norm, vy_norm]))
+
+        target_abs = np.concatenate(target_abs_data, axis=1)  # [T, 22]
         target_rel = np.concatenate(target_rel_data, axis=1)  # [T, 22]
         target_vel = np.concatenate(target_vel_data, axis=1)  # [T, 22]
+
+        # Condition 정규화
+        if self.zscore_stats is not None:
+            condition_seq_normalized = condition_seq.copy()
+            for col in condition_columns:
+                base, feat = col.rsplit("_", 1)
+                if feat in ("x", "y", "vx", "vy"):
+                    key = "ball" if base == "ball" else "player"
+                    stat_key_mean = f"{key}_{feat}_mean"
+                    stat_key_std = f"{key}_{feat}_std"
+                    
+                    # 해당 통계가 존재하는 경우에만 정규화
+                    if stat_key_mean in self.zscore_stats and stat_key_std in self.zscore_stats:
+                        mean = self.zscore_stats[stat_key_mean]
+                        std = self.zscore_stats[stat_key_std]
+                        condition_seq_normalized[col] = (condition_seq[col] - mean) / std
+                elif feat == "dist":
+                    if "dist_mean" in self.zscore_stats and "dist_std" in self.zscore_stats:
+                        condition_seq_normalized[col] = (condition_seq[col] - self.zscore_stats["dist_mean"]) / self.zscore_stats["dist_std"]
+        else:
+            # zscore_stats가 None인 경우 원본 데이터 사용
+            condition_seq_normalized = condition_seq.copy()
+            
+        # Other 정규화
+        other_array = other_seq.values.copy()
+        if self.zscore_stats is not None:
+            for i, col in enumerate(other_columns):
+                base, feat = col.rsplit("_", 1)
+                if feat in ("x", "y", "vx", "vy"):
+                    key = "ball" if base == "ball" else "player"
+                    stat_key_mean = f"{key}_{feat}_mean"
+                    stat_key_std = f"{key}_{feat}_std"
+                    
+                    # 해당 통계가 존재하는 경우에만 정규화
+                    if stat_key_mean in self.zscore_stats and stat_key_std in self.zscore_stats:
+                        mean = self.zscore_stats[stat_key_mean]
+                        std = self.zscore_stats[stat_key_std]
+                        other_array[:, i] = (other_array[:, i] - mean) / std
+        
+        other_tensor = torch.tensor(other_array, dtype=torch.float32)
         
         # 텐서로 변환
         target_abs_tensor = torch.tensor(target_abs, dtype=torch.float32)
@@ -622,6 +686,9 @@ class CustomDataset(Dataset):
             "target": target_abs_tensor,           # 절대좌표
             "target_relative": target_rel_tensor,  # 상대좌표
             "target_velocity": target_vel_tensor,  # 속도
+            "condition_reference": condition_reference_tensor,
+            "target_reference": target_reference_tensor,
+        
             "condition_columns": [
                 f"{base}_{f}" for base in player_bases for f in ["x", "y", "vx", "vy", "dist", "position", "starter", "possession_duration", "neighbor_count"]
             ] + ball_feats,
@@ -645,79 +712,7 @@ class CustomDataset(Dataset):
         sample["graph"] = self.graph_cache[idx]
         
         return sample
-    
 
-class ApplyAugmentedDataset(Dataset):
-    def __init__(self, base_dataset, flip_prob = 0.5):
-        self.base = base_dataset
-        if isinstance(base_dataset, Subset):
-            self.zscore_stats = base_dataset.dataset.zscore_stats
-        else:
-            self.zscore_stats = base_dataset.zscore_stats
-        self.N = len(base_dataset)
-        self.flip_N = int(self.N * flip_prob)
-        self.total = self.N + self.flip_N
-        self.flip_indices = random.sample(range(self.N), self.flip_N)
-
-    def __len__(self):
-        return self.total
-
-    def __getitem__(self, idx):
-        if idx < self.N:
-            return self.base[idx]
-
-        t = idx - self.N
-        base_sample = self.base[self.flip_indices[t]]
-        
-        cond = base_sample["condition"].clone()
-        cond_x_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_x")]
-        cond_vx_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_vx")]
-        cond[:, cond_x_indices + cond_vx_indices] *= -1
-
-        other = base_sample["other"].clone()
-        other_x_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_x")]
-        other_vx_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_vx")]
-        other[:, other_x_indices + other_vx_indices] *= -1
-
-        # 분리된 target 데이터들 각각 augmentation
-        target = base_sample["target"].clone()
-        target_x_indices = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_x")]
-        target[:, target_x_indices] *= -1
-
-        target_relative = base_sample["target_relative"].clone()
-        target_rel_x_indices = [i for i, col in enumerate(base_sample["target_relative_columns"]) if col.endswith("_rel_x")]
-        target_relative[:, target_rel_x_indices] *= -1
-
-        target_velocity = base_sample["target_velocity"].clone()
-        target_vx_indices = [i for i, col in enumerate(base_sample["target_velocity_columns"]) if col.endswith("_vx")]
-        target_velocity[:, target_vx_indices] *= -1
-
-        sample = {
-            "match_id": base_sample["match_id"],
-            "condition": cond,
-            "other": other,
-            "target": target,
-            "target_relative": target_relative,
-            "target_velocity": target_velocity,
-            "condition_columns": base_sample["condition_columns"],
-            "other_columns": base_sample["other_columns"],
-            "target_columns": base_sample["target_columns"],
-            "target_relative_columns": base_sample["target_relative_columns"],
-            "target_velocity_columns": base_sample["target_velocity_columns"],
-            "condition_frames": base_sample["condition_frames"],
-            "target_frames": base_sample["target_frames"],
-            "pitch_scale": base_sample["pitch_scale"],
-            "zscore_stats": base_sample["zscore_stats"]
-        }
-
-        sample["graph"] = build_graph_sequence_from_condition({
-            "condition": sample["condition"],
-            "condition_columns": sample["condition_columns"],
-            "pitch_scale": sample["pitch_scale"],
-            "zscore_stats": self.zscore_stats
-        })
-
-        return sample
 
 if __name__ == "__main__":
     raw_data_path = "idsse-data" # Raw Data Downloaded Path
@@ -773,3 +768,7 @@ if __name__ == "__main__":
     print("Target vel min:", sample["target_velocity"].min())
     print("Target vel max:", sample["target_velocity"].max())
     print("Target vel std:", sample["target_velocity"].std())
+    
+    first_rel = sample['target_relative'][0, :2]  # 첫 프레임, 첫 플레이어
+    print(f"First relative coord: ({first_rel[0]:.4f}, {first_rel[1]:.4f})")
+    print(f"Should be close to 0: {torch.norm(first_rel) < 0.1}")

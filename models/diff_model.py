@@ -39,7 +39,7 @@ class DiffusionTrajectoryModel(nn.Module):
         z = z.permute(0, 3, 2, 1)
 
         eps_pred, log_var = z[..., :6], z[..., 6:]
-        log_var = log_var.clamp(-2, 1)
+        log_var = log_var.clamp(-10, 2)
         var = log_var.exp()
         
         eps_pred_rel = eps_pred[..., 2:4]  # 상대좌표 부분만

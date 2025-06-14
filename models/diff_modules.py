@@ -65,8 +65,13 @@ class LinformerMultiHead(nn.Module):
         F_proj = get_EF(seq_len, compressed_dim)
         
         self.heads = nn.ModuleList([
-            LinearAttentionHead(self.head_dim, dropout, E_proj, F_proj, causal)
-            for _ in range(nheads)
+            LinearAttentionHead(
+                self.head_dim, 
+                dropout, 
+                E_proj, 
+                F_proj, 
+                causal
+            ) for _ in range(nheads)
         ])
 
         self.w_o = nn.Linear(channels, channels)
@@ -173,7 +178,7 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels, diffusion_embedding_dim, nheads, side_dim=None, time_seq_len=100, feature_seq_len=11, compressed_dim=32):
+    def __init__(self, channels, diffusion_embedding_dim, nheads, side_dim=None, time_seq_len=50, feature_seq_len=11, compressed_dim=32):
         super().__init__()
         self.channels = channels
         self.side_dim = side_dim
@@ -185,7 +190,8 @@ class ResidualBlock(nn.Module):
         self.feature_layer = get_linformer_trans(heads=nheads, layers=1, channels=channels, seq_len=feature_seq_len, 
                                                  compressed_dim=min(compressed_dim, feature_seq_len), causal=False)
         
-        self.norm = nn.LayerNorm(channels) 
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
         
         if side_dim is not None:
             self.cond_proj = nn.Linear(side_dim, channels)
@@ -236,6 +242,8 @@ class ResidualBlock(nn.Module):
         y = x.reshape(B, C, K * L)
         diff = self.diffusion_projection(diffusion_emb).unsqueeze(-1)
         y = y + diff
+        
+        y = self.norm1(y.permute(0, 2, 1)).permute(0, 2, 1)
 
         # Temporal + feature mixing
         yt = self.forward_time(y, base_shape)
@@ -244,7 +252,7 @@ class ResidualBlock(nn.Module):
         
         # Mid projection
         y = self.mid_projection(y)
-        y = self.norm(y.permute(0, 2, 1)).permute(0, 2, 1)
+        y = self.norm2(y.permute(0, 2, 1)).permute(0, 2, 1)
         y = self.dropout(y)
 
         # Cross-Attention based FiLM
@@ -288,7 +296,7 @@ class diff_CSDI(nn.Module):
         self.diffusion_embedding_dim = config["diffusion_embedding_dim"]
         self.side_dim = config.get("side_dim", None)
         
-        self.time_seq_len = config.get("time_seq_len", 100)
+        self.time_seq_len = config.get("time_seq_len", 50)
         self.feature_seq_len = config.get("feature_seq_len", 11) 
         self.compressed_dim = config.get("compressed_dim", 32)
         
@@ -366,6 +374,6 @@ class diff_CSDI(nn.Module):
         x = self.output_projection2(x)
         x = x.reshape(B, inputdim * 2, K, L)
         eps, log_sigma = x[:, :inputdim], x[:, inputdim:]
-        log_sigma = torch.clamp(log_sigma, -2, 1) # Clamp range Fixed
+        log_sigma = torch.clamp(log_sigma, -10, 2) # Clamp range Fixed
         x = torch.cat([eps, log_sigma], dim=1)
         return x

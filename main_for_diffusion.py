@@ -15,7 +15,7 @@ from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
-from make_dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
+from make_dataset import CustomDataset, organize_and_process
 from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats
 from utils.data_utils import split_dataset_indices, compute_train_zscore_stats, custom_collate_fn
 from utils.graph_utils import build_graph_sequence_from_condition
@@ -39,12 +39,12 @@ logger = logging.getLogger()
 csdi_config = {
     "num_steps": 1000,
     "channels": 512,
-    "diffusion_embedding_dim": 256,
+    "diffusion_embedding_dim": 512,
     "nheads": 8,
-    "layers": 5,
+    "layers": 10,
     "side_dim": 512,
     
-    "time_seq_len": 100,      # 시간 길이
+    "time_seq_len": 50,      # Target 시간 길이
     "feature_seq_len": 11,    # 선수 수
     "compressed_dim": 32     # 압축 차원
 }
@@ -56,7 +56,7 @@ hyperparams = {
     'test_batch_size': 16,
     'num_workers': 8,
     'epochs': 50,
-    'learning_rate': 1.5e-4,
+    'learning_rate': 1e-4,
     'self_conditioning_ratio': 0.0,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
@@ -98,7 +98,7 @@ gc.collect()
 dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats)
 
 train_dataloader = DataLoader(
-    ApplyAugmentedDataset(Subset(dataset, train_idx), flip_prob=0.5),
+    Subset(dataset, train_idx),
     batch_size=train_batch_size,
     shuffle=True,
     num_workers=num_workers,
@@ -162,8 +162,8 @@ denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate, weight_decay=0.0)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=3, threshold=1e-4, min_lr=learning_rate*0.01)
-# scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.1)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
+# scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.01)
 # scheduler = CosineAnnealingWarmRestarts(optimizer, T_0 = int(epochs * 0.5), T_mult = 2, eta_min=learning_rate * 0.1)
 scaler = GradScaler()
 
@@ -195,7 +195,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     for batch in tqdm(train_dataloader, desc = "Batch Training...", leave=False):
         optimizer.zero_grad()
         cond = batch["condition"].to(device)
-        B, T, _ = cond.shape
+        B, T_cond, _ = cond.shape
+        _, T_target, _ = batch["target"].shape
         target_columns = batch["target_columns"][0]
         condition_columns = batch["condition_columns"][0]
         
@@ -217,20 +218,20 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         #     last_past_cond[:, target_y_indices]   # [B, 11]
         # ], dim=-1)  # [B, 11, 2]
 
-        target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-        target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-        target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
+        target_vel = batch["target_velocity"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
 
         model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
         graph_batch = batch["graph"].to(device)    
         # graph → H
         H = graph_encoder(graph_batch)                                       # [B, 256]
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         
         # All player + ball history trajectories
         hist = cond[:, :, target_idx].to(device) 
         hist_rep = history_encoder(hist)  # [B, 256]
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         
         # Concat conditions
         cond_info = torch.cat([cond_H, cond_hist], dim=1)
@@ -298,7 +299,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation", leave=False):
             cond = batch["condition"].to(device)
-            B, T, _ = cond.shape
+            B, T_cond, _ = cond.shape
+            _, T_target, _ = batch["target"].shape
             target_columns = batch["target_columns"][0]
             condition_columns = batch["condition_columns"][0]
             
@@ -320,21 +322,21 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
             #     last_past_cond[:, target_y_indices]   # [B, 11]
             # ], dim=-1)  # [B, 11, 2]
             
-            target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-            target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-            target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+            target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
+            target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
+            target_vel = batch["target_velocity"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
 
             model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
             graph_batch = batch["graph"].to(device)                        # HeteroData batch
 
             # graph → H
             H = graph_encoder(graph_batch)                                      # [B, 256]
-            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
             
             # Target's history trajectories
             hist = cond[:, :, target_idx].to(device)  # [B,256,11,T]
             hist_rep = history_encoder(hist)  # [B, 256]
-            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+            cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
             
             # Concat conditions
             cond_info = torch.cat([cond_H, cond_hist], dim=1)
@@ -452,8 +454,8 @@ diff_model.eval()
 graph_encoder.eval()
 history_encoder.eval()
 
-all_best_ades = []
-all_best_fdes = []
+all_ades = []
+all_fdes = []
 
 visualize_samples = 5
 visualized = False # If you want to visualize
@@ -469,10 +471,16 @@ bx_std = torch.tensor(zscore_stats['ball_x_std'], device=device)
 by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
 by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
 
+rel_x_mean = torch.tensor(zscore_stats['rel_x_mean'], device=device)
+rel_x_std = torch.tensor(zscore_stats['rel_x_std'], device=device)
+rel_y_mean = torch.tensor(zscore_stats['rel_y_mean'], device=device)
+rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
+
 with torch.no_grad():        
     for batch in tqdm(test_dataloader, desc="Test Streaming Inference", leave=True):
         cond = batch["condition"].to(device)
-        B, T, _ = cond.shape
+        B, T_cond, _ = cond.shape
+        _, T_target, _ = batch["target"].shape
         target_columns = batch["target_columns"][0]
         condition_columns = batch["condition_columns"][0]
         
@@ -494,20 +502,20 @@ with torch.no_grad():
             last_past_cond[:, target_y_indices]   # [B, 11]
         ], dim=-1)  # [B, 11, 2]
         
-        target_abs = batch["target"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-        target_rel = batch["target_relative"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
-        target_vel = batch["target_velocity"].to(device).view(-1, T, 11, 2)  # [B, T, 11, 2]
+        target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
+        target_vel = batch["target_velocity"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
 
-        model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T, 11, 6]
+        model_input = torch.cat([target_abs, target_rel, target_vel], dim=-1).to(device)  # [B, T_target, 11, 6]
         graph_batch = batch["graph"].to(device)
 
         # condition 준비
         H = graph_encoder(batch["graph"].to(device))
-        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         
         hist = cond[:, :, target_idx].to(device)
         hist_rep = history_encoder(hist)
-        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T)
+        cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)
         
         # Target Denormalization
@@ -515,31 +523,22 @@ with torch.no_grad():
         target_den[...,0] = target_abs[...,0] * px_std + px_mean
         target_den[...,1] = target_abs[...,1] * py_std + py_mean
 
-        best_ade = torch.full((B,), float("inf"), device=device)
-        best_fde = torch.full((B,), float("inf"), device=device)
-        best_pred = torch.zeros_like(target_abs)
+        pred = diff_model.generate(shape=model_input.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
 
-        for _ in range(num_samples):
-            pred = diff_model.generate(shape=model_input.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
+        pred_rel_norm = pred[..., 2:4]  # 정규화된 상대좌표
+        pred_rel_raw = pred_rel_norm * torch.stack([rel_x_std, rel_y_std]) + torch.stack([rel_x_mean, rel_y_mean])
 
-            pred_rel = pred[..., 2:4]
-            pred_abs = pred_rel + initial_pos.unsqueeze(1).to(device)
+        initial_pos_raw = initial_pos * torch.stack([px_std, py_std]) + torch.stack([px_mean, py_mean])
 
-            pred_den = pred_abs.clone()
-            pred_den[...,0] = pred_abs[...,0] * px_std + px_mean
-            pred_den[...,1] = pred_abs[...,1] * py_std + py_mean
+        pred_abs_raw = pred_rel_raw + initial_pos_raw.unsqueeze(1)
+        pred_den = pred_abs_raw
+        
+        # ADE, FDE Calculation (Meters)
+        ade = ((pred_den[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
+        fde = ((pred_den[:,-1,:,:2] - target_den[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
             
-            # ADE, FDE Calculation (Meters)
-            ade = ((pred_den[...,:2] - target_den[...,:2])**2).sum(-1).sqrt().mean((1,2))
-            fde = ((pred_den[:,-1,:,:2] - target_den[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
-
-            mask = ade < best_ade
-            best_ade[mask] = ade[mask]
-            best_fde[mask] = fde[mask]
-            best_pred[mask] = pred_den[mask]
-            
-        all_best_ades.extend(best_ade.cpu().tolist())
-        all_best_fdes.extend(best_fde.cpu().tolist())
+        all_ades.extend(ade.cpu().tolist())
+        all_fdes.extend(fde.cpu().tolist())
         
         # Visualization (1st batch)
         if not visualized:
@@ -551,7 +550,7 @@ with torch.no_grad():
                 target_cols = batch["target_columns"][i]
                 
                 # Other Trajectories Denormalization
-                other_seq = batch["other"][i].view(T, -1, 2).to(device)          # [T, 12, 2]
+                other_seq = batch["other"][i].view(T_target, -1, 2).to(device)          # [T, 12, 2]
                 other_den = torch.zeros_like(other_seq)
                 for j in range(other_seq.size(1)):
                     x_col = other_cols[2 * j]
@@ -565,7 +564,7 @@ with torch.no_grad():
                     other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                     other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
                 
-                pred_traj = best_pred[i, :, :, :2].cpu().numpy()
+                pred_traj = pred_den[i, :, :, :2].cpu().numpy()
                 target_traj = target_den[i, :, :, :2].cpu().numpy()
                 other_traj  = other_den.cpu().numpy()
                 
@@ -583,12 +582,11 @@ with torch.no_grad():
 
             visualized = True
         
-        del pred, pred_den, target_den, ade, fde, mask
+        del pred, pred_den, target_den, ade, fde
         del cond, target_abs, target_rel, target_vel, H, cond_H, hist, hist_rep, cond_hist, cond_info, initial_pos
-        del best_ade, best_fde, best_pred
         torch.cuda.empty_cache()
         gc.collect()
             
 print(f"Best-of-{num_samples} Sampling:")
-print(f"ADE: {np.mean(all_best_ades):.3f} ± {np.std(all_best_ades):.3f} meters")
-print(f"FDE: {np.mean(all_best_fdes):.3f} ± {np.std(all_best_fdes):.3f} meters")
+print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
+print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")

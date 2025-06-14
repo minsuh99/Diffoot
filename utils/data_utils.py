@@ -106,8 +106,12 @@ def split_dataset_indices(dataset, val_ratio=(1/6), test_ratio=(1/6), random_see
     test_match_ids = set(match_ids[num_train_matches + num_val_matches:])
 
     train_indices = sorted([i for m in train_match_ids for i in match_to_indices[m]])
+    
     val_indices = sorted([i for m in val_match_ids for i in match_to_indices[m]])
+    val_indices = random.sample(val_indices, int(len(train_indices) * (0.15 / 0.7)))
+
     test_indices = sorted([i for m in test_match_ids for i in match_to_indices[m]])
+    test_indices = random.sample(test_indices, int(len(train_indices) * (0.15 / 0.7)))
 
     return train_indices, val_indices, test_indices
 
@@ -120,15 +124,18 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
     
     # 없으면 새로 계산
     train_subset = Subset(dataset, train_indices)
-    train_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=8, collate_fn=custom_collate_fn)
+    train_loader = DataLoader(train_subset, batch_size=32, shuffle=False, num_workers=8, collate_fn=custom_collate_fn)
     
     px, py, pvx, pvy = [], [], [], []
     bx, by, bvx, bvy = [], [], [], []
     dists = []
+    rel_x_all, rel_y_all = [], []
     
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="Calculate Z-score...")):
-        cond = batch["condition"]
+        cond = batch["condition"]  # [B, T, Features]
         cond_cols = batch["condition_columns"][0]
+        
+        # 기존 condition 통계 수집
         for i, col in enumerate(cond_cols):
             arr = cond[..., i].flatten().cpu().numpy()
             arr = arr[~np.isnan(arr)]
@@ -150,12 +157,44 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
                 bvy.extend(arr.tolist())
             elif col.endswith('_dist'):
                 dists.extend(arr.tolist())
-    
+
+        B, T = cond.shape[:2]
+
+        condition_reference = batch["condition_reference"]  # [B, 22]
+        target_columns = batch["target_columns"][0]  # 첫 번째 샘플의 target columns
+        
+        # Target players의 x, y 컬럼 인덱스 찾기
+        target_x_indices = []
+        target_y_indices = []
+        
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]      # e.g., 'Away_15_x'
+            y_col = target_columns[i + 1]  # e.g., 'Away_15_y'
+            
+            if x_col in cond_cols and y_col in cond_cols:
+                target_x_indices.append(cond_cols.index(x_col))
+                target_y_indices.append(cond_cols.index(y_col))
+                
+        for b in range(B):
+            for t in range(T):
+                for i, (x_idx, y_idx) in enumerate(zip(target_x_indices, target_y_indices)):
+                    abs_x = cond[b, t, x_idx].item()
+                    abs_y = cond[b, t, y_idx].item()
+
+                    ref_x = condition_reference[b, i * 2].item()
+                    ref_y = condition_reference[b, i * 2 + 1].item()
+                    
+                    rel_x = abs_x - ref_x
+                    rel_y = abs_y - ref_y
+                    
+                    if not (np.isnan(rel_x) or np.isnan(rel_y)):
+                        rel_x_all.append(rel_x)
+                        rel_y_all.append(rel_y)
+
     stats = {}
 
     stats['player_x_mean'], stats['player_x_std'] = float(np.mean(px)), float(np.std(px))
     stats['player_y_mean'], stats['player_y_std'] = float(np.mean(py)), float(np.std(py))
-
     stats['ball_x_mean'], stats['ball_x_std'] = float(np.mean(bx)), float(np.std(bx))
     stats['ball_y_mean'], stats['ball_y_std'] = float(np.mean(by)), float(np.std(by))
 
@@ -168,6 +207,10 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         stats['ball_vy_mean'], stats['ball_vy_std'] = float(np.mean(bvy)), float(np.std(bvy))
         
     stats['dist_mean'], stats['dist_std'] = float(np.mean(dists)), float(np.std(dists))
+
+    if rel_x_all and rel_y_all:
+        stats['rel_x_mean'], stats['rel_x_std'] = float(np.mean(rel_x_all)), float(np.std(rel_x_all))
+        stats['rel_y_mean'], stats['rel_y_std'] = float(np.mean(rel_y_all)), float(np.std(rel_y_all))
     
     with open(save_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -184,6 +227,10 @@ def compute_train_zscore_stats(dataset, train_indices, save_path="train_zscore_s
         print(f"Ball Vx: mean={stats['ball_vx_mean']:.2f}m/s, std={stats['ball_vx_std']:.2f}m/s")
         print(f"Ball Vy: mean={stats['ball_vy_mean']:.2f}m/s, std={stats['ball_vy_std']:.2f}m/s")
     print(f"Dist: mean={stats['dist_mean']:.2f}m, std={stats['dist_std']:.2f}m")
+
+    if 'rel_x_mean' in stats:
+        print(f"Rel X: mean={stats['rel_x_mean']:.3f}m, std={stats['rel_x_std']:.3f}m")
+        print(f"Rel Y: mean={stats['rel_y_mean']:.3f}m, std={stats['rel_y_std']:.3f}m")
 
     return stats
 
