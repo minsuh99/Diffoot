@@ -38,7 +38,8 @@ class LinearAttentionHead(nn.Module):
         if self.causal:
             seq_len, comp_dim = P_bar.size(1), P_bar.size(2)
             causal_mask = torch.triu(torch.ones(seq_len, comp_dim, device=P_bar.device)) == 1
-            P_bar = P_bar.masked_fill(~causal_mask, -1e10)
+            # P_bar = P_bar.masked_fill(~causal_mask, -1e10)
+            P_bar = P_bar.masked_fill(~causal_mask, -1e4)
         
         P_bar = P_bar.softmax(dim=-1)
         P_bar = self.dropout(P_bar)
@@ -289,7 +290,7 @@ class ResidualBlock(nn.Module):
 
 
 class diff_CSDI(nn.Module):
-    def __init__(self, config, inputdim=6):
+    def __init__(self, config, inputdim=2):
         super().__init__()
         self.channels = config["channels"]
         self.num_steps = config["num_steps"]
@@ -328,7 +329,7 @@ class diff_CSDI(nn.Module):
         
         # Output projections
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.channels, inputdim * 2, 1)  # noise(6) + log_sigma(6 channels)
+        self.output_projection2 = Conv1d_with_init(self.channels, inputdim * 2, 1)  # noise(2) + log_sigma(2 channels)
         nn.init.xavier_uniform_(self.output_projection2.weight)
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)

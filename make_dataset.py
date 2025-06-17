@@ -240,7 +240,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=175, condition_length=125, framerate=25, stride=12, zscore_stats = None):
+    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=12, zscore_stats = None):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -711,6 +711,86 @@ class CustomDataset(Dataset):
             
         sample["graph"] = self.graph_cache[idx]
         
+        return sample
+    
+class ApplyAugmentedDataset(Dataset):
+    def __init__(self, base_dataset, flip_prob = 0.7):
+        self.base = base_dataset
+        if isinstance(base_dataset, Subset):
+            self.zscore_stats = base_dataset.dataset.zscore_stats
+        else:
+            self.zscore_stats = base_dataset.zscore_stats
+        self.N = len(base_dataset)
+        self.flip_N = int(self.N * flip_prob)
+        self.total = self.N + self.flip_N
+        self.flip_indices = random.sample(range(self.N), self.flip_N)
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        if idx < self.N:
+            return self.base[idx]
+
+        t = idx - self.N
+        base_sample = self.base[self.flip_indices[t]]
+
+        cond = base_sample["condition"].clone()
+        cond_y_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_y")]
+        cond_vy_indices = [i for i, col in enumerate(base_sample["condition_columns"]) if col.endswith("_vy")]
+        cond[:, cond_y_indices + cond_vy_indices] *= -1
+
+        other = base_sample["other"].clone()
+        other_y_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_y")]
+        other_vy_indices = [i for i, col in enumerate(base_sample["other_columns"]) if col.endswith("_vy")]
+        other[:, other_y_indices + other_vy_indices] *= -1
+
+        # 분리된 target 데이터들 각각 augmentation
+        target = base_sample["target"].clone()
+        target_y_indices = [i for i, col in enumerate(base_sample["target_columns"]) if col.endswith("_y")]
+        target[:, target_y_indices] *= -1
+
+        target_relative = base_sample["target_relative"].clone()
+        target_rel_y_indices = [i for i, col in enumerate(base_sample["target_relative_columns"]) if col.endswith("_rel_y")]
+        target_relative[:, target_rel_y_indices] *= -1
+
+        target_velocity = base_sample["target_velocity"].clone()
+        target_vy_indices = [i for i, col in enumerate(base_sample["target_velocity_columns"]) if col.endswith("_vy")]
+        target_velocity[:, target_vy_indices] *= -1
+        
+        condition_reference = base_sample["condition_reference"].clone()
+        target_reference = base_sample["target_reference"].clone()
+        condition_reference[1::2] *= -1
+        target_reference[1::2] *= -1
+
+        sample = {
+            "match_id": base_sample["match_id"],
+            "condition": cond,
+            "other": other,
+            "target": target,
+            "target_relative": target_relative,
+            "target_velocity": target_velocity,
+            "condition_reference": base_sample["condition_reference"],
+            "target_reference": base_sample["target_reference"],
+            
+            "condition_columns": base_sample["condition_columns"],
+            "other_columns": base_sample["other_columns"],
+            "target_columns": base_sample["target_columns"],
+            "target_relative_columns": base_sample["target_relative_columns"],
+            "target_velocity_columns": base_sample["target_velocity_columns"],
+            "condition_frames": base_sample["condition_frames"],
+            "target_frames": base_sample["target_frames"],
+            "pitch_scale": base_sample["pitch_scale"],
+            "zscore_stats": base_sample["zscore_stats"]
+        }
+
+        sample["graph"] = build_graph_sequence_from_condition({
+            "condition": sample["condition"],
+            "condition_columns": sample["condition_columns"],
+            "pitch_scale": sample["pitch_scale"],
+            "zscore_stats": self.zscore_stats
+        })
+
         return sample
 
 

@@ -35,25 +35,26 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t, noise = self.q_sample(x_0, t)
         x_t_in = x_t.permute(0, 3, 2, 1)
 
+        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)               # [B,1,1,1]
+        sqrt_a = torch.sqrt(a_hat)                               # √α̂_t
+        sqrt_om = torch.sqrt(1 - a_hat)                          # √(1−α̂_t)
+        v_target = sqrt_a * noise - sqrt_om * x_0                 # v_t = √α ε_t − √(1−α) x₀
+        
+        x_t_in = x_t.permute(0, 3, 2, 1)
         z = self.model(x_t_in, t, cond_info, self_cond)
         z = z.permute(0, 3, 2, 1)
 
-        eps_pred, log_var = z[..., :6], z[..., 6:]
+        v_pred, log_var = z[..., :2], z[..., 2:]
         log_var = log_var.clamp(-10, 2)
         var = log_var.exp()
-        
-        eps_pred_rel = eps_pred[..., 2:4]  # 상대좌표 부분만
-        noise_rel = noise[..., 2:4]
-        log_var_rel = log_var[..., 2:4]
-        var_rel = var[..., 2:4]
-        
-        noise_mse = F.mse_loss(eps_pred_rel, noise_rel)
+
+        v_loss = F.mse_loss(v_pred, v_target)
         
         # NLL loss computing
-        nll = 0.5 * ((noise_rel - eps_pred_rel) ** 2 / var_rel + log_var_rel + math.log(2 * math.pi))
+        nll = 0.5 * ((v_target - v_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
         
-        return noise_mse, noise_nll
+        return v_loss, noise_nll
     
     # DDIM Sampling
     @torch.no_grad()
@@ -83,14 +84,13 @@ class DiffusionTrajectoryModel(nn.Module):
             use_self_cond = self_cond if torch.rand(1).item() < self_conditioning_ratio else None
         
             z = self.model(x_in, t_batch, cond_info, use_self_cond).permute(0, 3, 2, 1)
-            eps_pred, log_var = z[..., :6], z[..., 6:]
+            v_pred = z[..., :2]
             
-            # 훈련과 동일하게 상대좌표 부분만 사용
-            noise_pred = eps_pred
-            
-            x0_pred = x.clone()
-            x0_pred[..., 2:4] = (x[..., 2:4] - torch.sqrt(1 - ah_t) * noise_pred[..., 2:4]) / torch.sqrt(ah_t)
-            
+            sqrt_ah_t  = torch.sqrt(ah_t)           # √α̂_t
+            sqrt_om_t  = torch.sqrt(1 - ah_t)       # √(1−α̂_t)
+            x0_pred =  sqrt_ah_t * x - sqrt_om_t * v_pred
+            eps_pred = (x - sqrt_ah_t * x0_pred) / sqrt_om_t
+
             # Self-conditioning 업데이트 (ratio > 0일 때만)
             if self_conditioning_ratio > 0:
                 self_cond = x0_pred.permute(0, 3, 2, 1).detach()
@@ -106,7 +106,7 @@ class DiffusionTrajectoryModel(nn.Module):
                 c1 = torch.sqrt(ah_t_prev)
                 c2 = torch.sqrt(1 - ah_t_prev - sigma_t**2)
                 x_new = x.clone()
-                x_new[..., 2:4] = c1 * x0_pred[..., 2:4] + c2 * noise_pred[..., 2:4] + sigma_t * noise[..., 2:4]
+                x_new = c1 * x0_pred + c2 * eps_pred + sigma_t * noise
                 x = x_new
             else:
                 x = x0_pred
