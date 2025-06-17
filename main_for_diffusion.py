@@ -40,8 +40,8 @@ csdi_config = {
     "num_steps": 1000,
     "channels": 256,
     "diffusion_embedding_dim": 256,
-    "nheads": 8,
-    "layers": 8,
+    "nheads": 4,
+    "layers": 5,
     "side_dim": 256,
     
     "time_seq_len": 100,      # Target 시간 길이
@@ -175,8 +175,8 @@ logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {diff_model}")
 
 # 4. Train
-best_state_dict = None
 best_val_loss = float("inf")
+best_model_path = None
 
 train_losses = []
 val_losses   = []
@@ -393,12 +393,20 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        best_state_dict = {
-            'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
-            'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
-            # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
-            'zscore_stats': zscore_stats
-        }
+        if best_model_path and os.path.exists(best_model_path):
+            os.remove(best_model_path)
+        
+        best_model_path = os.path.join(model_save_path, f'best_model_epoch_{epoch}.pth')
+        
+        torch.save({
+            'diff_model': diff_model.state_dict(),
+            'graph_encoder': graph_encoder.state_dict(),
+            'zscore_stats': zscore_stats,
+            'val_loss': avg_val_loss,
+            'train_loss': avg_train_loss,
+            'epoch': epoch,
+            'hyperparams': hyperparams
+        }, best_model_path)
     
     torch.cuda.empty_cache()
     gc.collect()
@@ -431,20 +439,12 @@ plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
 plt.show()
 plt.close()
 
-final_state = {
-    'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
-    'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
-    # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
-    'zscore_stats': zscore_stats,
-    'train_losses': train_losses,
-    'val_losses': val_losses
-}
-
-torch.save(final_state, './results/final_model_latest.pth')
-
 # 5. Inference (Best-of-N Sampling) & Visualization
-diff_model.load_state_dict(best_state_dict['diff_model'])
-graph_encoder.load_state_dict(best_state_dict['graph_encoder'])
+if best_model_path and os.path.exists(best_model_path):    
+    checkpoint = torch.load(best_model_path, map_location=device)
+    diff_model.load_state_dict(checkpoint['diff_model'])
+    graph_encoder.load_state_dict(checkpoint['graph_encoder'])
+
 # history_encoder.load_state_dict(best_state_dict['history_encoder'])
 
 diff_model.eval()

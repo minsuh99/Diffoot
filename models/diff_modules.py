@@ -52,7 +52,7 @@ class LinearAttentionHead(nn.Module):
         return out_tensor
 
 class LinformerMultiHead(nn.Module):
-    def __init__(self, channels, nheads, seq_len, compressed_dim=32, dropout=0.1, causal=False):
+    def __init__(self, channels, nheads, seq_len, compressed_dim=32, dropout=0.2, causal=False):
         super().__init__()
         self.nheads = nheads
         self.head_dim = channels // nheads
@@ -99,11 +99,11 @@ def get_linformer_trans(heads=4, layers=1, channels=128, seq_len=100, compressed
         seq_len=seq_len,
         compressed_dim=compressed_dim,
         causal=causal,
-        dropout=0.1
+        dropout=0.2
     )
 
 class LinformerTransformer(nn.Module):
-    def __init__(self, channels, nheads, seq_len, compressed_dim=32, causal=False, dropout=0.1):
+    def __init__(self, channels, nheads, seq_len, compressed_dim=32, causal=False, dropout=0.2):
         super().__init__()
         self.attention = LinformerMultiHead(
             channels=channels,
@@ -201,7 +201,7 @@ class ResidualBlock(nn.Module):
                 embed_dim=channels,
                 num_heads=nheads,
                 batch_first=True,
-                dropout=0.1
+                dropout=0.2
             )
             # FiLM projection from attended cond_info
             self.film_proj = nn.Sequential(
@@ -221,7 +221,7 @@ class ResidualBlock(nn.Module):
         self.mid_projection = Conv1d_with_init(channels, channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
         
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.2)
 
     def forward_time(self, y, base_shape):
         B, C, K, L = base_shape
@@ -301,7 +301,7 @@ class diff_CSDI(nn.Module):
         self.feature_seq_len = config.get("feature_seq_len", 11) 
         self.compressed_dim = config.get("compressed_dim", 32)
         
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.2)
         self.norm = nn.LayerNorm(self.channels)
 
         # Diffusion embedding module
