@@ -463,7 +463,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
     i = player_idx
     
     x, y = target[:, i, 0], target[:, i, 1]
-    ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target' if i == 0 else None)
+    ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target')
     ax.scatter(x[-1], y[-1], color='blue', s=50, marker='o', alpha=0.7)
     
     if annotate and target_columns is not None:
@@ -473,7 +473,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, targe
         ax.text(x0 + 0.5, y0 + 0.5, jersey, color='blue', fontsize=10)
     
     x, y = pred[:, i, 0], pred[:, i, 1]
-    ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted' if i == 0 else None)
+    ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted')
     ax.scatter(x[-1], y[-1], color='blue', s=50, marker='x', alpha=0.5)
     
     if annotate and target_columns is not None:
