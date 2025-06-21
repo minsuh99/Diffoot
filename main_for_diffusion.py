@@ -57,7 +57,7 @@ hyperparams = {
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 1e-4,
-    'self_conditioning_ratio': 0.0,
+    'self_conditioning_ratio': 0.5,
     'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
@@ -191,7 +191,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     
     train_loss_v = 0
     train_noise_nll = 0
-    train_coords_fde = 0
+    train_player_mse = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training...", leave=False):
@@ -258,8 +258,8 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
 
-            loss_v, noise_nll, coords_fde = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
-            loss = loss_v + noise_nll * 0.001 + coords_fde * 0.1
+            loss_v, noise_nll, player_mse = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
+            loss = loss_v + noise_nll * 0.001
             
         # optimizer.zero_grad()
         # loss.backward()
@@ -270,19 +270,19 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         
         train_loss_v += (loss_v).item()
         train_noise_nll += (noise_nll * 0.001).item()
-        train_coords_fde += (coords_fde * 0.1).item()
+        # train_player_mse += (player_mse * 0.1).item()
 
         train_loss += loss.item()
 
         # del cond, last_past_cond, target_rel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond, last_past_cond, target_rel, graph_batch, H, cond_H
-        del cond_info, t, s, loss_v, noise_nll, coords_fde
+        del cond_info, t, s, loss_v, noise_nll
 
     num_batches = len(train_dataloader)
     
     avg_train_loss_v = train_loss_v / num_batches
     avg_train_noise_nll = train_noise_nll / num_batches
-    avg_train_coords_fde = train_coords_fde / num_batches
+    # avg_train_player_mse = train_player_mse / num_batches
     avg_train_loss = train_loss / num_batches
 
 
@@ -293,7 +293,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     
     val_loss_v = 0
     val_noise_nll = 0
-    val_coords_fde = 0
+    val_player_mse = 0
     val_total_loss = 0
 
     with torch.no_grad():
@@ -359,35 +359,35 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
 
-                loss_v, noise_nll, coords_fde = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
-                val_loss = loss_v + noise_nll * 0.001 + coords_fde * 0.1
+                loss_v, noise_nll, player_mse = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
+                val_loss = loss_v + noise_nll * 0.001
 
             val_loss_v += (loss_v).item()
             val_noise_nll += (noise_nll * 0.001).item()
-            val_coords_fde += (coords_fde * 0.1).item()
+            # val_player_mse += (player_mse * 0.1).item()
             val_total_loss += val_loss.item()
 
         # del cond, last_past_cond, target_rel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond, last_past_cond, target_rel, graph_batch, H, cond_H
-        del cond_info, t, s, loss_v, noise_nll, coords_fde
+        del cond_info, t, s, loss_v, noise_nll
 
     num_batches = len(val_dataloader)
 
     avg_val_loss_v = val_loss_v / num_batches
     avg_val_noise_nll = val_noise_nll / num_batches
-    avg_val_coords_fde = val_coords_fde / num_batches
+    # avg_val_player_mse = val_player_mse / num_batches
     avg_val_loss = val_total_loss / num_batches
 
     train_losses.append(avg_train_loss)
     val_losses.append(avg_val_loss)
     
     current_lr = scheduler.get_last_lr()[0]
-    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_loss_v:.6f}, Noise NLL={avg_train_noise_nll:.6f}, Coords MSE={avg_train_coords_fde:.6f}) | "
-                f"Val Loss={avg_val_loss:.6f} (Noise simple={avg_val_loss_v:.6f}, Noise NLL={avg_val_noise_nll:.6f}, Coords MSE={avg_val_coords_fde:.6f}) | LR={current_lr:.6e}")
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} (Noise simple={avg_train_loss_v:.6f}, Noise NLL={avg_train_noise_nll:.6f}) | "
+                f"Val Loss={avg_val_loss:.6f} (Noise simple={avg_val_loss_v:.6f}, Noise NLL={avg_val_noise_nll:.6f}) | LR={current_lr:.6e}")
 
     tqdm.write(f"[Epoch {epoch}]\n"
-               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_loss_v:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | Coords MSE={avg_train_coords_fde:.6f} | LR: {current_lr:.6f}\n"
-               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_loss_v:.6f} | NLL Loss: {avg_val_noise_nll:.6f} | Coords MSE={avg_val_coords_fde:.6f}")
+               f"[Train] Cost: {avg_train_loss:.6f} | Noise Loss: {avg_train_loss_v:.6f} | NLL Loss: {avg_train_noise_nll:.6f} | LR: {current_lr:.6f}\n"
+               f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_loss_v:.6f} | NLL Loss: {avg_val_noise_nll:.6f}")
 
     scheduler.step(avg_val_loss)
     # scheduler.step()

@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.utils import per_player_fde_loss
+from utils.utils import per_player_mse_loss
 
 class DiffusionTrajectoryModel(nn.Module):
     def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
@@ -37,8 +37,8 @@ class DiffusionTrajectoryModel(nn.Module):
 
         a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)               # [B,1,1,1]
         sqrt_a = torch.sqrt(a_hat)                               # √α̂_t
-        sqrt_one_minus = torch.sqrt(1 - a_hat)                          # √(1−α̂_t)
-        v_target = sqrt_a * noise - sqrt_one_minus * x_0                 # v_t = √α ε_t − √(1−α) x₀
+        sqrt_o = torch.sqrt(1 - a_hat)                          # √(1−α̂_t)
+        v_target = sqrt_a * noise - sqrt_o * x_0                 # v_t = √α ε_t − √(1−α) x₀
         
         x_t_in = x_t.permute(0, 3, 2, 1)
         z = self.model(x_t_in, t, cond_info, self_cond)
@@ -53,12 +53,8 @@ class DiffusionTrajectoryModel(nn.Module):
         # NLL loss computing
         nll = 0.5 * ((v_target - v_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
-        
-        # Relative Coords FDE
-        x0_pred = sqrt_a * x_t - sqrt_one_minus * v_pred  # x₀ = √α̂_t x_t − √(1−α̂_t) v_pred
-        x0_fde = per_player_fde_loss(x0_pred, x_0)
     
-        return v_loss, noise_nll, x0_fde
+        return v_loss, noise_nll
     
     # DDIM Sampling
     @torch.no_grad()
@@ -91,9 +87,9 @@ class DiffusionTrajectoryModel(nn.Module):
             v_pred = z[..., :2]
             
             sqrt_ah_t  = torch.sqrt(ah_t)           # √α̂_t
-            sqrt_one_minus_t  = torch.sqrt(1 - ah_t)       # √(1−α̂_t)
-            x0_pred =  sqrt_ah_t * x - sqrt_one_minus_t * v_pred
-            eps_pred = (x - sqrt_ah_t * x0_pred) / sqrt_one_minus_t
+            sqrt_o_t  = torch.sqrt(1 - ah_t)       # √(1−α̂_t)
+            x0_pred =  sqrt_ah_t * x - sqrt_o_t * v_pred
+            eps_pred = (x - sqrt_ah_t * x0_pred) / sqrt_o_t
 
             # Self-conditioning 업데이트 (ratio > 0일 때만)
             if self_conditioning_ratio > 0:
