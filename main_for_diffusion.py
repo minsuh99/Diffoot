@@ -42,7 +42,7 @@ csdi_config = {
     "diffusion_embedding_dim": 256,
     "nheads": 4,
     "layers": 5,
-    "side_dim": 256,
+    "side_dim": 512,
     
     "time_seq_len": 100,      # Target 시간 길이
     "feature_seq_len": 11,    # 선수 수
@@ -57,8 +57,8 @@ hyperparams = {
     'num_workers': 8,
     'epochs': 50,
     'learning_rate': 1e-4,
-    'self_conditioning_ratio': 0.5,
-    'num_samples': 10,
+    'self_conditioning_ratio': 0.0,
+    # 'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
@@ -74,7 +74,7 @@ num_workers = hyperparams['num_workers']
 epochs = hyperparams['epochs']
 learning_rate = hyperparams['learning_rate']
 self_conditioning_ratio = hyperparams['self_conditioning_ratio']
-num_samples = hyperparams['num_samples']
+# num_samples = hyperparams['num_samples']
 device = hyperparams['device']
 ddim_step = hyperparams['ddim_step']
 eta = hyperparams['eta']
@@ -258,7 +258,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
 
-            loss_v, noise_nll, player_mse = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
+            loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
             loss = loss_v + noise_nll * 0.001
             
         # optimizer.zero_grad()
@@ -359,7 +359,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
 
-                loss_v, noise_nll, player_mse = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
+                loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
                 val_loss = loss_v + noise_nll * 0.001
 
             val_loss_v += (loss_v).item()
@@ -590,6 +590,6 @@ with torch.no_grad():
         torch.cuda.empty_cache()
         gc.collect()
             
-print(f"Best-of-{num_samples} Sampling:")
+# print(f"Best-of-{num_samples} Sampling:")
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
