@@ -42,7 +42,7 @@ csdi_config = {
     "diffusion_embedding_dim": 256,
     "nheads": 4,
     "layers": 5,
-    "side_dim": 512,
+    "side_dim": 256,
     
     "time_seq_len": 100,      # Target 시간 길이
     "feature_seq_len": 11,    # 선수 수
@@ -55,10 +55,10 @@ hyperparams = {
     'val_batch_size': 16,
     'test_batch_size': 16,
     'num_workers': 8,
-    'epochs': 50,
+    'epochs': 30,
     'learning_rate': 1e-4,
     'self_conditioning_ratio': 0.0,
-    # 'num_samples': 10,
+    'num_samples': 10,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
@@ -74,7 +74,7 @@ num_workers = hyperparams['num_workers']
 epochs = hyperparams['epochs']
 learning_rate = hyperparams['learning_rate']
 self_conditioning_ratio = hyperparams['self_conditioning_ratio']
-# num_samples = hyperparams['num_samples']
+num_samples = hyperparams['num_samples']
 device = hyperparams['device']
 ddim_step = hyperparams['ddim_step']
 eta = hyperparams['eta']
@@ -175,9 +175,8 @@ logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {diff_model}")
 
 # 4. Train
+best_state_dict = None
 best_val_loss = float("inf")
-best_model_path = None
-timestamp = datetime.now().strftime('%m%d_%H%M%S')
 
 train_losses = []
 val_losses   = []
@@ -247,16 +246,16 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     # 첫 번째 예측 (self_cond=None)
                     z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                    v_pred1 = z1[:, :2, :, :]
+                    eps_pred1 = z1[:, :2, :, :]
                     
                     # x0 예측값 계산 (다음 step의 self-conditioning input)
                     a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * v_pred1) / a_hat.sqrt()
+                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
                     x0_hat = x0_hat.permute(0, 3, 2, 1)
                     
                     s = x0_hat.detach()  # [B, T, 11, 2]
                     
-                    del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
+                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
             loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
             loss = loss_v + noise_nll * 0.001
@@ -270,7 +269,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         
         train_loss_v += (loss_v).item()
         train_noise_nll += (noise_nll * 0.001).item()
-        # train_player_mse += (player_mse * 0.1).item()
+        # train_player_mse += (player_mse * 0.05).item()
 
         train_loss += loss.item()
 
@@ -348,23 +347,23 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     
                     # 첫 번째 예측 (self_cond=None)
                     z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                    v_pred1 = z1[:, :2, :, :]
+                    eps_pred1 = z1[:, :2, :, :]
                     
                     # x0 예측값 계산 (다음 step의 self-conditioning input)
                     a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * v_pred1) / a_hat.sqrt()
+                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
                     x0_hat = x0_hat.permute(0, 3, 2, 1)
                     
                     s = x0_hat.detach() # [B, T, 11, 2]
                     
-                    del x_t, noise, x_t_input, z1, v_pred1, a_hat, x0_hat
+                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
 
                 loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
                 val_loss = loss_v + noise_nll * 0.001
 
             val_loss_v += (loss_v).item()
             val_noise_nll += (noise_nll * 0.001).item()
-            # val_player_mse += (player_mse * 0.1).item()
+            # val_player_mse += (player_mse * 0.05).item()
             val_total_loss += val_loss.item()
 
         # del cond, last_past_cond, target_rel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
@@ -394,20 +393,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        if best_model_path and os.path.exists(best_model_path):
-            os.remove(best_model_path)
-        
-        best_model_path = os.path.join(model_save_path, f'{timestamp}_best_model_epoch_{epoch}.pth')
-        
-        torch.save({
-            'diff_model': diff_model.state_dict(),
-            'graph_encoder': graph_encoder.state_dict(),
-            'zscore_stats': zscore_stats,
-            'val_loss': avg_val_loss,
-            'train_loss': avg_train_loss,
-            'epoch': epoch,
-            'hyperparams': hyperparams
-        }, best_model_path)
+        best_state_dict = {
+            'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
+            'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
+            # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
+            'zscore_stats': zscore_stats
+        }
     
     torch.cuda.empty_cache()
     gc.collect()
@@ -434,17 +425,26 @@ plt.legend()
 plt.tight_layout()
 
 # plt.savefig('results/0603_diffusion_lr_curve.png')
+timestamp = datetime.now().strftime('%m%d')
 plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
 
-# 5. Inference (Best-of-N Sampling) & Visualization
-if best_model_path and os.path.exists(best_model_path):    
-    checkpoint = torch.load(best_model_path, map_location=device)
-    diff_model.load_state_dict(checkpoint['diff_model'])
-    graph_encoder.load_state_dict(checkpoint['graph_encoder'])
+final_state = {
+    'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
+    'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
+    # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
+    'zscore_stats': zscore_stats,
+    'train_losses': train_losses,
+    'val_losses': val_losses
+}
 
+torch.save(final_state, './results/final_model_latest.pth')
+
+# 5. Inference (Best-of-N Sampling) & Visualization
+diff_model.load_state_dict(best_state_dict['diff_model'])
+graph_encoder.load_state_dict(best_state_dict['graph_encoder'])
 # history_encoder.load_state_dict(best_state_dict['history_encoder'])
 
 diff_model.eval()

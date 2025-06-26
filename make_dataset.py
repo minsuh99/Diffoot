@@ -255,7 +255,7 @@ class CustomDataset(Dataset):
         self.column_order = None
         self.load_all_matches(data_root)
         self.graph_cache = {}
-        self.max_graph_cache_size = 2000
+        self.max_graph_cache_size = 5000
     
     # Preprocess raw match data and extract valid trajectory segments
     def load_all_matches(self, data_root):

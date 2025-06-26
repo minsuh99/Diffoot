@@ -330,11 +330,23 @@ def per_player_mse_loss(pred, target):
 
     return mse_per_player.mean()
 
-def per_player_frechet_loss(pred, target):
-    # pred, target (B, T, N=11, 2)
-    dists = torch.norm(pred - target, dim=-1) # (B, T, N)
-    max_dists = dists.max(dim=1).values # (B, N)
-    return max_dists.mean(dim=1).mean()
+def calc_frechet_distance(P, Q):
+    T = P.shape[0]
+    D = np.full((T, T), -1.0)
+    def c(i, j):
+        if D[i, j] > -1:
+            return D[i, j]
+        d = np.linalg.norm(P[i] - Q[j])
+        if i == 0 and j == 0:
+            D[i, j] = d
+        elif i > 0 and j == 0:
+            D[i, j] = max(c(i-1,0), d)
+        elif i == 0 and j > 0:
+            D[i, j] = max(c(0,j-1), d)
+        else:
+            D[i, j] = max(min(c(i-1,j), c(i,j-1), c(i-1,j-1)), d)
+        return D[i, j]
+    return c(T-1, T-1)
 
 
 def per_player_fde_loss(pred, target):
