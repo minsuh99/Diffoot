@@ -38,8 +38,8 @@ class LinearAttentionHead(nn.Module):
         if self.causal:
             seq_len, comp_dim = P_bar.size(1), P_bar.size(2)
             causal_mask = torch.triu(torch.ones(seq_len, comp_dim, device=P_bar.device)) == 1
-            # P_bar = P_bar.masked_fill(~causal_mask, -1e10)
-            P_bar = P_bar.masked_fill(~causal_mask, -1e4)
+            P_bar = P_bar.masked_fill(~causal_mask, -1e10)
+            # P_bar = P_bar.masked_fill(~causal_mask, -1e4)
         
         P_bar = P_bar.softmax(dim=-1)
         P_bar = self.dropout(P_bar)
@@ -311,8 +311,6 @@ class diff_CSDI(nn.Module):
         )
         # Input projection
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
-        # Self-conditioning projection
-        self.self_cond_projection = Conv1d_with_init(inputdim, self.channels, 1)
         # Residual blocks
         self.residual_layers = nn.ModuleList([
             ResidualBlock(
@@ -334,18 +332,13 @@ class diff_CSDI(nn.Module):
         if self.output_projection2.bias is not None:
             nn.init.zeros_(self.output_projection2.bias)
 
-    def forward(self, x, diffusion_step, cond_info=None, self_cond=None):
+    def forward(self, x, diffusion_step, cond_info=None):
         B, inputdim, K, L = x.shape
         # Flatten time and feature
         x = x.reshape(B, inputdim, K * L)
         x = self.input_projection(x)
         x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1)
         x = F.silu(x)
-
-        # Add self-conditioning if provided
-        if self_cond is not None:
-            sc = self.self_cond_projection(self_cond.permute(0, 3, 1, 2).reshape(B, inputdim, K * L))
-            x = x + sc
 
         # Prepare diffusion embedding
         diffusion_emb = self.diffusion_embedding(diffusion_step)

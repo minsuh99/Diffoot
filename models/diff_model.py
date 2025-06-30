@@ -5,13 +5,31 @@ import torch.nn.functional as F
 from utils.utils import per_player_mse_loss
 
 class DiffusionTrajectoryModel(nn.Module):
-    def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
+    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
+    #     super().__init__()
+    #     self.model = model
+    #     self.num_steps = num_steps
+    
+    #     ts = torch.linspace(0, 1, num_steps)
+    #     betas = beta_start + (beta_end - beta_start) * (ts ** 2)
+    #     alphas = 1.0 - betas
+    #     alpha_hat = torch.cumprod(alphas, dim=0)
+    
+    def __init__(self, model, num_steps=1000, s=0.008):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
-    
-        ts = torch.linspace(0, 1, num_steps)
-        betas = beta_start + (beta_end - beta_start) * (ts ** 2)
+
+        steps = num_steps + 1
+        x = torch.linspace(0, num_steps, steps, dtype=torch.float64)
+
+        alphas_cumprod = torch.cos(((x / num_steps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        
+        # Calculate betas from alpha_cumprod
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = torch.clip(betas, 0.0001, 0.9999).float()
+        
         alphas = 1.0 - betas
         alpha_hat = torch.cumprod(alphas, dim=0)
 
@@ -26,7 +44,7 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, t=None, cond_info=None, self_cond=None):
+    def forward(self, x_0, t=None, cond_info=None):
         B = x_0.size(0)
         device = x_0.device
         
@@ -41,7 +59,7 @@ class DiffusionTrajectoryModel(nn.Module):
         v_target = sqrt_a * noise - sqrt_o * x_0                 # v_t = √α ε_t − √(1−α) x₀
         
         x_t_in = x_t.permute(0, 3, 2, 1)
-        z = self.model(x_t_in, t, cond_info, self_cond)
+        z = self.model(x_t_in, t, cond_info)
         z = z.permute(0, 3, 2, 1)
 
         v_pred, log_var = z[..., :2], z[..., 2:]
@@ -58,7 +76,7 @@ class DiffusionTrajectoryModel(nn.Module):
     
     # DDIM Sampling
     @torch.no_grad()
-    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1, self_conditioning_ratio=0.0):
+    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
         B, T, N, D = shape
         device = next(self.parameters()).device
 
@@ -70,7 +88,6 @@ class DiffusionTrajectoryModel(nn.Module):
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
-        self_cond = None
 
         for i, t in enumerate(reversed(timesteps)):
             t_prev = 0 if i == ddim_steps - 1 else timesteps[-(i + 2)]
@@ -81,9 +98,8 @@ class DiffusionTrajectoryModel(nn.Module):
             t_batch = torch.full((num_samples * B,), t, device=device, dtype=torch.long)
             
             x_in = x.permute(0, 3, 2, 1)
-            use_self_cond = self_cond if torch.rand(1).item() < self_conditioning_ratio else None
         
-            z = self.model(x_in, t_batch, cond_info, use_self_cond).permute(0, 3, 2, 1)
+            z = self.model(x_in, t_batch, cond_info).permute(0, 3, 2, 1)
             v_pred = z[..., :2]
             
             sqrt_ah_t  = torch.sqrt(ah_t)           # √α̂_t
@@ -91,10 +107,6 @@ class DiffusionTrajectoryModel(nn.Module):
             x0_pred =  sqrt_ah_t * x - sqrt_o_t * v_pred
             eps_pred = (x - sqrt_ah_t * x0_pred) / sqrt_o_t
 
-            # Self-conditioning 업데이트 (ratio > 0일 때만)
-            if self_conditioning_ratio > 0:
-                self_cond = x0_pred.permute(0, 3, 2, 1).detach()
-            
             if t_prev > 0:
                 if eta > 0:
                     sigma_t = eta * torch.sqrt((1 - ah_t_prev) / (1 - ah_t)) * torch.sqrt(1 - ah_t / ah_t_prev)

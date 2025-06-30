@@ -10,13 +10,13 @@ from datetime import datetime
 from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
-from models.encoder import InteractionGraphEncoder, TargetTrajectoryEncoder
+from models.encoder import InteractionGraphEncoder
 from make_dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
-from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats
+from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats, calc_frechet_distance
 from utils.data_utils import split_dataset_indices, compute_train_zscore_stats, custom_collate_fn
 from utils.graph_utils import build_graph_sequence_from_condition
 
@@ -57,12 +57,11 @@ hyperparams = {
     'num_workers': 8,
     'epochs': 30,
     'learning_rate': 1e-4,
-    'self_conditioning_ratio': 0.0,
-    'num_samples': 10,
+    'num_samples': 20,
     'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
 
     'ddim_step': 50,
-    'eta': 0.0,
+    'eta': 0.2,
     **csdi_config
 }
 raw_data_path = hyperparams['raw_data_path']
@@ -73,7 +72,6 @@ test_batch_size = hyperparams['test_batch_size']
 num_workers = hyperparams['num_workers']
 epochs = hyperparams['epochs']
 learning_rate = hyperparams['learning_rate']
-self_conditioning_ratio = hyperparams['self_conditioning_ratio']
 num_samples = hyperparams['num_samples']
 device = hyperparams['device']
 ddim_step = hyperparams['ddim_step']
@@ -151,26 +149,17 @@ log_graph_stats(graph, logger, prefix="InitGraphSample")
 
 in_dim = graph['Node'].x.size(1)
 
-# history trajectories from condition
-condition_columns = sample["condition_columns"]
-target_idx = [i for i, col in enumerate(condition_columns) if col.endswith(("_x", "_y"))]
-
-# graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim // 2, out_dim=side_dim // 2).to(device)
+# Model Define
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim, out_dim=side_dim).to(device)
-# history_encoder = TargetTrajectoryEncoder(num_layers=5, hidden_dim = side_dim // 4, bidirectional=True).to(device)
 denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
 
-# optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()) + list(history_encoder.parameters()), lr=learning_rate, weight_decay=0.0)
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
-# scheduler = CosineAnnealingLR(optimizer, T_max=epochs * 0.7, eta_min=learning_rate * 0.01)
-# scheduler = CosineAnnealingWarmRestarts(optimizer, T_0 = int(epochs * 0.5), T_mult = 2, eta_min=learning_rate * 0.1)
 scaler = GradScaler()
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
-# logger.info(f"HistoryEncoder: {history_encoder}")
 logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {diff_model}")
 
@@ -186,16 +175,76 @@ first_batch_debug = True
 for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     diff_model.train()
     graph_encoder.train()
-    # history_encoder.train()
     
     train_loss_v = 0
     train_noise_nll = 0
-    train_player_mse = 0
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc = "Batch Training...", leave=False):
+        cond = batch["condition"].to(device)
+        B, T_cond, _ = cond.shape
+        _, T_target, _ = batch["target"].shape
+        target_columns = batch["target_columns"][0]
+        condition_columns = batch["condition_columns"][0]
+        
+        target_x_indices = []
+        target_y_indices = []
+        
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]
+            y_col = target_columns[i + 1]
+            
+            if x_col in condition_columns and y_col in condition_columns:
+                target_x_indices.append(condition_columns.index(x_col))
+                target_y_indices.append(condition_columns.index(y_col))
+
+        last_past_cond = cond[:, -1]
+        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+        # initial_pos = torch.stack([
+        #     last_past_cond[:, target_x_indices],  # [B, 11]
+        #     last_past_cond[:, target_y_indices]   # [B, 11]
+        # ], dim=-1)  # [B, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
+        graph_batch = batch["graph"].to(device)    
+        # graph → H
+        H = graph_encoder(graph_batch)                                # [B, 256]
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
+        cond_info = cond_H
+
+        # timestep (consistency)
+        t = torch.randint(0, diff_model.num_steps, (target_rel.size(0),), device=device)
+        
+        loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info)
+        loss = loss_v + noise_nll * 0.001
+            
         optimizer.zero_grad()
-        with autocast('cuda'):
+        loss.backward()
+        optimizer.step()        
+        
+        train_loss_v += (loss_v).item()
+        train_noise_nll += (noise_nll * 0.001).item()
+        train_loss += loss.item()
+
+        del cond, last_past_cond, target_rel, graph_batch, H, cond_H
+        del cond_info, t, loss_v, noise_nll
+
+    num_batches = len(train_dataloader)
+    
+    avg_train_loss_v = train_loss_v / num_batches
+    avg_train_noise_nll = train_noise_nll / num_batches
+    avg_train_loss = train_loss / num_batches
+
+
+    # --- Validation ---
+    diff_model.eval()
+    graph_encoder.eval()
+    
+    val_loss_v = 0
+    val_noise_nll = 0
+    val_total_loss = 0
+
+    with torch.no_grad():
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
             cond = batch["condition"].to(device)
             B, T_cond, _ = cond.shape
             _, T_target, _ = batch["target"].shape
@@ -212,7 +261,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                 if x_col in condition_columns and y_col in condition_columns:
                     target_x_indices.append(condition_columns.index(x_col))
                     target_y_indices.append(condition_columns.index(y_col))
-
+            
             last_past_cond = cond[:, -1]
             # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
             # initial_pos = torch.stack([
@@ -220,155 +269,24 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
             #     last_past_cond[:, target_y_indices]   # [B, 11]
             # ], dim=-1)  # [B, 11, 2]
             target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-            graph_batch = batch["graph"].to(device)    
+            graph_batch = batch["graph"].to(device)                        # HeteroData batch
+
             # graph → H
-            H = graph_encoder(graph_batch)                                       # [B, 256]
+            H = graph_encoder(graph_batch)                                      # [B, 256]
             cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-            
-            # All player + ball history trajectories
-            # hist = cond[:, :, target_idx].to(device) 
-            # hist_rep = history_encoder(hist)  # [B, 256]
-            # cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-            
-            # Concat conditions
-            # cond_info = torch.cat([cond_H, cond_hist], dim=1)
             cond_info = cond_H
-            # Preparing Self-conditioning data
-            # timestep (consistency)
-            t = torch.randint(0, diff_model.num_steps, (target_rel.size(0),), device=device)
             
-            s = None
-            if torch.rand(1, device=device) < self_conditioning_ratio:
-                with torch.no_grad():
-                    # 첫 번째 denoising step으로 x0 예측
-                    x_t, noise = diff_model.q_sample(target_rel, t)
-                    x_t_input = x_t.permute(0, 3, 2, 1)
-                    
-                    # 첫 번째 예측 (self_cond=None)
-                    z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                    eps_pred1 = z1[:, :2, :, :]
-                    
-                    # x0 예측값 계산 (다음 step의 self-conditioning input)
-                    a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                    x0_hat = x0_hat.permute(0, 3, 2, 1)
-                    
-                    s = x0_hat.detach()  # [B, T, 11, 2]
-                    
-                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
-
-            loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
-            loss = loss_v + noise_nll * 0.001
-            
-        # optimizer.zero_grad()
-        # loss.backward()
-        # optimizer.step()        
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        
-        train_loss_v += (loss_v).item()
-        train_noise_nll += (noise_nll * 0.001).item()
-        # train_player_mse += (player_mse * 0.05).item()
-
-        train_loss += loss.item()
-
-        # del cond, last_past_cond, target_rel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
-        del cond, last_past_cond, target_rel, graph_batch, H, cond_H
-        del cond_info, t, s, loss_v, noise_nll
-
-    num_batches = len(train_dataloader)
+            t = torch.randint(0, diff_model.num_steps, (B,), device=device)
     
-    avg_train_loss_v = train_loss_v / num_batches
-    avg_train_noise_nll = train_noise_nll / num_batches
-    # avg_train_player_mse = train_player_mse / num_batches
-    avg_train_loss = train_loss / num_batches
-
-
-    # --- Validation ---
-    diff_model.eval()
-    graph_encoder.eval()
-    # history_encoder.eval()
-    
-    val_loss_v = 0
-    val_noise_nll = 0
-    val_player_mse = 0
-    val_total_loss = 0
-
-    with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
-            with autocast('cuda'):
-                cond = batch["condition"].to(device)
-                B, T_cond, _ = cond.shape
-                _, T_target, _ = batch["target"].shape
-                target_columns = batch["target_columns"][0]
-                condition_columns = batch["condition_columns"][0]
-                
-                target_x_indices = []
-                target_y_indices = []
-                
-                for i in range(0, len(target_columns), 2):
-                    x_col = target_columns[i]
-                    y_col = target_columns[i + 1]
-                    
-                    if x_col in condition_columns and y_col in condition_columns:
-                        target_x_indices.append(condition_columns.index(x_col))
-                        target_y_indices.append(condition_columns.index(y_col))
-                
-                last_past_cond = cond[:, -1]
-                # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-                # initial_pos = torch.stack([
-                #     last_past_cond[:, target_x_indices],  # [B, 11]
-                #     last_past_cond[:, target_y_indices]   # [B, 11]
-                # ], dim=-1)  # [B, 11, 2]
-                target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-                graph_batch = batch["graph"].to(device)                        # HeteroData batch
-
-                # graph → H
-                H = graph_encoder(graph_batch)                                      # [B, 256]
-                cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-                
-                # Target's history trajectories
-                # hist = cond[:, :, target_idx].to(device)  # [B,256,11,T]
-                # hist_rep = history_encoder(hist)  # [B, 256]
-                # cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-                
-                # Concat conditions
-                # cond_info = torch.cat([cond_H, cond_hist], dim=1)
-                cond_info = cond_H
-                
-                t = torch.randint(0, diff_model.num_steps, (B,), device=device)
-                
-                s = None
-                if torch.rand(1, device=device) < self_conditioning_ratio:
-                    # 첫 번째 denoising step으로 x0 예측
-                    x_t, noise = diff_model.q_sample(target_rel, t)
-                    x_t_input = x_t.permute(0, 3, 2, 1)
-                    
-                    # 첫 번째 예측 (self_cond=None)
-                    z1 = diff_model.model(x_t_input, t, cond_info, self_cond=None)
-                    eps_pred1 = z1[:, :2, :, :]
-                    
-                    # x0 예측값 계산 (다음 step의 self-conditioning input)
-                    a_hat = diff_model.alpha_hat[t].view(-1, 1, 1, 1)
-                    x0_hat = (x_t_input - (1 - a_hat).sqrt() * eps_pred1) / a_hat.sqrt()
-                    x0_hat = x0_hat.permute(0, 3, 2, 1)
-                    
-                    s = x0_hat.detach() # [B, T, 11, 2]
-                    
-                    del x_t, noise, x_t_input, z1, eps_pred1, a_hat, x0_hat
-
-                loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info, self_cond=s)
-                val_loss = loss_v + noise_nll * 0.001
+            loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info)
+            val_loss = loss_v + noise_nll * 0.001
 
             val_loss_v += (loss_v).item()
             val_noise_nll += (noise_nll * 0.001).item()
-            # val_player_mse += (player_mse * 0.05).item()
             val_total_loss += val_loss.item()
 
-        # del cond, last_past_cond, target_rel, graph_batch, H, cond_H, hist, hist_rep, cond_hist
         del cond, last_past_cond, target_rel, graph_batch, H, cond_H
-        del cond_info, t, s, loss_v, noise_nll
+        del cond_info, t, loss_v, noise_nll
 
     num_batches = len(val_dataloader)
 
@@ -419,8 +337,7 @@ plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels,\n"
-          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers "
-          f"self-conditioning ratio: {self_conditioning_ratio}")
+          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers")
 plt.legend()
 plt.tight_layout()
 
@@ -453,6 +370,11 @@ graph_encoder.eval()
 
 all_ades = []
 all_fdes = []
+all_frechet_dist = []
+
+all_min_ades = []
+all_min_fdes = []
+all_min_frechet = []
 
 visualize_samples = 5
 visualized = False # If you want to visualize
@@ -474,7 +396,7 @@ rel_y_mean = torch.tensor(zscore_stats['rel_y_mean'], device=device)
 rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
 
 with torch.no_grad():        
-    for batch in tqdm(test_dataloader, desc="Test Streaming Inference", leave=True):
+    for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Streaming Inference", leave=True)):
         cond = batch["condition"].to(device)
         with autocast('cuda'):
             B, T_cond, _ = cond.shape
@@ -508,19 +430,13 @@ with torch.no_grad():
             # condition 준비
             H = graph_encoder(batch["graph"].to(device))
             cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-            
-            # hist = cond[:, :, target_idx].to(device)
-            # hist_rep = history_encoder(hist)
-            # cond_hist = hist_rep.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-            
-            # cond_info = torch.cat([cond_H, cond_hist], dim=1)  # (B, C, 11, T)
             cond_info = cond_H
             
-            pred = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=1)[0]  # (B, T, 11, 6)
+            preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
 
-        pred_rel_denorm = pred.clone()
-        pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
-        pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
+        # pred_rel_denorm = preds.clone()
+        # pred_rel_denorm[..., 0] = preds[..., 0] * rel_x_std + rel_x_mean
+        # pred_rel_denorm[..., 1] = preds[..., 1] * rel_y_std + rel_y_mean
         
         # 2. 기준점 비정규화
         ref_denorm = initial_pos.clone()
@@ -528,31 +444,110 @@ with torch.no_grad():
         ref_denorm[..., 1] = initial_pos[..., 1] * py_std + py_mean
         
         # 3. 예측 절대좌표 = 기준점 + 예측 상대좌표
-        pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
+        # pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
         
         # GT 절대좌표 비정규화
         target_abs_denorm = target_abs.clone()
         target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
         target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
         
-        # ADE, FDE Calculation (Meters)
-        ade = ((pred_absolute[...,:2] - target_abs_denorm[...,:2])**2).sum(-1).sqrt().mean((1,2))
-        fde = ((pred_absolute[:,-1,:,:2] - target_abs_denorm[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)
+        # Initialize arrays to store metrics for all samples
+        batch_ades_all_samples = []  # [num_samples, B]
+        batch_fdes_all_samples = []  # [num_samples, B]
+        batch_frechet_all_samples = []  # [num_samples, B]
+        
+        # Process each sample
+        for sample_idx in range(num_samples):
+            pred = preds[sample_idx]  # [B, T, 11, 2]
             
-        all_ades.extend(ade.cpu().tolist())
-        all_fdes.extend(fde.cpu().tolist())
+            # Denormalize predicted relative coordinates
+            pred_rel_denorm = pred.clone()
+            pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
+            pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
+            
+            # Convert to absolute coordinates
+            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
+            
+            # Calculate ADE and FDE
+            ade = ((pred_absolute[...,:2] - target_abs_denorm[...,:2])**2).sum(-1).sqrt().mean((1,2))  # [B]
+            fde = ((pred_absolute[:,-1,:,:2] - target_abs_denorm[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)  # [B]
+            
+            # Calculate Fréchet distance
+            pred_np = pred_absolute.cpu().numpy()      # [B,T,N,2]
+            target_np = target_abs_denorm.cpu().numpy()
+            B_, T, N, _ = pred_np.shape
+            batch_frechet = []
+            for b in range(B_):
+                per_player_frechet = []
+                for j in range(N):
+                    pred_traj = pred_np[b, :, j, :]
+                    target_traj = target_np[b, :, j, :]
+                    frechet_dist = calc_frechet_distance(pred_traj, target_traj)
+                    per_player_frechet.append(frechet_dist)
+                batch_frechet.append(np.mean(per_player_frechet))
+            
+            batch_ades_all_samples.append(ade.cpu())
+            batch_fdes_all_samples.append(fde.cpu())
+            batch_frechet_all_samples.append(torch.tensor(batch_frechet))
+        
+        # Convert to tensors for easier manipulation
+        batch_ades_tensor = torch.stack(batch_ades_all_samples)  # [num_samples, B]
+        batch_fdes_tensor = torch.stack(batch_fdes_all_samples)  # [num_samples, B]
+        batch_frechet_tensor = torch.stack(batch_frechet_all_samples)  # [num_samples, B]
+        
+        # Find minimum values across samples for each batch item
+        min_ades, _ = batch_ades_tensor.min(dim=0)  # [B]
+        min_fdes, _ = batch_fdes_tensor.min(dim=0)  # [B]
+        min_frechet, _ = batch_frechet_tensor.min(dim=0)  # [B]
+        
+        # Store results
+        all_min_ades.extend(min_ades.tolist())
+        all_min_fdes.extend(min_fdes.tolist())
+        all_min_frechet.extend(min_frechet.tolist())
+        
+        # Also store average results for comparison
+        avg_ades = batch_ades_tensor.mean(dim=0)
+        avg_fdes = batch_fdes_tensor.mean(dim=0)
+        avg_frechet = batch_frechet_tensor.mean(dim=0)
+        
+        all_ades.extend(avg_ades.tolist())
+        all_fdes.extend(avg_fdes.tolist())
+        all_frechet_dist.extend(avg_frechet.tolist())
+        
+        # Debug print
+        print(f"[Batch {batch_idx}] "
+              f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, Frechet={avg_frechet.mean():.3f} | "
+              f"Min - ADE={min_ades.mean():.3f}, FDE={min_fdes.mean():.3f}, Frechet={min_frechet.mean():.3f}")
         
         # Visualization (1st batch)
         if not visualized:
-            base_dir = "results/test_trajs"
+            base_dir = "results/test_trajs_best_ade_cosine"
             os.makedirs(base_dir, exist_ok=True)
+
+            # 🔥 핵심: 모든 샘플의 절대 좌표를 저장
+            all_pred_absolutes = []
+            for sample_idx in range(num_samples):
+                pred = preds[sample_idx]  # [B, T, 11, 2]
+                
+                # Denormalize predicted relative coordinates
+                pred_rel_denorm = pred.clone()
+                pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
+                pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
+                
+                # Convert to absolute coordinates
+                pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
+                all_pred_absolutes.append(pred_absolute.cpu().numpy())
+            
+            all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
+
+            best_ade_indices = batch_ades_tensor.argmin(dim=0)  # [B]
 
             for i in range(min(B, visualize_samples)):
                 other_cols = batch["other_columns"][i]
                 target_cols = batch["target_columns"][i]
                 
-                # Other Trajectories Denormalization
-                other_seq = batch["other"][i].view(T_target, -1, 2).to(device)          # [T, 12, 2]
+                # Other Trajectories Denormalization (기존과 동일)
+                other_seq = batch["other"][i].view(T_target, -1, 2).to(device)
                 other_den = torch.zeros_like(other_seq)
                 for j in range(other_seq.size(1)):
                     x_col = other_cols[2 * j]
@@ -565,17 +560,23 @@ with torch.no_grad():
 
                     other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                     other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
+
+                best_sample_idx = best_ade_indices[i].item()
+                pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
                 
-                pred_traj = pred_absolute[i].cpu().numpy()
                 target_traj = target_abs_denorm[i].cpu().numpy()
-                other_traj  = other_den.cpu().numpy()
+                other_traj = other_den.cpu().numpy()
+
+                best_ade = batch_ades_tensor[best_sample_idx, i].item()
+                best_fde = batch_fdes_tensor[best_sample_idx, i].item()
+                best_frechet = batch_frechet_tensor[best_sample_idx, i].item()
                 
-                folder = os.path.join(base_dir, f"sample{i:02d}")
+                folder = os.path.join(base_dir, f"sample{i:02d}_best_ade")
                 os.makedirs(folder, exist_ok=True)
                 
                 defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
                 for idx, jersey in enumerate(defender_nums):
-                    save_path = os.path.join(folder, f"player_{jersey:02d}.png")
+                    save_path = os.path.join(folder, f"player_{jersey:02d}_best_ade.png")
                     plot_trajectories_on_pitch(
                         other_traj, target_traj, pred_traj,
                         other_columns=other_cols, target_columns=target_cols, player_idx=idx,
@@ -584,8 +585,7 @@ with torch.no_grad():
 
             visualized = True
         
-        del pred, pred_rel_denorm, pred_absolute, target_abs_denorm, ref_denorm, ade, fde
-        # del cond, target_rel, target_abs, initial_pos, H, cond_H, hist, hist_rep, cond_hist, cond_info
+        del preds, pred_rel_denorm, pred_absolute, target_abs_denorm, ref_denorm, ade, fde
         del cond, target_rel, target_abs, initial_pos, H, cond_H, cond_info
         torch.cuda.empty_cache()
         gc.collect()
@@ -593,3 +593,9 @@ with torch.no_grad():
 # print(f"Best-of-{num_samples} Sampling:")
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
+print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
+
+print(f"Best-of-{num_samples} Sampling (min):")
+print(f"minADE{num_samples}: {np.mean(all_min_ades):.3f} ± {np.std(all_min_ades):.3f} meters")
+print(f"minFDE{num_samples}: {np.mean(all_min_fdes):.3f} ± {np.std(all_min_fdes):.3f} meters")
+print(f"minFréchet{num_samples}: {np.mean(all_min_frechet):.3f} ± {np.std(all_min_frechet):.3f} meters")
