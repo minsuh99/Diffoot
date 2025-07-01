@@ -1,6 +1,5 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import gc
 import logging
 import torch
@@ -11,7 +10,6 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.amp import autocast, GradScaler
 from models.diff_modules import diff_CSDI
 from models.diff_model import DiffusionTrajectoryModel
 from models.encoder import InteractionGraphEncoder
@@ -153,10 +151,8 @@ in_dim = graph['Node'].x.size(1)
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim, out_dim=side_dim).to(device)
 denoiser = diff_CSDI(csdi_config)
 diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
-
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
-scaler = GradScaler()
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
@@ -164,13 +160,12 @@ logger.info(f"Denoiser (diff_CSDI): {denoiser}")
 logger.info(f"DiffusionTrajectoryModel: {diff_model}")
 
 # 4. Train
-best_state_dict = None
+best_model_path = None
+timestamp = datetime.now().strftime('%m%d')
 best_val_loss = float("inf")
 
 train_losses = []
 val_losses   = []
-
-first_batch_debug = True
 
 for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     diff_model.train()
@@ -199,15 +194,11 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                 target_y_indices.append(condition_columns.index(y_col))
 
         last_past_cond = cond[:, -1]
-        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-        # initial_pos = torch.stack([
-        #     last_past_cond[:, target_x_indices],  # [B, 11]
-        #     last_past_cond[:, target_y_indices]   # [B, 11]
-        # ], dim=-1)  # [B, 11, 2]
+
         target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-        graph_batch = batch["graph"].to(device)    
+        graph_batch = batch["graph"].to(device) # HeteroData batch
         # graph → H
-        H = graph_encoder(graph_batch)                                # [B, 256]
+        H = graph_encoder(graph_batch) # [B, 256]
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         cond_info = cond_H
 
@@ -263,16 +254,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                     target_y_indices.append(condition_columns.index(y_col))
             
             last_past_cond = cond[:, -1]
-            # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-            # initial_pos = torch.stack([
-            #     last_past_cond[:, target_x_indices],  # [B, 11]
-            #     last_past_cond[:, target_y_indices]   # [B, 11]
-            # ], dim=-1)  # [B, 11, 2]
+
             target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-            graph_batch = batch["graph"].to(device)                        # HeteroData batch
+            graph_batch = batch["graph"].to(device) # HeteroData batch
 
             # graph → H
-            H = graph_encoder(graph_batch)                                      # [B, 256]
+            H = graph_encoder(graph_batch) # [B, 256]
             cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
             cond_info = cond_H
             
@@ -292,7 +279,6 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
     avg_val_loss_v = val_loss_v / num_batches
     avg_val_noise_nll = val_noise_nll / num_batches
-    # avg_val_player_mse = val_player_mse / num_batches
     avg_val_loss = val_total_loss / num_batches
 
     train_losses.append(avg_train_loss)
@@ -307,16 +293,32 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
                f"[Validation] Val Loss: {avg_val_loss:.6f} | Noise Loss: {avg_val_loss_v:.6f} | NLL Loss: {avg_val_noise_nll:.6f}")
 
     scheduler.step(avg_val_loss)
-    # scheduler.step()
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
+        
+        if best_model_path and os.path.exists(best_model_path):
+            os.remove(best_model_path)
+        best_model_path = os.path.join(model_save_path, f'{timestamp}_best_model_epoch_{epoch}.pth')
+        
         best_state_dict = {
             'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
             'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
-            # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
             'zscore_stats': zscore_stats
         }
+        
+        torch.save({
+            'epoch': epoch,
+            'diff_model': diff_model.state_dict(),
+            'graph_encoder': graph_encoder.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'zscore_stats': zscore_stats,
+            'hyperparams': hyperparams
+        }, best_model_path)
     
     torch.cuda.empty_cache()
     gc.collect()
@@ -340,33 +342,17 @@ plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_con
           f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers")
 plt.legend()
 plt.tight_layout()
-
-# plt.savefig('results/0603_diffusion_lr_curve.png')
-timestamp = datetime.now().strftime('%m%d')
 plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
 
 plt.show()
 plt.close()
 
-final_state = {
-    'diff_model': {k: v.cpu().clone() for k, v in diff_model.state_dict().items()},
-    'graph_encoder': {k: v.cpu().clone() for k, v in graph_encoder.state_dict().items()},
-    # 'history_encoder': {k: v.cpu().clone() for k, v in history_encoder.state_dict().items()},
-    'zscore_stats': zscore_stats,
-    'train_losses': train_losses,
-    'val_losses': val_losses
-}
-
-torch.save(final_state, './results/final_model_latest.pth')
-
 # 5. Inference (Best-of-N Sampling) & Visualization
-diff_model.load_state_dict(best_state_dict['diff_model'])
-graph_encoder.load_state_dict(best_state_dict['graph_encoder'])
-# history_encoder.load_state_dict(best_state_dict['history_encoder'])
+diff_model.load_state_dict({k: v.to(device) for k, v in best_state_dict['diff_model'].items()})
+graph_encoder.load_state_dict({k: v.to(device) for k, v in best_state_dict['graph_encoder'].items()})
 
 diff_model.eval()
 graph_encoder.eval()
-# history_encoder.eval()
 
 all_ades = []
 all_fdes = []
@@ -375,10 +361,6 @@ all_frechet_dist = []
 all_min_ades = []
 all_min_fdes = []
 all_min_frechet = []
-
-visualize_samples = 5
-visualized = False # If you want to visualize
-# visualized = True
 
 px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
 px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
@@ -433,18 +415,11 @@ with torch.no_grad():
         
         preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
 
-        # pred_rel_denorm = preds.clone()
-        # pred_rel_denorm[..., 0] = preds[..., 0] * rel_x_std + rel_x_mean
-        # pred_rel_denorm[..., 1] = preds[..., 1] * rel_y_std + rel_y_mean
-        
         # 2. 기준점 비정규화
         ref_denorm = initial_pos.clone()
         ref_denorm[..., 0] = initial_pos[..., 0] * px_std + px_mean
         ref_denorm[..., 1] = initial_pos[..., 1] * py_std + py_mean
-        
-        # 3. 예측 절대좌표 = 기준점 + 예측 상대좌표
-        # pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
-        
+
         # GT 절대좌표 비정규화
         target_abs_denorm = target_abs.clone()
         target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
@@ -518,70 +493,66 @@ with torch.no_grad():
               f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, Frechet={avg_frechet.mean():.3f} | "
               f"Min - ADE={min_ades.mean():.3f}, FDE={min_fdes.mean():.3f}, Frechet={min_frechet.mean():.3f}")
         
-        # Visualization (1st batch)
-        if not visualized:
-            base_dir = "results/test_trajs_best_ade_cosine"
-            os.makedirs(base_dir, exist_ok=True)
+        # Visualization
+        base_dir = "results/test_trajs_best_ade_cosine"
+        os.makedirs(base_dir, exist_ok=True)
 
-            all_pred_absolutes = []
-            for sample_idx in range(num_samples):
-                pred = preds[sample_idx]  # [B, T, 11, 2]
-                
-                # Denormalize predicted relative coordinates
-                pred_rel_denorm = pred.clone()
-                pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
-                pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
-                
-                # Convert to absolute coordinates
-                pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
-                all_pred_absolutes.append(pred_absolute.cpu().numpy())
+        all_pred_absolutes = []
+        for sample_idx in range(num_samples):
+            pred = preds[sample_idx]  # [B, T, 11, 2]
             
-            all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
+            # Denormalize predicted relative coordinates
+            pred_rel_denorm = pred.clone()
+            pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
+            pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
+            
+            # Convert to absolute coordinates
+            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
+            all_pred_absolutes.append(pred_absolute.cpu().numpy())
+        
+        all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
 
-            best_ade_indices = batch_ades_tensor.argmin(dim=0)  # [B]
+        best_ade_indices = batch_ades_tensor.argmin(dim=0)  # [B]
 
-            for i in range(min(B, visualize_samples)):
-                other_cols = batch["other_columns"][i]
-                target_cols = batch["target_columns"][i]
-                
-                # Other Trajectories Denormalization (기존과 동일)
-                other_seq = batch["other"][i].view(T_target, -1, 2).to(device)
-                other_den = torch.zeros_like(other_seq)
-                for j in range(other_seq.size(1)):
-                    x_col = other_cols[2 * j]
-                    if x_col == "ball_x":
-                        x_mean, x_std = bx_mean, bx_std
-                        y_mean, y_std = by_mean, by_std
-                    else:
-                        x_mean, x_std = px_mean, px_std
-                        y_mean, y_std = py_mean, py_std
+        for i in range(B):
+            other_cols = batch["other_columns"][i]
+            target_cols = batch["target_columns"][i]
+            
+            # Other Trajectories Denormalization
+            other_seq = batch["other"][i].view(T_target, -1, 2).to(device)
+            other_den = torch.zeros_like(other_seq)
+            for j in range(other_seq.size(1)):
+                x_col = other_cols[2 * j]
+                if x_col == "ball_x":
+                    x_mean, x_std = bx_mean, bx_std
+                    y_mean, y_std = by_mean, by_std
+                else:
+                    x_mean, x_std = px_mean, px_std
+                    y_mean, y_std = py_mean, py_std
 
-                    other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
-                    other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
+                other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
+                other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
-                best_sample_idx = best_ade_indices[i].item()
-                pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
-                
-                target_traj = target_abs_denorm[i].cpu().numpy()
-                other_traj = other_den.cpu().numpy()
+            best_sample_idx = best_ade_indices[i].item()
+            pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
+            
+            target_traj = target_abs_denorm[i].cpu().numpy()
+            other_traj = other_den.cpu().numpy()
 
-                best_ade = batch_ades_tensor[best_sample_idx, i].item()
-                best_fde = batch_fdes_tensor[best_sample_idx, i].item()
-                best_frechet = batch_frechet_tensor[best_sample_idx, i].item()
-                
-                folder = os.path.join(base_dir, f"sample{i:02d}_best_ade")
-                os.makedirs(folder, exist_ok=True)
-                
-                defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
-                for idx, jersey in enumerate(defender_nums):
-                    save_path = os.path.join(folder, f"player_{jersey:02d}_best_ade.png")
-                    plot_trajectories_on_pitch(
-                        other_traj, target_traj, pred_traj,
-                        other_columns=other_cols, target_columns=target_cols, player_idx=idx,
-                        annotate=True, save_path=save_path
-                    )
+            best_ade = batch_ades_tensor[best_sample_idx, i].item()
+            best_fde = batch_fdes_tensor[best_sample_idx, i].item()
+            best_frechet = batch_frechet_tensor[best_sample_idx, i].item()
 
-            visualized = True
+            defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
+
+            folder = os.path.join(base_dir, f"batch_{batch_idx:03d}")
+            os.makedirs(folder, exist_ok=True)
+
+            save_path = os.path.join(folder, f"sample_{i:02d}.png")
+            plot_trajectories_on_pitch(
+                other_traj, target_traj, pred_traj, other_columns=other_cols, 
+                defenders_num=defender_nums, annotate=True, save_path=save_path
+            )
         
         del preds, pred_rel_denorm, pred_absolute, target_abs_denorm, ref_denorm, ade, fde
         del cond, target_rel, target_abs, initial_pos, H, cond_H, cond_info
