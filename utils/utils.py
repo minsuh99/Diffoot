@@ -464,8 +464,13 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
         if annotate and other_columns is not None:
             col_x = other_columns[2 * m]  # e.g. 'Home_2_x'
             jersey = col_x.split('_')[1]
-            x0, y0 = others[-1, m, 0], others[-1, m, 1]
-            ax.text(x0 + 0.5, y0 + 0.5, jersey, color='red', fontsize=10)
+            square_size = 2.0
+            square = plt.Rectangle((x[-1] - square_size/2, y[-1] - square_size/2), 
+                                square_size, square_size, 
+                                color='red', alpha=0.9, zorder=10)
+            ax.add_patch(square)
+            ax.text(x[-1], y[-1], jersey, color='white', fontsize=10, fontweight='bold',
+                    ha='center', va='center', zorder=11)
     # ball
     ball_x, ball_y = others[:, 11, 0], others[:, 11, 1]
     ax.plot(ball_x, ball_y, color='black', linestyle='-', linewidth=2.0, alpha = 1.0, label='Ball')
@@ -476,22 +481,27 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
     
     for i in range(num_defenders):
         x, y = target[:, i, 0], target[:, i, 1]
-        ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=0.7, label='Target' if i == 0 else None)
-        ax.scatter(x[-1], y[-1], color='blue', s=50, marker='o', alpha=0.7)
+        ax.plot(x, y, color='blue', linestyle='-', linewidth=2.0, alpha=1.0, label='Target' if i == 0 else None)
+        ax.scatter(x[-1], y[-1], color='blue', s=50, marker='o', alpha=1.0)
         
         if annotate and defenders_num is not None:
             jersey = defenders_num[i]
             x0, y0 = target[-1, i, 0], target[-1, i, 1]
-            ax.text(x0 + 0.5, y0 + 0.5, f"{jersey}", color='blue', fontsize=10)
+            square_size = 2.0
+            square_gt = plt.Rectangle((x0 - square_size/2, y0 - square_size/2), 
+                                     square_size, square_size, 
+                                     color='blue', alpha=0.9, zorder=10)
+            ax.add_patch(square_gt)
+            ax.text(x0, y0, jersey, color='white', fontsize=10, fontweight='bold',
+                    ha='center', va='center', zorder=11)
 
         x, y = pred[:, i, 0], pred[:, i, 1]
-        ax.plot(x, y, color='blue', linestyle='--', linewidth=2.0, alpha=0.5, label='Predicted' if i == 0 else None)
-        ax.scatter(x[-1], y[-1], color='blue', s=50, marker='x', alpha=0.5)
+        ax.plot(x, y, color='navy', linestyle='--', linewidth=2.0, alpha=0.8, label='Predicted' if i == 0 else None)
+        ax.scatter(x[-1], y[-1], color='navy', s=100, marker='x', alpha=0.8)
 
-        if annotate and defenders_num is not None:
-            jersey = defenders_num[i]
-            x0, y0 = pred[-1, i, 0], pred[-1, i, 1]
-            ax.text(x0 - 0.5, y0 - 0.5, f"{jersey}(pred)", color='blue', fontsize=10)
+        # if annotate and defenders_num is not None:
+        #     jersey = defenders_num[i]
+        #     x0, y0 = pred[-1, i, 0], pred[-1, i, 1]
 
     ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=True)
 

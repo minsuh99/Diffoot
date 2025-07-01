@@ -397,7 +397,7 @@ with torch.no_grad():
                 target_y_indices.append(condition_columns.index(y_col))
         
         last_past_cond = cond[:, -1]
-        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+
         initial_pos = torch.stack([
             last_past_cond[:, target_x_indices],  # [B, 11]
             last_past_cond[:, target_y_indices]   # [B, 11]
@@ -494,7 +494,8 @@ with torch.no_grad():
               f"Min - ADE={min_ades.mean():.3f}, FDE={min_fdes.mean():.3f}, Frechet={min_frechet.mean():.3f}")
         
         # Visualization
-        base_dir = "results/test_trajs_best_ade_cosine"
+        timestamp = datetime.now().strftime('%m%d')
+        base_dir = f"results/{timestamp}_test_trajs_best_ade"
         os.makedirs(base_dir, exist_ok=True)
 
         all_pred_absolutes = []
