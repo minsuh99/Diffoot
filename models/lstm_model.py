@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class DefenseTrajectoryPredictorLSTM(nn.Module):
-    def __init__(self, input_dim=44, hidden_dim=256, num_layers=2, output_dim=2200, dropout=0.1):
+    def __init__(self, input_dim=22, hidden_dim=256, num_layers=2, output_dim=2200, dropout=0.1):
         super().__init__()
 
         self.lstm = nn.LSTM(

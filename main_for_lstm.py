@@ -147,10 +147,9 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
         
         target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
-        target_rel_flat = target_rel.view(target_rel.size(0), -1) # [B, T_target * 22]
 
-        pred = model(past_rel_coords)  # [B, T_target * 22]
-        loss = criterion(pred, target_rel_flat)
+        pred = model(past_rel_coords)  # [B, T_target, 22]
+        loss = criterion(pred, target_rel)
         
         optimizer.zero_grad()
         loss.backward()
@@ -158,7 +157,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
         train_loss += loss.item()
         
-        del past_rel_coords, target_rel, target_rel_flat, pred, loss
+        del past_rel_coords, target_rel, pred, loss
 
     num_batches = len(train_dataloader)
     avg_train_loss = train_loss / num_batches
@@ -172,14 +171,13 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
             past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
 
             target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
-            target_rel_flat = target_rel.view(target_rel.size(0), -1)  # [B, T_target * 22]
 
-            pred = model(past_rel_coords)  # [B, T_target * 22]
-            
-            loss = criterion(pred, target_rel_flat)
+            pred = model(past_rel_coords)  # [B, T_target, 22]
+
+            loss = criterion(pred, target_rel)
             val_loss += loss.item()
-            
-            del past_rel_coords, target_rel, target_rel_flat, pred, loss
+
+            del past_rel_coords, target_rel, pred, loss
 
     avg_val_loss = val_loss / len(val_dataloader)
 
@@ -276,9 +274,8 @@ with torch.no_grad():
         _, T_target, _ = batch["target"].shape
         
         # Predict
-        pred_rel_flat = model(past_rel_coords)  # [B, T_target * 22]
-        pred_rel = pred_rel_flat.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
-        
+        pred_rel = model(past_rel_coords)  # [B, T_target, 22]
+
         # Ground truth
         target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
         target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
@@ -369,7 +366,7 @@ with torch.no_grad():
                 defenders_num=defender_nums, annotate=True, save_path=save_path
             )
         
-        del pred_rel_flat, pred_rel, pred_rel_denorm, pred_absolute, target_abs_denorm, ade, fde
+        del pred_rel, pred_rel_denorm, pred_absolute, target_abs_denorm, ade, fde
         del past_rel_coords, target_abs, target_rel, ref_pos, ref_denorm
         torch.cuda.empty_cache()
         gc.collect()
