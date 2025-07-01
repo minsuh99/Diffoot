@@ -398,41 +398,40 @@ rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
 with torch.no_grad():        
     for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Streaming Inference", leave=True)):
         cond = batch["condition"].to(device)
-        with autocast('cuda'):
-            B, T_cond, _ = cond.shape
-            _, T_target, _ = batch["target"].shape
-            target_columns = batch["target_columns"][0]
-            condition_columns = batch["condition_columns"][0]
+        B, T_cond, _ = cond.shape
+        _, T_target, _ = batch["target"].shape
+        target_columns = batch["target_columns"][0]
+        condition_columns = batch["condition_columns"][0]
+        
+        target_x_indices = []
+        target_y_indices = []
+        
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]
+            y_col = target_columns[i + 1]
             
-            target_x_indices = []
-            target_y_indices = []
-            
-            for i in range(0, len(target_columns), 2):
-                x_col = target_columns[i]
-                y_col = target_columns[i + 1]
-                
-                if x_col in condition_columns and y_col in condition_columns:
-                    target_x_indices.append(condition_columns.index(x_col))
-                    target_y_indices.append(condition_columns.index(y_col))
-            
-            last_past_cond = cond[:, -1]
-            # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
-            initial_pos = torch.stack([
-                last_past_cond[:, target_x_indices],  # [B, 11]
-                last_past_cond[:, target_y_indices]   # [B, 11]
-            ], dim=-1)  # [B, 11, 2]
-            
-            target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
-            target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
+            if x_col in condition_columns and y_col in condition_columns:
+                target_x_indices.append(condition_columns.index(x_col))
+                target_y_indices.append(condition_columns.index(y_col))
+        
+        last_past_cond = cond[:, -1]
+        # initial_pos: [B, 11, 2] - 각 수비수의 마지막 위치
+        initial_pos = torch.stack([
+            last_past_cond[:, target_x_indices],  # [B, 11]
+            last_past_cond[:, target_y_indices]   # [B, 11]
+        ], dim=-1)  # [B, 11, 2]
+        
+        target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
+        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
 
-            graph_batch = batch["graph"].to(device)
+        graph_batch = batch["graph"].to(device)
 
-            # condition 준비
-            H = graph_encoder(batch["graph"].to(device))
-            cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
-            cond_info = cond_H
-            
-            preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
+        # condition 준비
+        H = graph_encoder(batch["graph"].to(device))
+        cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
+        cond_info = cond_H
+        
+        preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
 
         # pred_rel_denorm = preds.clone()
         # pred_rel_denorm[..., 0] = preds[..., 0] * rel_x_std + rel_x_mean
@@ -524,7 +523,6 @@ with torch.no_grad():
             base_dir = "results/test_trajs_best_ade_cosine"
             os.makedirs(base_dir, exist_ok=True)
 
-            # 🔥 핵심: 모든 샘플의 절대 좌표를 저장
             all_pred_absolutes = []
             for sample_idx in range(num_samples):
                 pred = preds[sample_idx]  # [B, T, 11, 2]
