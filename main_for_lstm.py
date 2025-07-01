@@ -144,55 +144,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc="Batch Training...", leave=False):
-        condition = batch["condition"].to(device)
-        target_columns = batch["target_columns"][0]
-        condition_columns = batch["condition_columns"][0]
+        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
         
-        B, T_cond, _ = condition.shape
-        _, T_target, _ = batch["target"].shape
-        
-        # Get target player indices from condition
-        target_x_indices = []
-        target_y_indices = []
-        
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                target_x_indices.append(condition_columns.index(x_col))
-                target_y_indices.append(condition_columns.index(y_col))
-        
-        # Extract absolute positions from condition (last frame as reference)
-        last_past_cond = condition[:, -1]  # [B, Features]
-        
-        # Reference positions (last frame of condition)
-        initial_pos = torch.stack([
-            last_past_cond[:, target_x_indices],  # [B, 11]
-            last_past_cond[:, target_y_indices]   # [B, 11]
-        ], dim=-1)  # [B, 11, 2]
-        
-        # Create relative coordinates for input (condition)
-        past_rel_coords = []
-        for t in range(T_cond):
-            current_pos = torch.stack([
-                condition[:, t, target_x_indices],  # [B, 11]
-                condition[:, t, target_y_indices]   # [B, 11]
-            ], dim=-1)  # [B, 11, 2]
-            
-            # Relative to the initial position (last frame of condition)
-            rel_pos = current_pos - initial_pos.unsqueeze(1).expand(-1, 1, -1, -1).squeeze(1)  # [B, 11, 2]
-            past_rel_coords.append(rel_pos.view(B, -1))  # [B, 22]
-        
-        past_rel_coords = torch.stack(past_rel_coords, dim=1)  # [B, T_cond, 22]
-        
-        # Target: use target_relative from batch
         target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
-        target_rel_flat = target_rel.view(B, -1)  # [B, T_target * 22]
-        
-        # Forward pass
+        target_rel_flat = target_rel.view(target_rel.size(0), -1) # [B, T_target * 22]
+
         pred = model(past_rel_coords)  # [B, T_target * 22]
-        
         loss = criterion(pred, target_rel_flat)
         
         optimizer.zero_grad()
@@ -201,8 +158,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
         train_loss += loss.item()
         
-        del condition, target_rel, target_rel_flat, past_rel_coords, pred, loss
-        del last_past_cond, initial_pos
+        del past_rel_coords, target_rel, target_rel_flat, pred, loss
 
     num_batches = len(train_dataloader)
     avg_train_loss = train_loss / num_batches
@@ -213,55 +169,17 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation", leave=False):
-            condition = batch["condition"].to(device)
-            target_columns = batch["target_columns"][0]
-            condition_columns = batch["condition_columns"][0]
-            
-            B, T_cond, _ = condition.shape
-            _, T_target, _ = batch["target"].shape
+            past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
 
-            target_x_indices = []
-            target_y_indices = []
-            
-            for i in range(0, len(target_columns), 2):
-                x_col = target_columns[i]
-                y_col = target_columns[i + 1]
-                
-                if x_col in condition_columns and y_col in condition_columns:
-                    target_x_indices.append(condition_columns.index(x_col))
-                    target_y_indices.append(condition_columns.index(y_col))
-
-            last_past_cond = condition[:, -1]
-
-            initial_pos = torch.stack([
-                last_past_cond[:, target_x_indices],  # [B, 11]
-                last_past_cond[:, target_y_indices]   # [B, 11]
-            ], dim=-1)  # [B, 11, 2]
-
-            past_rel_coords = []
-            for t in range(T_cond):
-                current_pos = torch.stack([
-                    condition[:, t, target_x_indices],  # [B, 11]
-                    condition[:, t, target_y_indices]   # [B, 11]
-                ], dim=-1)  # [B, 11, 2]
-
-                rel_pos = current_pos - initial_pos.unsqueeze(1).expand(-1, 1, -1, -1).squeeze(1)  # [B, 11, 2]
-                past_rel_coords.append(rel_pos.view(B, -1))  # [B, 22]
-            
-            past_rel_coords = torch.stack(past_rel_coords, dim=1)  # [B, T_cond, 22]
-            
-            # Target: use target_relative from batch
             target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
-            target_rel_flat = target_rel.view(B, -1)  # [B, T_target * 22]
-            
-            # Forward pass
+            target_rel_flat = target_rel.view(target_rel.size(0), -1)  # [B, T_target * 22]
+
             pred = model(past_rel_coords)  # [B, T_target * 22]
             
             loss = criterion(pred, target_rel_flat)
             val_loss += loss.item()
             
-            del condition, target_rel, target_rel_flat, past_rel_coords, pred, loss
-            del last_past_cond, initial_pos
+            del past_rel_coords, target_rel, target_rel_flat, pred, loss
 
     avg_val_loss = val_loss / len(val_dataloader)
 
@@ -350,47 +268,14 @@ rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
 
 with torch.no_grad():
     for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Inference", leave=True)):
-        condition = batch["condition"].to(device)
-        target_columns = batch["target_columns"][0]
-        condition_columns = batch["condition_columns"][0]
+        # Simplified: use pre-computed condition_relative
+        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
         
-        B, T_cond, _ = condition.shape
+        # Get shape info
+        B, T_cond, _ = past_rel_coords.shape
         _, T_target, _ = batch["target"].shape
-
-        # Get target player indices from condition
-        target_x_indices = []
-        target_y_indices = []
         
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                target_x_indices.append(condition_columns.index(x_col))
-                target_y_indices.append(condition_columns.index(y_col))
-        
-        # Extract absolute positions from condition (last frame as reference)
-        last_past_cond = condition[:, -1]  # [B, Features]
-        
-        # Reference positions (last frame of condition)
-        initial_pos = torch.stack([
-            last_past_cond[:, target_x_indices],  # [B, 11]
-            last_past_cond[:, target_y_indices]   # [B, 11]
-        ], dim=-1)  # [B, 11, 2]
-        
-        # Create relative coordinates for input (condition)
-        past_rel_coords = []
-        for t in range(T_cond):
-            current_pos = torch.stack([
-                condition[:, t, target_x_indices],  # [B, 11]
-                condition[:, t, target_y_indices]   # [B, 11]
-            ], dim=-1)  # [B, 11, 2]
-            
-            # Relative to the initial position (last frame of condition)
-            rel_pos = current_pos - initial_pos.unsqueeze(1).expand(-1, 1, -1, -1).squeeze(1)  # [B, 11, 2]
-            past_rel_coords.append(rel_pos.view(B, -1))  # [B, 22]
-        
-        past_rel_coords = torch.stack(past_rel_coords, dim=1)  # [B, T_cond, 22]
+        # Predict
         pred_rel_flat = model(past_rel_coords)  # [B, T_target * 22]
         pred_rel = pred_rel_flat.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
         
@@ -398,20 +283,19 @@ with torch.no_grad():
         target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
         target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
 
-        # Denormalize reference positions
-        ref_denorm = initial_pos.clone()
-        ref_denorm[..., 0] = initial_pos[..., 0] * px_std + px_mean
-        ref_denorm[..., 1] = initial_pos[..., 1] * py_std + py_mean
+        condition_reference = batch["condition_reference"].to(device)  # [B, 22]
+        ref_pos = condition_reference.view(B, 11, 2)  # [B, 11, 2]
 
-        # Denormalize predicted relative coordinates
+        ref_denorm = ref_pos.clone()
+        ref_denorm[..., 0] = ref_pos[..., 0] * px_std + px_mean
+        ref_denorm[..., 1] = ref_pos[..., 1] * py_std + py_mean
+
         pred_rel_denorm = pred_rel.clone()
         pred_rel_denorm[..., 0] = pred_rel[..., 0] * rel_x_std + rel_x_mean
         pred_rel_denorm[..., 1] = pred_rel[..., 1] * rel_y_std + rel_y_mean
-        
-        # Convert to absolute coordinates
+
         pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T_target, 11, 2]
 
-        # Denormalize ground truth absolute coordinates
         target_abs_denorm = target_abs.clone()
         target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
         target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
@@ -444,7 +328,7 @@ with torch.no_grad():
               f"ADE={ade.mean():.3f}, FDE={fde.mean():.3f}, Frechet={np.mean(batch_frechet):.3f}")
 
         # Visualization
-        base_dir = "results/test_trajs_lstm_relative"
+        base_dir = "results/test_trajs_lstm_simplified"
         os.makedirs(base_dir, exist_ok=True)
 
         for i in range(B):
@@ -486,7 +370,7 @@ with torch.no_grad():
             )
         
         del pred_rel_flat, pred_rel, pred_rel_denorm, pred_absolute, target_abs_denorm, ade, fde
-        del condition, target_abs, target_rel, past_rel_coords, initial_pos, ref_denorm
+        del past_rel_coords, target_abs, target_rel, ref_pos, ref_denorm
         torch.cuda.empty_cache()
         gc.collect()
 

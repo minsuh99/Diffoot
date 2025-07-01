@@ -497,7 +497,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
 
         x, y = pred[:, i, 0], pred[:, i, 1]
         ax.plot(x, y, color='navy', linestyle='--', linewidth=2.0, alpha=0.8, label='Predicted' if i == 0 else None)
-        ax.scatter(x[-1], y[-1], color='navy', s=100, marker='x', alpha=0.8)
+        ax.scatter(x[-1], y[-1], color='navy', s=100, marker='x', alpha=1.0)
 
         # if annotate and defenders_num is not None:
         #     jersey = defenders_num[i]
