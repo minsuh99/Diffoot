@@ -240,7 +240,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=12, zscore_stats = None):
+    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=12, zscore_stats = None, use_graph=True):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -256,6 +256,7 @@ class CustomDataset(Dataset):
         self.load_all_matches(data_root)
         self.graph_cache = {}
         self.max_graph_cache_size = 5000
+        self.use_graph = use_graph
     
     # Preprocess raw match data and extract valid trajectory segments
     def load_all_matches(self, data_root):
@@ -714,24 +715,25 @@ class CustomDataset(Dataset):
             "pitch_scale": (x_scale, y_scale),
             "zscore_stats": self.zscore_stats
         }
-        if idx not in self.graph_cache:
-            if len(self.graph_cache) >= self.max_graph_cache_size:
-                oldest_idx = next(iter(self.graph_cache))
-                del self.graph_cache[oldest_idx]
+        if self.use_graph:
+            if idx not in self.graph_cache:
+                if len(self.graph_cache) >= self.max_graph_cache_size:
+                    oldest_idx = next(iter(self.graph_cache))
+                    del self.graph_cache[oldest_idx]
+                    
+                self.graph_cache[idx] = build_graph_sequence_from_condition({
+                    "condition": condition_tensor,
+                    "condition_columns": sample["condition_columns"],
+                    "pitch_scale": sample["pitch_scale"],
+                    "zscore_stats": self.zscore_stats
+                })
                 
-            self.graph_cache[idx] = build_graph_sequence_from_condition({
-                "condition": condition_tensor,
-                "condition_columns": sample["condition_columns"],
-                "pitch_scale": sample["pitch_scale"],
-                "zscore_stats": self.zscore_stats
-            })
-            
-        sample["graph"] = self.graph_cache[idx]
+            sample["graph"] = self.graph_cache[idx]
         
         return sample
     
 class ApplyAugmentedDataset(Dataset):
-    def __init__(self, base_dataset, flip_prob = 0.7):
+    def __init__(self, base_dataset, flip_prob = 0.7, use_graph=True):
         self.base = base_dataset
         if isinstance(base_dataset, Subset):
             self.zscore_stats = base_dataset.dataset.zscore_stats
@@ -741,6 +743,7 @@ class ApplyAugmentedDataset(Dataset):
         self.flip_N = int(self.N * flip_prob)
         self.total = self.N + self.flip_N
         self.flip_indices = random.sample(range(self.N), self.flip_N)
+        self.use_graph = use_graph
 
     def __len__(self):
         return self.total
@@ -800,13 +803,14 @@ class ApplyAugmentedDataset(Dataset):
             "pitch_scale": base_sample["pitch_scale"],
             "zscore_stats": base_sample["zscore_stats"]
         }
-
-        sample["graph"] = build_graph_sequence_from_condition({
-            "condition": sample["condition"],
-            "condition_columns": sample["condition_columns"],
-            "pitch_scale": sample["pitch_scale"],
-            "zscore_stats": self.zscore_stats
-        })
+        
+        if self.use_graph:
+            sample["graph"] = build_graph_sequence_from_condition({
+                "condition": sample["condition"],
+                "condition_columns": sample["condition_columns"],
+                "pitch_scale": sample["pitch_scale"],
+                "zscore_stats": self.zscore_stats
+            })
 
         return sample
 
@@ -848,12 +852,17 @@ if __name__ == "__main__":
     
     print("Target (absolute):", sample["target"])
     print("Target relative:", sample["target_relative"])
-    print("Target velocity:", sample["target_velocity"])
     
     print("Target relative mean:", sample["target_relative"].mean())
     print("Target relative min:", sample["target_relative"].min())
     print("Target relative max:", sample["target_relative"].max())
     print("Target relative std:", sample["target_relative"].std())
+    
+    print("Condition relative mean:", sample["condition_relative"].mean())
+    print("Condition relative min:", sample["condition_relative"].min())
+    print("Condition relative max:", sample["condition_relative"].max())
+    print("Condition relative std:", sample["condition_relative"].std())
+    print("Condition relative nan:", torch.isnan(sample["condition_relative"]).any())
     
     print("Target mean:", sample["target"].mean())
     print("Target min:", sample["target"].min())

@@ -513,7 +513,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
         #     jersey = defenders_num[i]
         #     x0, y0 = pred[-1, i, 0], pred[-1, i, 1]
 
-    ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=True)
+    # ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=True)
 
     if save_path:
         fig.savefig(save_path, bbox_inches='tight')

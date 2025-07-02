@@ -85,16 +85,16 @@ if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
 else:
     print("Skip organize_and_process")
 
-temp_dataset = CustomDataset(data_root=data_save_path)
+temp_dataset = CustomDataset(data_root=data_save_path, use_graph=True)
 train_idx, val_idx, test_idx = split_dataset_indices(temp_dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
 
 zscore_stats = compute_train_zscore_stats(temp_dataset, train_idx, save_path="./train_zscore_stats.pkl")
 del temp_dataset
 gc.collect()
-dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats)
+dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats, use_graph=True)
 
 train_dataloader = DataLoader(
-    ApplyAugmentedDataset(Subset(dataset, train_idx)),
+    ApplyAugmentedDataset(Subset(dataset, train_idx), use_graph=True),
     batch_size=train_batch_size,
     shuffle=True,
     num_workers=num_workers,
