@@ -477,32 +477,23 @@ class CustomDataset(Dataset):
         
         target_reference_tensor = torch.tensor(target_ref_coords, dtype=torch.float32)  # [22]
         
-        # Condition reference (start_idx - 1 프레임)
-        condition_reference_tensor = None
-        if condition_reference_idx >= 0:
-            condition_reference_frame = df.iloc[condition_reference_idx]
-            condition_ref_coords = []
-            for i in range(num_players):
-                col_x = target_columns[i * 2]
-                col_y = target_columns[i * 2 + 1]
-                cond_ref_x = condition_reference_frame[col_x]
-                cond_ref_y = condition_reference_frame[col_y]
-                condition_ref_coords.extend([cond_ref_x, cond_ref_y])
-            
-            condition_reference_tensor = torch.tensor(condition_ref_coords, dtype=torch.float32)  # [22]
+        same_period = (
+            condition_reference_idx >= 0
+            and df.loc[condition_reference_idx, "Period"] == df.loc[start_idx, "Period"]
+        )
+        if same_period:
+            reference_frame = df.iloc[condition_reference_idx]
         else:
-            # 첫 번째 세그먼트인 경우 - condition의 첫 프레임을 기준으로 사용
-            first_frame = condition_seq.iloc[0]
-            condition_ref_coords = []
-            for i in range(num_players):
-                col_x = target_columns[i * 2]
-                col_y = target_columns[i * 2 + 1]
-                cond_ref_x = first_frame[col_x] if col_x in first_frame.index else 0.0
-                cond_ref_y = first_frame[col_y] if col_y in first_frame.index else 0.0
-                condition_ref_coords.extend([cond_ref_x, cond_ref_y])
-        
-            condition_reference_tensor = torch.tensor(condition_ref_coords, dtype=torch.float32)
+            reference_frame = condition_seq.iloc[0]
 
+        condition_ref_coords = []
+        for i in range(num_players):
+            base = target_columns[i * 2].rsplit("_", 1)[0]
+            x = reference_frame[f"{base}_x"]
+            y = reference_frame[f"{base}_y"]
+            condition_ref_coords.extend([x, y])
+
+        condition_reference_tensor = torch.tensor(condition_ref_coords, dtype=torch.float32)
         target_abs_data = []
         target_rel_data = []
         
