@@ -1,27 +1,71 @@
 import os
-import random
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+import gc
+import logging
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+from datetime import datetime
+from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from models.transformer_model import DefenseTrajectoryTransformer
-from make_dataset import MultiMatchSoccerDataset, organize_and_process
-from utils.utils import set_evertyhing, worker_init_fn, generator, plot_trajectories_on_pitch
-from utils.data_utils import split_dataset_indices, custom_collate_fn
+from make_dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
+from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, calc_frechet_distance
+from utils.data_utils import split_dataset_indices, compute_train_zscore_stats, custom_collate_fn
 
-# 1. Hyperparameter Setting
-raw_data_path = "idsse-data"
-data_save_path = "match_data"
-batch_size = 64
-num_workers = 8
-epochs = 100
-learning_rate = 1e-4
+# SEED Fix
 SEED = 42
+set_everything(SEED)
 
-set_evertyhing(SEED)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Save Log / Logger Setting
+model_save_path = './results/logs/'
+os.makedirs(model_save_path, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    filename=os.path.join(model_save_path, 'transformer_train.log'),
+    filemode='w'
+)
+logger = logging.getLogger()
+
+# 1. Model Config & Hyperparameter Setting
+transformer_config = {
+    "input_dim": 22,
+    "hidden_dim": 128,
+    "output_dim": 22,
+    "projection_dim": 64,
+    "num_layers": 3,
+    "nhead": 4,
+    "seq_len": 200
+}
+hyperparams = {
+    'raw_data_path': "idsse-data",
+    'data_save_path': "match_data",
+    'train_batch_size': 16,
+    'val_batch_size': 16,
+    'test_batch_size': 16,
+    'num_workers': 8,
+    'epochs': 30,
+    'learning_rate': 1e-4,
+    'device': 'cuda:1' if torch.cuda.is_available() else 'cpu',
+    **transformer_config
+}
+
+raw_data_path = hyperparams['raw_data_path']
+data_save_path = hyperparams['data_save_path']
+train_batch_size = hyperparams['train_batch_size']
+val_batch_size = hyperparams['val_batch_size']
+test_batch_size = hyperparams['test_batch_size']
+num_workers = hyperparams['num_workers']
+epochs = hyperparams['epochs']
+learning_rate = hyperparams['learning_rate']
+device = hyperparams['device']
+
+logger.info(f"Hyperparameters: {hyperparams}")
 
 # 2. Data Loading
 print("---Data Loading---")
@@ -30,16 +74,22 @@ if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
 else:
     print("Skip organize_and_process")
 
-dataset = MultiMatchSoccerDataset(data_root=data_save_path)
-train_idx, val_idx, test_idx = split_dataset_indices(dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
+temp_dataset = CustomDataset(data_root=data_save_path, use_graph=False)
+train_idx, val_idx, test_idx = split_dataset_indices(temp_dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
+
+zscore_stats = compute_train_zscore_stats(temp_dataset, train_idx, save_path="./train_zscore_stats.pkl")
+del temp_dataset
+gc.collect()
+dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats, use_graph=False)
 
 train_dataloader = DataLoader(
-    Subset(dataset, train_idx),
-    batch_size=batch_size,
+    ApplyAugmentedDataset(Subset(dataset, train_idx), use_graph=False),
+    batch_size=train_batch_size,
     shuffle=True,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
     generator=generator(SEED)
@@ -47,136 +97,301 @@ train_dataloader = DataLoader(
 
 val_dataloader = DataLoader(
     Subset(dataset, val_idx),
-    batch_size=batch_size,
+    batch_size=val_batch_size,
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn,
 )
 
 test_dataloader = DataLoader(
     Subset(dataset, test_idx),
-    batch_size=8,
+    batch_size=test_batch_size,
     shuffle=False,
-    num_workers=0,
+    num_workers=num_workers,
     pin_memory=True,
-    persistent_workers=False,
+    persistent_workers=True,
+    prefetch_factor=1,
     collate_fn=custom_collate_fn,
     worker_init_fn=worker_init_fn
 )
 
 print("---Data Load!---")
+print(f"Train: {len(train_dataloader.dataset)} | Val: {len(val_dataloader.dataset)} | Test: {len(test_dataloader.dataset)}")
 
 # 3. Model Define
-model = DefenseTrajectoryTransformer().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, threshold=1e-4)
+model = DefenseTrajectoryTransformer(**transformer_config).to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
+
+logger.info(f"Device: {device}")
+logger.info(f"Transformer Model: {model}")
 
 # 4. Train
-best_state_dict = None
 best_val_loss = float("inf")
+best_model_path = None
+timestamp = datetime.now().strftime('%m%d')
 
-for epoch in tqdm(range(1, epochs + 1)):
+train_losses = []
+val_losses = []
+
+for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     model.train()
+    
     train_loss = 0
 
-    for batch in tqdm(train_dataloader, desc="Training"):
-        condition = batch['condition'].to(device)  # [B, T, 158]
-        target = batch['target'].to(device)        # [B, T, 22]
-        pred = model(condition, target=target)     # Teacher forcing with GT
-
-        pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)      # [B, T, 11, 2]
-        target = target.view(target.shape[0], target.shape[1], 11, 2)
-
-        mse = ((pred - target) ** 2).mean(dim=(1, 2, 3))  # [B]
-        loss = mse.mean()
-
+    for batch in tqdm(train_dataloader, desc="Batch Training...", leave=False):
+        # Use relative coordinates
+        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+        target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
+        
+        # Predict relative coordinates
+        pred_rel = model(past_rel_coords)  # [B, T_target, 22]
+        loss = criterion(pred_rel, target_rel_coords)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
         train_loss += loss.item()
-    
-    avg_train_loss = train_loss / len(train_dataloader)
+
+        del past_rel_coords, target_rel_coords, pred_rel, loss
+
+    num_batches = len(train_dataloader)
+    avg_train_loss = train_loss / num_batches
+
     # --- Validation ---
     model.eval()
     val_loss = 0
+    
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validation"):
-            condition = batch['condition'].to(device)
-            target = batch['target'].to(device)
-
-            pred = model(condition, target=target)
-            pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)
-            target = target.view(target.shape[0], target.shape[1], 11, 2)
-
-            mse = ((pred - target) ** 2).mean(dim=(1, 2, 3))  # [B]
-            loss = mse.mean()
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
+            # Use relative coordinates
+            past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+            target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
+            
+            # Predict relative coordinates
+            pred_rel = model(past_rel_coords)  # [B, T_target, 22]
+            loss = criterion(pred_rel, target_rel_coords)
             val_loss += loss.item()
 
+            del past_rel_coords, target_rel_coords, pred_rel, loss
+
     avg_val_loss = val_loss / len(val_dataloader)
-    tqdm.write(f"[Epoch {epoch}] Train Loss: {avg_train_loss:.6f}, Validation Loss: {avg_val_loss:.6f} Current LR: {scheduler.get_last_lr()[0]:.6f}, target_mean: {target.mean():.4f}, pred_mean: {pred.mean():.4f}")
-    scheduler.step(avg_val_loss)
+
+    train_losses.append(avg_train_loss)
+    val_losses.append(avg_val_loss)
     
+    current_lr = scheduler.get_last_lr()[0]
+    logger.info(f"[Epoch {epoch}/{epochs}] Train Loss={avg_train_loss:.6f} | Val Loss={avg_val_loss:.6f} | LR={current_lr:.6e}")
+
+    tqdm.write(f"[Epoch {epoch}]\n"
+               f"[Train] MSE Loss: {avg_train_loss:.6f} | LR: {current_lr:.6f}\n"
+               f"[Validation] MSE Loss: {avg_val_loss:.6f}")
+
+    scheduler.step(avg_val_loss)
+
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        best_state_dict = model.state_dict()
+        
+        if best_model_path and os.path.exists(best_model_path):
+            os.remove(best_model_path)
+        best_model_path = os.path.join(model_save_path, f'{timestamp}_best_transformer_epoch_{epoch}.pth')
+        
+        torch.save({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'zscore_stats': zscore_stats,
+            'hyperparams': hyperparams
+        }, best_model_path)
+    
+    torch.cuda.empty_cache()
+    gc.collect()
 
+logger.info(f"Training complete. Best val loss: {best_val_loss:.6f}")
 
-# 5. Inference ＆ Visualization
-model.load_state_dict(best_state_dict)
+if epoch == epochs:
+    for loader in (train_dataloader, val_dataloader):
+        ds = loader.dataset
+        ds = ds.dataset if isinstance(ds, Subset) else ds
+        if hasattr(ds, "graph_cache"):
+            ds.graph_cache.clear()
+
+# 4-1. Plot learning curve
+plt.figure(figsize=(8, 6))
+plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
+plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title(f"Transformer Model (Relative Coords) - Train & Validation Loss\n"
+          f"Hidden dim: {transformer_config['hidden_dim']}, Layers: {transformer_config['num_layers']}")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f'results/{timestamp}_transformer_relative_lr_curve.png')
+plt.show()
+plt.close()
+
+# 5. Inference & Visualization
+if best_model_path and os.path.exists(best_model_path):
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+
 model.eval()
-all_ade = []
-all_fde = []
 
-visualize_samples = 5
-visualization_done = False
+all_ades = []
+all_fdes = []
+all_frechet_dist = []
+all_DE = []
+
+px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
+px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
+py_mean = torch.tensor(zscore_stats['player_y_mean'], device=device)
+py_std = torch.tensor(zscore_stats['player_y_std'], device=device)
+
+bx_mean = torch.tensor(zscore_stats['ball_x_mean'], device=device)
+bx_std = torch.tensor(zscore_stats['ball_x_std'], device=device)
+by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
+by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
+
+rel_x_mean = torch.tensor(zscore_stats['rel_x_mean'], device=device)
+rel_x_std = torch.tensor(zscore_stats['rel_x_std'], device=device)
+rel_y_mean = torch.tensor(zscore_stats['rel_y_mean'], device=device)
+rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
 
 with torch.no_grad():
-    for batch in tqdm(test_dataloader, desc="Inference"):
-        condition = batch['condition'].to(device)
-        target = batch['target'].to(device)
-        pred = model(condition, target = None) # Teacher forcing without GT
+    for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Inference", leave=True)):
+        # Use relative coordinates for prediction
+        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+        target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
+        target_reference = batch["target_reference"].to(device)  # [B, 22] - reference point
+        
+        B, T_cond, _ = past_rel_coords.shape
+        _, T_target, _ = target_rel_coords.shape
+        
+        # Predict relative coordinates
+        pred_rel = model(past_rel_coords)  # [B, T_target, 22]
+        pred_rel = pred_rel.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
+        target_rel = target_rel_coords.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
+        
+        # Convert relative coordinates back to absolute coordinates for evaluation
+        # Denormalize relative coordinates first
+        pred_rel_denorm = pred_rel.clone()
+        pred_rel_denorm[..., 0] = pred_rel[..., 0] * rel_x_std + rel_x_mean
+        pred_rel_denorm[..., 1] = pred_rel[..., 1] * rel_y_std + rel_y_mean
+        
+        target_rel_denorm = target_rel.clone()
+        target_rel_denorm[..., 0] = target_rel[..., 0] * rel_x_std + rel_x_mean
+        target_rel_denorm[..., 1] = target_rel[..., 1] * rel_y_std + rel_y_mean
+        
+        # Get reference point (target_reference is normalized, so denormalize it)
+        ref_coords = target_reference.view(B, 11, 2)  # [B, 11, 2]
+        
+        # Convert to absolute coordinates: absolute = reference + relative
+        pred_abs = pred_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
+        target_abs = target_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
 
-        pred = pred.view(pred.shape[0], pred.shape[1], 11, 2)
-        target = target.view(target.shape[0], target.shape[1], 11, 2)
+        # Calculate ADE and FDE
+        ade = ((pred_abs - target_abs)**2).sum(-1).sqrt().mean((1,2))  # [B]
+        fde = ((pred_abs[:,-1,:,:] - target_abs[:,-1,:,:])**2).sum(-1).sqrt().mean(1)  # [B]
 
-        # Denormalize
-        x_scales = torch.tensor([s[0] for s in batch["pitch_scale"]], device=device).view(-1, 1, 1)
-        y_scales = torch.tensor([s[1] for s in batch["pitch_scale"]], device=device).view(-1, 1, 1)
+        # Calculate Direction Error
+        eps = 1e-6
+        overall_pred = pred_abs[:, -1] - pred_abs[:, 0]
+        overall_gt = target_abs[:, -1] - target_abs[:, 0]
+        
+        norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+        norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+        
+        u = overall_pred / norm_pred
+        v = overall_gt / norm_gt
+        
+        cosine = (u * v).sum(dim=-1).clamp(-1.0, 1.0)
+        theta = cosine.acos()
+        DE = theta.mean(dim=1)
 
-        pred = pred.clone()
-        target = target.clone()
+        all_ades.extend(ade.cpu().tolist())
+        all_fdes.extend(fde.cpu().tolist())
+        all_DE.extend(DE.cpu().tolist())
 
-        pred[..., 0] *= x_scales
-        pred[..., 1] *= y_scales
-        target[..., 0] *= x_scales
-        target[..., 1] *= y_scales
-
-        # Player-wise ADE
-        ade = ((pred - target) ** 2).sum(-1).sqrt().mean(1).mean(1)  # [B]
-        all_ade.extend(ade.cpu().numpy())
-
-        # Player-wise FDE
-        fde = ((pred[:, -1] - target[:, -1]) ** 2).sum(-1).sqrt().mean(1)  # [B]
-        all_fde.extend(fde.cpu().numpy())
+        # Calculate Fréchet distance
+        pred_np = pred_abs.cpu().numpy()      # [B,T,N,2]
+        target_np = target_abs.cpu().numpy()
+        B_, T, N, _ = pred_np.shape
+        batch_frechet = []
+        for b in range(B_):
+            per_player_frechet = []
+            for j in range(N):
+                pred_traj = pred_np[b, :, j, :]
+                target_traj = target_np[b, :, j, :]
+                frechet_dist = calc_frechet_distance(pred_traj, target_traj)
+                per_player_frechet.append(frechet_dist)
+            batch_frechet.append(np.mean(per_player_frechet))
+        
+        all_frechet_dist.extend(batch_frechet)
+        
+        # Debug print
+        print(f"[Batch {batch_idx}] "
+              f"ADE={ade.mean():.3f}, FDE={fde.mean():.3f}, "
+              f"Frechet={np.mean(batch_frechet):.3f}, DE={torch.rad2deg(DE.mean()):.2f}°")
 
         # Visualization
-        os.makedirs("results", exist_ok=True)
-        if not visualization_done:
-            B = pred.shape[0]
-            for i in range(min(B, visualize_samples)):
-                others = batch["other"][i].view(-1, 12, 2).cpu()
-                target_vis = target[i].cpu()
-                pred_vis = pred[i].cpu()
-                pitch_scale = batch["pitch_scale"][i]
+        base_dir = "results/test_trajs_transformer"
+        os.makedirs(base_dir, exist_ok=True)
 
-                save_path = f"results/Transformer_sample_{i:02d}.png"
-                plot_trajectories_on_pitch(others, target_vis, pred_vis, pitch_scale, save_path=save_path)
+        for i in range(B):
+            other_cols = batch["other_columns"][i]
+            target_cols = batch["target_columns"][i]
+            
+            # Other Trajectories Denormalization
+            other_seq = batch["other"][i].view(T_target, -1, 2).to(device)
+            other_den = torch.zeros_like(other_seq)
+            for j in range(other_seq.size(1)):
+                x_col = other_cols[2 * j]
+                if x_col == "ball_x":
+                    x_mean, x_std = bx_mean, bx_std
+                    y_mean, y_std = by_mean, by_std
+                else:
+                    x_mean, x_std = px_mean, px_std
+                    y_mean, y_std = py_mean, py_std
 
-            visualization_done = True
+                other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
+                other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
-avg_ade = np.mean(all_ade)
-avg_fde = np.mean(all_fde)
-print(f"[Inference] ADE: {avg_ade:.4f} | FDE: {avg_fde:.4f}")
+            pred_traj = pred_abs[i].cpu().numpy()
+            target_traj = target_abs[i].cpu().numpy()
+            other_traj = other_den.cpu().numpy()
+
+            current_ade = ade[i].item()
+            current_fde = fde[i].item()
+            current_frechet = batch_frechet[i]
+
+            defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
+
+            folder = os.path.join(base_dir, f"batch_{batch_idx:03d}")
+            os.makedirs(folder, exist_ok=True)
+
+            save_path = os.path.join(folder, f"sample_{i:02d}.png")
+            plot_trajectories_on_pitch(
+                other_traj, target_traj, pred_traj, other_columns=other_cols, 
+                defenders_num=defender_nums, annotate=True, save_path=save_path
+            )
+
+        del pred_rel, pred_rel_denorm, target_rel, target_rel_denorm
+        del pred_abs, target_abs, ref_coords, ade, fde, DE
+        torch.cuda.empty_cache()
+        gc.collect()
+
+print(f"Transformer Baseline (Relative Coordinates):")
+print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
+print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
+print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
+print(f"Direction Error (DE): {np.rad2deg(np.mean(all_DE)):.2f} ± {np.rad2deg(np.std(all_DE)):.2f}°")

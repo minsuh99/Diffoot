@@ -34,10 +34,10 @@ logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
 lstm_config = {
-    "input_dim": 22,  # 11 players * 2 coords (relative x, y)
+    "input_dim": 22,
     "hidden_dim": 128,
     "num_layers": 2,
-    "dropout": 0.2
+    "dropout": 0.5
 }
 
 hyperparams = {
@@ -143,27 +143,12 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc="Batch Training...", leave=False):
-        cond = batch["condition"].to(device)
-        target_columns = batch["target_columns"][0]
-        condition_columns = batch["condition_columns"][0]
-        target = batch["target"].to(device)  # [B, T_target, 22]
+        past_rel = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+        target_rel = batch["target_relative"].to(device)   # [B, T_target, 22]
         
-        B, T_cond, _ = cond.shape
+        pred_rel = model(past_rel)  # [B, T_target, 11, 2]
         
-        # Find indices of target players in condition
-        target_indices = []
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                x_idx = condition_columns.index(x_col)
-                y_idx = condition_columns.index(y_col)
-                target_indices.extend([x_idx, y_idx])
-
-        past_abs_coords = cond[:, :, target_indices]
-        pred = model(past_abs_coords)  # [B, T_target, 22]
-        loss = criterion(pred, target)
+        loss = criterion(pred_rel, target_rel)
         
         optimizer.zero_grad()
         loss.backward()
@@ -171,7 +156,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
         train_loss += loss.item()
 
-        del past_abs_coords, target, pred, loss
+        del past_rel, target_rel, pred_rel, loss
 
     num_batches = len(train_dataloader)
     avg_train_loss = train_loss / num_batches
@@ -182,33 +167,17 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation", leave=False):
-            cond = batch["condition"].to(device)
-            target_columns = batch["target_columns"][0]
-            condition_columns = batch["condition_columns"][0]
-            target = batch["target"].to(device)  # [B, T_target, 22]
+            # Use relative coordinates
+            past_rel = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+            target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
             
-            B, T_cond, _ = cond.shape
-            
-            # Find indices of target players in condition
-            target_indices = []
-            for i in range(0, len(target_columns), 2):
-                x_col = target_columns[i]
-                y_col = target_columns[i + 1]
-                
-                if x_col in condition_columns and y_col in condition_columns:
-                    x_idx = condition_columns.index(x_col)
-                    y_idx = condition_columns.index(y_col)
-                    target_indices.extend([x_idx, y_idx])
-
-            past_abs_coords = cond[:, :, target_indices]
-
-            pred = model(past_abs_coords)  # [B, T_target, 22]
-
-            loss = criterion(pred, target)
+            # Predict relative coordinates
+            pred_rel = model(past_rel)  # [B, T_target, 22]
+            loss = criterion(pred_rel, target_rel)
             val_loss += loss.item()
 
-            del past_abs_coords, target, pred, loss
-
+            del past_rel, target_rel, pred_rel, loss
+            
     avg_val_loss = val_loss / len(val_dataloader)
 
     train_losses.append(avg_train_loss)
@@ -278,6 +247,7 @@ model.eval()
 all_ades = []
 all_fdes = []
 all_frechet_dist = []
+all_DE = []
 
 px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
 px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
@@ -296,49 +266,62 @@ rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
 
 with torch.no_grad():
     for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Inference", leave=True)):
-        cond = batch["condition"].to(device)
-        target_columns = batch["target_columns"][0]
-        condition_columns = batch["condition_columns"][0]
-
-        # Find indices of target players in condition
-        target_indices = []
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                x_idx = condition_columns.index(x_col)
-                y_idx = condition_columns.index(y_col)
-                target_indices.extend([x_idx, y_idx])
-        past_abs_coords = cond[:, :, target_indices]  # [B, T_cond, 22]        
-        # Get shape info
-        B, T_cond, _ = past_abs_coords.shape
-        _, T_target, _ = batch["target"].shape
+        # Use relative coordinates for prediction
+        past_rel = batch["condition_relative"].to(device)  # [B, T_cond, 22]
+        target_rel = batch["target_relative"].to(device)  # [B, T_target, 22]
+        target_reference = batch["target_reference"].to(device)  # [B, 22] - reference point
         
-        # Predict
-        pred = model(past_abs_coords).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
-
-        # Ground truth
-        target = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
-
-        pred_abs_denorm = pred.clone()
-        pred_abs_denorm[..., 0] = pred[..., 0] * px_std + px_mean
-        pred_abs_denorm[..., 1] = pred[..., 1] * py_std + py_mean
-
-        target_abs_denorm = target.clone()
-        target_abs_denorm[..., 0] = target[..., 0] * px_std + px_mean
-        target_abs_denorm[..., 1] = target[..., 1] * py_std + py_mean
+        B, T_cond, _ = past_rel.shape
+        _, T_target, _ = target_rel.shape
+        
+        # Predict relative coordinates
+        pred_rel = model(past_rel)  # [B, T_target, 22]
+        pred_rel = pred_rel.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
+        target_rel = target_rel.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
+        
+        # Convert relative coordinates back to absolute coordinates for evaluation
+        # Denormalize relative coordinates first
+        pred_rel_denorm = pred_rel.clone()
+        pred_rel_denorm[..., 0] = pred_rel[..., 0] * rel_x_std + rel_x_mean
+        pred_rel_denorm[..., 1] = pred_rel[..., 1] * rel_y_std + rel_y_mean
+        
+        target_rel_denorm = target_rel.clone()
+        target_rel_denorm[..., 0] = target_rel[..., 0] * rel_x_std + rel_x_mean
+        target_rel_denorm[..., 1] = target_rel[..., 1] * rel_y_std + rel_y_mean
+        
+        # Get reference point (target_reference is normalized, so denormalize it)
+        ref_coords = target_reference.view(B, 11, 2)  # [B, 11, 2]
+        
+        # Convert to absolute coordinates: absolute = reference + relative
+        pred_abs = pred_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
+        target_abs = target_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
 
         # Calculate ADE and FDE
-        ade = ((pred_abs_denorm - target_abs_denorm)**2).sum(-1).sqrt().mean((1,2))  # [B]
-        fde = ((pred_abs_denorm[:,-1,:,:] - target_abs_denorm[:,-1,:,:])**2).sum(-1).sqrt().mean(1)  # [B]
+        ade = ((pred_abs - target_abs)**2).sum(-1).sqrt().mean((1,2))  # [B]
+        fde = ((pred_abs[:,-1,:,:] - target_abs[:,-1,:,:])**2).sum(-1).sqrt().mean(1)  # [B]
+
+        # Calculate DE (Direction Error: overall movement direction)
+        eps = 1e-6
+        overall_pred = pred_abs[:, -1] - pred_abs[:, 0]
+        overall_gt = target_abs[:, -1] - target_abs[:, 0]
+        
+        norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+        norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+        
+        u = overall_pred / norm_pred
+        v = overall_gt / norm_gt
+        
+        cosine = (u * v).sum(dim=-1).clamp(-1.0, 1.0)
+        theta = cosine.acos()
+        DE = theta.mean(dim=1)
 
         all_ades.extend(ade.cpu().tolist())
         all_fdes.extend(fde.cpu().tolist())
-
+        all_DE.extend(DE.cpu().tolist())
+        
         # Calculate Fréchet distance
-        pred_np = pred_abs_denorm.cpu().numpy()      # [B,T,N,2]
-        target_np = target_abs_denorm.cpu().numpy()
+        pred_np = pred_abs.cpu().numpy()      # [B,T,N,2]
+        target_np = target_abs.cpu().numpy()
         B_, T, N, _ = pred_np.shape
         batch_frechet = []
         for b in range(B_):
@@ -354,10 +337,12 @@ with torch.no_grad():
         
         # Debug print
         print(f"[Batch {batch_idx}] "
-              f"ADE={ade.mean():.3f}, FDE={fde.mean():.3f}, Frechet={np.mean(batch_frechet):.3f}")
+              f"ADE={ade.mean():.3f}, FDE={fde.mean():.3f}, "
+              f"Frechet={np.mean(batch_frechet):.3f}, DE={torch.rad2deg(DE.mean()):.2f}°")
+
 
         # Visualization
-        base_dir = "results/test_trajs_lstm_simplified"
+        base_dir = "results/test_trajs_lstm"
         os.makedirs(base_dir, exist_ok=True)
 
         for i in range(B):
@@ -379,8 +364,8 @@ with torch.no_grad():
                 other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                 other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
-            pred_traj = pred_abs_denorm[i].cpu().numpy()
-            target_traj = target_abs_denorm[i].cpu().numpy()
+            pred_traj = pred_abs[i].cpu().numpy()
+            target_traj = target_abs[i].cpu().numpy()
             other_traj = other_den.cpu().numpy()
 
             current_ade = ade[i].item()
@@ -398,10 +383,13 @@ with torch.no_grad():
                 defenders_num=defender_nums, annotate=True, save_path=save_path
             )
 
-        del pred, pred_abs_denorm, target, target_abs_denorm, ade, fde
+        del pred_rel, pred_rel_denorm, target_rel, target_rel_denorm
+        del pred_abs, target_abs, ref_coords, ade, fde, DE
         torch.cuda.empty_cache()
         gc.collect()
 
+print(f"LSTM Baseline")
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
 print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
+print(f"Direction Error (DE): {np.rad2deg(np.mean(all_DE)):.2f} ± {np.rad2deg(np.std(all_DE)):.2f}°")

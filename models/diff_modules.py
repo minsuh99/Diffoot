@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 # TransformerEncoder -> Linformer
 def get_EF(input_size, dim, bias=True):
-    """Returns the E or F matrix for Linformer projection"""
     lin = nn.Linear(input_size, dim, bias)
     torch.nn.init.xavier_normal_(lin.weight)
     return lin

@@ -47,7 +47,7 @@ class InteractionGraphEncoder(nn.Module):
             ('Node', 'def_and_ball', 'Node'),
             ('Node', 'temporal', 'Node'),
         ]
-        # 1st layer convs: from in_dim to hidden_dim
+
         conv1 = { rel: GATConv(
                     in_channels=self.in_dim,
                     out_channels=hidden_dim,
@@ -56,7 +56,7 @@ class InteractionGraphEncoder(nn.Module):
                     add_self_loops=False,
                     dropout=0.1
                 ) for rel in edge_types }
-        # 2nd layer convs: from hidden_dim to hidden_dim
+
         conv2 = { rel: GATConv(
                     in_channels=hidden_dim,
                     out_channels=hidden_dim,
@@ -67,18 +67,21 @@ class InteractionGraphEncoder(nn.Module):
                 ) for rel in edge_types }
         self.het1 = HeteroConv(conv1, aggr='sum')
         self.het2 = HeteroConv(conv2, aggr='sum')
-        self.proj = nn.Linear(hidden_dim, out_dim)
+        
+        self.global_pool = AttentionPooling(hidden_dim)
+        self.defender_pool = AttentionPooling(hidden_dim)
+
+        self.proj = nn.Linear(hidden_dim * 2, out_dim)
 
     def forward(self, graph: HeteroData):
         x_all = graph['Node'].x
-        # possession Encoding (with Learnable Parameter)
+        batch = graph['Node'].batch
+
         pos_idx = 5                  
         cont = torch.cat([x_all[:, :pos_idx], x_all[:, pos_idx+1:]], dim=1)
         pos_raw = x_all[:, pos_idx].long()
-        
         pos_idx_emb = pos_raw.clamp(min=0)
         pos_emb = self.position_emb(pos_idx_emb)
-        
         x = torch.cat([cont, pos_emb], dim=1)
         
         x_dict = {'Node': x}
@@ -95,11 +98,22 @@ class InteractionGraphEncoder(nn.Module):
         x = self.dropout(x)
         x = self.norm2(x)
 
-        # pooling
-        batch = graph['Node'].batch
-        graph_rep = self.pool(x, batch)
-        graph_rep = self.dropout(graph_rep)
-        return self.proj(graph_rep)  # (B, out_dim)
+        node_types = x_all[:, -1].long()
+
+        global_rep = self.global_pool(x, batch)  # [B, hidden_dim]
+        defender_mask = node_types == 1
+        
+        if defender_mask.any():
+            def_nodes = x[defender_mask]
+            def_batch = batch[defender_mask]
+            defender_rep = self.defender_pool(def_nodes, def_batch)
+        else:
+            defender_rep = x.new_zeros((global_rep.size(0), x.size(-1)))
+
+        combined = torch.cat([global_rep, defender_rep], dim=-1)  # [B, hidden_dim*2]
+        final_rep = self.proj(combined)  # [B, out_dim]
+        
+        return final_rep
 
 
 class TargetTrajectoryEncoder(nn.Module):

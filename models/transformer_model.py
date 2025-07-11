@@ -18,7 +18,7 @@ class PositionalEncoding(nn.Module):
 
 
 class DefenseTrajectoryTransformer(nn.Module):
-    def __init__(self, input_dim=158, hidden_dim=256, output_dim=22, projection_dim=64, num_layers=4, nhead=8, seq_len=125):
+    def __init__(self, input_dim=22, hidden_dim=256, output_dim=22, projection_dim=64, num_layers=6, nhead=8, seq_len=100):
         super().__init__()
 
         self.encoder_input_proj = nn.Linear(input_dim, hidden_dim)
@@ -62,43 +62,55 @@ class DefenseTrajectoryTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, condition, target=None, teacher_forcing_ratio=0.5):
+    def forward(self, condition, target=None):
         B, T, _ = condition.size()
 
-        # Encode
         encoder_input = self.encoder_input_proj(condition)
         encoder_input = self.encoder_pos_encoding(encoder_input)
         memory = self.encoder(encoder_input)
 
-        # Decode with teacher forcing or autoregressive
-        outputs = []
-        hidden_dim = memory.size(-1)
-        decoder_input = torch.zeros(B, 1, hidden_dim, device=condition.device)
+        if self.training and target is not None:
+            decoder_input = self.decoder_input_proj(target)
+            decoder_input = self.decoder_pos_encoding(decoder_input)
 
+            tgt_mask = self._generate_square_subsequent_mask(T, condition.device)
+            
+            decoder_output = self.decoder(
+                tgt=decoder_input, 
+                memory=memory, 
+                tgt_mask=tgt_mask
+            )
+            output_seq = self.output_proj(decoder_output)
+            
+        else:
+            output_seq = self._autoregressive_decode(memory, T, condition.device)
+            
+        return output_seq
+
+    def _autoregressive_decode(self, memory, T, device):
+        B = memory.size(0)
+
+        decoder_input = torch.zeros(B, 1, self.output_proj[-1].out_features, device=device)
+        outputs = []
+        
         for t in range(T):
-            use_teacher_forcing = (
-                self.training and 
-                target is not None and 
-                torch.rand(1).item() < teacher_forcing_ratio
+            decoder_input_proj = self.decoder_input_proj(decoder_input)
+            decoder_input_proj = self.decoder_pos_encoding(decoder_input_proj)
+            
+            # Decode
+            decoder_output = self.decoder(
+                tgt=decoder_input_proj, 
+                memory=memory
             )
 
-            if t == 0:
-                decoder_input_t = decoder_input
-            else:
-                if use_teacher_forcing:
-                    prev_gt = target[:, t - 1:t]
-                    decoder_input_t = self.decoder_input_proj(prev_gt)
-                else:
-                    prev_pred = self.output_proj(decoder_output)
-                    decoder_input_t = self.decoder_input_proj(prev_pred)
-
-            decoder_input_t = self.decoder_pos_encoding(decoder_input_t)
-
-            decoder_output = self.decoder(tgt=decoder_input_t, memory=memory)
-
-            output_t = self.output_proj(decoder_output)
+            output_t = self.output_proj(decoder_output[:, -1:, :])  # [B, 1, output_dim]
             outputs.append(output_t)
 
+            decoder_input = torch.cat([decoder_input, output_t], dim=1)
+        
+        return torch.cat(outputs, dim=1)  # [B, T, output_dim]
 
-        output_seq = torch.cat(outputs, dim=1)  # [B, T, output_dim]
-        return output_seq
+    def _generate_square_subsequent_mask(self, sz, device):
+        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        return mask
