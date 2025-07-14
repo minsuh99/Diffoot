@@ -357,10 +357,12 @@ graph_encoder.eval()
 all_ades = []
 all_fdes = []
 all_frechet_dist = []
+all_DE = []
 
 all_min_ades = []
 all_min_fdes = []
 all_min_frechet = []
+all_min_DE = []
 
 px_mean = torch.tensor(zscore_stats['player_x_mean'], device=device)
 px_std = torch.tensor(zscore_stats['player_x_std'], device=device)
@@ -424,27 +426,38 @@ with torch.no_grad():
         target_abs_denorm = target_abs.clone()
         target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
         target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
-        
-        # Initialize arrays to store metrics for all samples
+
+        # Evaluation
         batch_ades_all_samples = []  # [num_samples, B]
         batch_fdes_all_samples = []  # [num_samples, B]
         batch_frechet_all_samples = []  # [num_samples, B]
-        
-        # Process each sample
+        batch_DE_all_samples = []  # [num_samples, B]
+
         for sample_idx in range(num_samples):
             pred = preds[sample_idx]  # [B, T, 11, 2]
-            
-            # Denormalize predicted relative coordinates
+
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
-            
-            # Convert to absolute coordinates
+
             pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
-            
-            # Calculate ADE and FDE
+
             ade = ((pred_absolute[...,:2] - target_abs_denorm[...,:2])**2).sum(-1).sqrt().mean((1,2))  # [B]
             fde = ((pred_absolute[:,-1,:,:2] - target_abs_denorm[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)  # [B]
+
+            eps = 1e-6
+            overall_pred = pred_absolute[:, -1] - pred_absolute[:, 0]  # [B, N, 2]
+            overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]  # [B, N, 2]
+            
+            norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+            norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+            
+            u = overall_pred / norm_pred  # [B, N, 2]
+            v = overall_gt / norm_gt  # [B, N, 2]
+            
+            cosine = (u * v).sum(dim=-1).clamp(-1.0, 1.0)
+            theta = cosine.acos()
+            DE = theta.mean(dim=1)
             
             # Calculate Fréchet distance
             pred_np = pred_absolute.cpu().numpy()      # [B,T,N,2]
@@ -463,35 +476,40 @@ with torch.no_grad():
             batch_ades_all_samples.append(ade.cpu())
             batch_fdes_all_samples.append(fde.cpu())
             batch_frechet_all_samples.append(torch.tensor(batch_frechet))
-        
-        # Convert to tensors for easier manipulation
+            batch_DE_all_samples.append(DE.cpu())
+
         batch_ades_tensor = torch.stack(batch_ades_all_samples)  # [num_samples, B]
         batch_fdes_tensor = torch.stack(batch_fdes_all_samples)  # [num_samples, B]
         batch_frechet_tensor = torch.stack(batch_frechet_all_samples)  # [num_samples, B]
-        
-        # Find minimum values across samples for each batch item
-        min_ades, _ = batch_ades_tensor.min(dim=0)  # [B]
+        batch_DE_tensor = torch.stack(batch_DE_all_samples)  # [num_samples, B]
+
+        min_ades, min_ade_indices = batch_ades_tensor.min(dim=0)  # [B]
         min_fdes, _ = batch_fdes_tensor.min(dim=0)  # [B]
         min_frechet, _ = batch_frechet_tensor.min(dim=0)  # [B]
+        min_DE, _ = batch_DE_tensor.min(dim=0)  # [B]
         
-        # Store results
         all_min_ades.extend(min_ades.tolist())
         all_min_fdes.extend(min_fdes.tolist())
         all_min_frechet.extend(min_frechet.tolist())
+        all_min_DE.extend(min_DE.tolist())
         
         # Also store average results for comparison
         avg_ades = batch_ades_tensor.mean(dim=0)
         avg_fdes = batch_fdes_tensor.mean(dim=0)
         avg_frechet = batch_frechet_tensor.mean(dim=0)
+        avg_DE = batch_DE_tensor.mean(dim=0)
         
         all_ades.extend(avg_ades.tolist())
         all_fdes.extend(avg_fdes.tolist())
         all_frechet_dist.extend(avg_frechet.tolist())
+        all_DE.extend(avg_DE.tolist())
         
         # Debug print
         print(f"[Batch {batch_idx}] "
-              f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, Frechet={avg_frechet.mean():.3f} | "
-              f"Min - ADE={min_ades.mean():.3f}, FDE={min_fdes.mean():.3f}, Frechet={min_frechet.mean():.3f}")
+              f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, "
+              f"Frechet={avg_frechet.mean():.3f}, DE={torch.rad2deg(avg_DE.mean()):.2f}° | "
+              f"Min - ADE={min_ades.mean():.3f}, FDE={min_fdes.mean():.3f}, "
+              f"Frechet={min_frechet.mean():.3f}, DE={torch.rad2deg(min_DE.mean()):.2f}°")
         
         # Visualization
         timestamp = datetime.now().strftime('%m%d')
@@ -501,25 +519,20 @@ with torch.no_grad():
         all_pred_absolutes = []
         for sample_idx in range(num_samples):
             pred = preds[sample_idx]  # [B, T, 11, 2]
-            
-            # Denormalize predicted relative coordinates
+
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
-            
-            # Convert to absolute coordinates
+
             pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
             all_pred_absolutes.append(pred_absolute.cpu().numpy())
         
         all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
 
-        best_ade_indices = batch_ades_tensor.argmin(dim=0)  # [B]
-
         for i in range(B):
             other_cols = batch["other_columns"][i]
             target_cols = batch["target_columns"][i]
-            
-            # Other Trajectories Denormalization
+
             other_seq = batch["other"][i].view(T_target, -1, 2).to(device)
             other_den = torch.zeros_like(other_seq)
             for j in range(other_seq.size(1)):
@@ -534,7 +547,7 @@ with torch.no_grad():
                 other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                 other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
-            best_sample_idx = best_ade_indices[i].item()
+            best_sample_idx = min_ade_indices[i].item()
             pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
             
             target_traj = target_abs_denorm[i].cpu().numpy()
@@ -543,6 +556,7 @@ with torch.no_grad():
             best_ade = batch_ades_tensor[best_sample_idx, i].item()
             best_fde = batch_fdes_tensor[best_sample_idx, i].item()
             best_frechet = batch_frechet_tensor[best_sample_idx, i].item()
+            best_DE_deg = torch.rad2deg(batch_DE_tensor[best_sample_idx, i]).item()
 
             defender_nums = [int(col.split('_')[1]) for col in target_cols[::2]]
 
