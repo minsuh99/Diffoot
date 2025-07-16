@@ -44,21 +44,46 @@ class DiffusionTrajectoryModel(nn.Module):
         x_t = torch.sqrt(a_hat) * x_0 + torch.sqrt(1 - a_hat) * noise
         return x_t, noise
 
-    def forward(self, x_0, t=None, cond_info=None):
-        B = x_0.size(0)
-        device = x_0.device
+    def forward(self, target_abs, reference_point, zscore_stats, t=None, cond_info=None):
+        B = target_abs.size(0)
+        T = target_abs.size(1)
+        device = target_abs.device
         
         if t is None:
             t = torch.randint(0, self.num_steps, (B,), device=device)
+
+        N = reference_point.size(1) // 2
+        target_abs_4d = target_abs.view(B, T, N, 2)
+        ref_raw = reference_point.view(B, N, 2)
+        
+        if zscore_stats is not None:
+            px_s = zscore_stats['player_x_std']
+            py_s = zscore_stats['player_y_std']
+            rx_m, rx_s = zscore_stats['rel_x_mean'], zscore_stats['rel_x_std']
+            ry_m, ry_s = zscore_stats['rel_y_mean'], zscore_stats['rel_y_std']
+
+            abs_raw = torch.zeros_like(target_abs_4d)
+            abs_raw[..., 0] = target_abs_4d[..., 0] * px_s + zscore_stats['player_x_mean']
+            abs_raw[..., 1] = target_abs_4d[..., 1] * py_s + zscore_stats['player_y_mean']
+
+            rel_raw = abs_raw - ref_raw.unsqueeze(1)  # [B, T, N, 2]
+
+            rel_norm = torch.zeros_like(rel_raw)
+            rel_norm[..., 0] = (rel_raw[..., 0] - rx_m) / rx_s
+            rel_norm[..., 1] = (rel_raw[..., 1] - ry_m) / ry_s
+            
+            x_0 = rel_norm
+        else:
+            x_0 = target_abs_4d - ref_raw.unsqueeze(1)
+
         x_t, noise = self.q_sample(x_0, t)
         x_t_in = x_t.permute(0, 3, 2, 1)
 
-        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)               # [B,1,1,1]
-        sqrt_a = torch.sqrt(a_hat)                               # √α̂_t
-        sqrt_o = torch.sqrt(1 - a_hat)                          # √(1−α̂_t)
-        v_target = sqrt_a * noise - sqrt_o * x_0                 # v_t = √α ε_t − √(1−α) x₀
+        a_hat = self.alpha_hat[t].view(-1, 1, 1, 1)
+        sqrt_a = torch.sqrt(a_hat)
+        sqrt_o = torch.sqrt(1 - a_hat)
+        v_target = sqrt_a * noise - sqrt_o * x_0
         
-        x_t_in = x_t.permute(0, 3, 2, 1)
         z = self.model(x_t_in, t, cond_info)
         z = z.permute(0, 3, 2, 1)
 
@@ -71,12 +96,12 @@ class DiffusionTrajectoryModel(nn.Module):
         # NLL loss computing
         nll = 0.5 * ((v_target - v_pred) ** 2 / var + log_var + math.log(2 * math.pi))
         noise_nll = nll.mean()
-    
+
         return v_loss, noise_nll
     
     # DDIM Sampling
     @torch.no_grad()
-    def generate(self, shape, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
+    def generate(self, shape, reference_point, cond_info=None, ddim_steps=50, eta=0.0, num_samples=1):
         B, T, N, D = shape
         device = next(self.parameters()).device
 
@@ -86,6 +111,10 @@ class DiffusionTrajectoryModel(nn.Module):
         if cond_info is not None:
             cond_info = cond_info.to(device).unsqueeze(0).repeat(num_samples, 1, 1, 1, 1)
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
+
+        ref_raw = reference_point.view(B, N, D)  # [B, N, 2]
+        ref_raw = ref_raw.unsqueeze(0).repeat(num_samples, 1, 1, 1)  # [num_samples, B, N, 2]
+        ref_raw = ref_raw.view(num_samples * B, N, D)  # [num_samples*B, N, 2]
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
 
@@ -102,9 +131,9 @@ class DiffusionTrajectoryModel(nn.Module):
             z = self.model(x_in, t_batch, cond_info).permute(0, 3, 2, 1)
             v_pred = z[..., :2]
             
-            sqrt_ah_t  = torch.sqrt(ah_t)           # √α̂_t
-            sqrt_o_t  = torch.sqrt(1 - ah_t)       # √(1−α̂_t)
-            x0_pred =  sqrt_ah_t * x - sqrt_o_t * v_pred
+            sqrt_ah_t = torch.sqrt(ah_t)
+            sqrt_o_t = torch.sqrt(1 - ah_t)
+            x0_pred = sqrt_ah_t * x - sqrt_o_t * v_pred
             eps_pred = (x - sqrt_ah_t * x0_pred) / sqrt_o_t
 
             if t_prev > 0:
@@ -123,5 +152,5 @@ class DiffusionTrajectoryModel(nn.Module):
             else:
                 x = x0_pred
 
-        result = x.view(num_samples, B, T, N, D)
-        return result
+        rel_norm = x.view(num_samples, B, T, N, D)
+        return rel_norm

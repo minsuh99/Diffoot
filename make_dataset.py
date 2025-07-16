@@ -768,11 +768,31 @@ class ApplyAugmentedDataset(Dataset):
         target_relative = base_sample["target_relative"].clone()
         target_rel_y_indices = [i for i, col in enumerate(base_sample["target_relative_columns"]) if col.endswith("_rel_y")]
         target_relative[:, target_rel_y_indices] *= -1
-        
-        condition_reference = base_sample["condition_reference"].clone()
-        target_reference = base_sample["target_reference"].clone()
-        condition_reference[1::2] *= -1
-        target_reference[1::2] *= -1
+
+        target_ref_raw = base_sample["target_reference"].clone()
+        target_ref_norm = torch.zeros_like(target_ref_raw)
+
+        target_ref_norm[0::2] = (target_ref_raw[0::2] - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
+        target_ref_norm[1::2] = (target_ref_raw[1::2] - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
+
+        target_ref_norm[1::2] *= -1
+
+        target_reference = torch.zeros_like(target_ref_norm)
+        target_reference[0::2] = target_ref_norm[0::2] * self.zscore_stats['player_x_std'] + self.zscore_stats['player_x_mean']
+        target_reference[1::2] = target_ref_norm[1::2] * self.zscore_stats['player_y_std'] + self.zscore_stats['player_y_mean']
+
+        cond_ref_raw = base_sample["condition_reference"].clone()
+        cond_ref_norm = torch.zeros_like(cond_ref_raw)
+
+        cond_ref_norm[0::2] = (cond_ref_raw[0::2] - self.zscore_stats['player_x_mean']) / self.zscore_stats['player_x_std']
+        cond_ref_norm[1::2] = (cond_ref_raw[1::2] - self.zscore_stats['player_y_mean']) / self.zscore_stats['player_y_std']
+
+        cond_ref_norm[1::2] *= -1
+
+        condition_reference = torch.zeros_like(cond_ref_norm)
+        condition_reference[0::2] = cond_ref_norm[0::2] * self.zscore_stats['player_x_std'] + self.zscore_stats['player_x_mean']
+        condition_reference[1::2] = cond_ref_norm[1::2] * self.zscore_stats['player_y_std'] + self.zscore_stats['player_y_mean']
+
 
         sample = {
             "match_id": base_sample["match_id"],
@@ -781,8 +801,8 @@ class ApplyAugmentedDataset(Dataset):
             "target": target,
             "condition_relative": cond_relative,
             "target_relative": target_relative,
-            "condition_reference": base_sample["condition_reference"],
-            "target_reference": base_sample["target_reference"],
+            "condition_reference": condition_reference,
+            "target_reference": target_reference,
             
             "condition_columns": base_sample["condition_columns"],
             "other_columns": base_sample["other_columns"],

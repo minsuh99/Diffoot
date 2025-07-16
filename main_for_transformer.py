@@ -27,14 +27,14 @@ os.makedirs(model_save_path, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
-    filename=os.path.join(model_save_path, 'transformer_train.log'),
+    filename=os.path.join(model_save_path, 'transformer_absolute_train.log'),
     filemode='w'
 )
 logger = logging.getLogger()
 
 # 1. Model Config & Hyperparameter Setting
 transformer_config = {
-    "input_dim": 22,
+    "input_dim": 22,      # 11 defenders * 2 coordinates (x, y)
     "hidden_dim": 128,
     "output_dim": 22,
     "projection_dim": 64,
@@ -42,6 +42,7 @@ transformer_config = {
     "nhead": 4,
     "seq_len": 200
 }
+
 hyperparams = {
     'raw_data_path': "idsse-data",
     'data_save_path': "match_data",
@@ -74,16 +75,16 @@ if not os.path.exists(data_save_path) or len(os.listdir(data_save_path)) == 0:
 else:
     print("Skip organize_and_process")
 
-temp_dataset = CustomDataset(data_root=data_save_path, use_graph=False)
+temp_dataset = CustomDataset(data_root=data_save_path)
 train_idx, val_idx, test_idx = split_dataset_indices(temp_dataset, val_ratio=1/6, test_ratio=1/6, random_seed=SEED)
 
 zscore_stats = compute_train_zscore_stats(temp_dataset, train_idx, save_path="./train_zscore_stats.pkl")
 del temp_dataset
 gc.collect()
-dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats, use_graph=False)
+dataset = CustomDataset(data_root=data_save_path, zscore_stats=zscore_stats)
 
 train_dataloader = DataLoader(
-    ApplyAugmentedDataset(Subset(dataset, train_idx), use_graph=False),
+    ApplyAugmentedDataset(Subset(dataset, train_idx)),
     batch_size=train_batch_size,
     shuffle=True,
     num_workers=num_workers,
@@ -129,7 +130,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
 
 logger.info(f"Device: {device}")
-logger.info(f"Transformer Model: {model}")
+logger.info(f"Transformer Model (Absolute Coords): {model}")
 
 # 4. Train
 best_val_loss = float("inf")
@@ -145,13 +146,37 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     train_loss = 0
 
     for batch in tqdm(train_dataloader, desc="Batch Training...", leave=False):
-        # Use relative coordinates
-        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
-        target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
+        # Extract defender coordinates from condition
+        condition = batch["condition"].to(device)  # [B, T_cond, F]
+        condition_columns = batch["condition_columns"][0]
+        target_columns = batch["target_columns"][0]
         
-        # Predict relative coordinates
-        pred_rel = model(past_rel_coords)  # [B, T_target, 22]
-        loss = criterion(pred_rel, target_rel_coords)
+        # Extract defender absolute coordinates from condition
+        B, T_cond, _ = condition.shape
+        past_abs = torch.zeros(B, T_cond, 22, device=condition.device)
+        
+        # Create mapping from condition columns to indices
+        col_to_idx = {col: i for i, col in enumerate(condition_columns)}
+        
+        # Extract defender coordinates
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]     # e.g., 'Away_15_x'  
+            y_col = target_columns[i + 1] # e.g., 'Away_15_y'
+            
+            if x_col in col_to_idx and y_col in col_to_idx:
+                x_idx = col_to_idx[x_col]
+                y_idx = col_to_idx[y_col]
+                
+                past_abs[:, :, i] = condition[:, :, x_idx]     # x coordinate
+                past_abs[:, :, i + 1] = condition[:, :, y_idx] # y coordinate
+        
+        # Target is already in absolute coordinates
+        target_abs = batch["target"].to(device)  # [B, T_target, 22]
+        
+        # Predict absolute coordinates
+        pred_abs = model(past_abs)  # [B, T_target, 22]
+        
+        loss = criterion(pred_abs, target_abs)
         
         optimizer.zero_grad()
         loss.backward()
@@ -159,7 +184,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
 
         train_loss += loss.item()
 
-        del past_rel_coords, target_rel_coords, pred_rel, loss
+        del condition, past_abs, target_abs, pred_abs, loss
 
     num_batches = len(train_dataloader)
     avg_train_loss = train_loss / num_batches
@@ -170,16 +195,40 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validation", leave=False):
-            # Use relative coordinates
-            past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
-            target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
+            # Extract defender coordinates from condition
+            condition = batch["condition"].to(device)  # [B, T_cond, F]
+            condition_columns = batch["condition_columns"][0]
+            target_columns = batch["target_columns"][0]
             
-            # Predict relative coordinates
-            pred_rel = model(past_rel_coords)  # [B, T_target, 22]
-            loss = criterion(pred_rel, target_rel_coords)
+            # Extract defender absolute coordinates from condition
+            B, T_cond, _ = condition.shape
+            past_abs = torch.zeros(B, T_cond, 22, device=condition.device)
+            
+            # Create mapping from condition columns to indices
+            col_to_idx = {col: i for i, col in enumerate(condition_columns)}
+            
+            # Extract defender coordinates
+            for i in range(0, len(target_columns), 2):
+                x_col = target_columns[i]     # e.g., 'Away_15_x'  
+                y_col = target_columns[i + 1] # e.g., 'Away_15_y'
+                
+                if x_col in col_to_idx and y_col in col_to_idx:
+                    x_idx = col_to_idx[x_col]
+                    y_idx = col_to_idx[y_col]
+                    
+                    past_abs[:, :, i] = condition[:, :, x_idx]     # x coordinate
+                    past_abs[:, :, i + 1] = condition[:, :, y_idx] # y coordinate
+            
+            # Target is already in absolute coordinates
+            target_abs = batch["target"].to(device)  # [B, T_target, 22]
+            
+            # Predict absolute coordinates
+            pred_abs = model(past_abs)  # [B, T_target, 22]
+            
+            loss = criterion(pred_abs, target_abs)
             val_loss += loss.item()
 
-            del past_rel_coords, target_rel_coords, pred_rel, loss
+            del condition, past_abs, target_abs, pred_abs, loss
 
     avg_val_loss = val_loss / len(val_dataloader)
 
@@ -200,7 +249,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         
         if best_model_path and os.path.exists(best_model_path):
             os.remove(best_model_path)
-        best_model_path = os.path.join(model_save_path, f'{timestamp}_best_transformer_epoch_{epoch}.pth')
+        best_model_path = os.path.join(model_save_path, f'{timestamp}_best_transformer_absolute_epoch_{epoch}.pth')
         
         torch.save({
             'epoch': epoch,
@@ -232,11 +281,11 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Transformer Model (Relative Coords) - Train & Validation Loss\n"
+plt.title(f"Transformer Baseline (Absolute Coords) - Train & Validation Loss\n"
           f"Hidden dim: {transformer_config['hidden_dim']}, Layers: {transformer_config['num_layers']}")
 plt.legend()
 plt.tight_layout()
-plt.savefig(f'results/{timestamp}_transformer_relative_lr_curve.png')
+plt.savefig(f'results/{timestamp}_transformer_absolute_lr_curve.png')
 plt.show()
 plt.close()
 
@@ -262,51 +311,62 @@ bx_std = torch.tensor(zscore_stats['ball_x_std'], device=device)
 by_mean = torch.tensor(zscore_stats['ball_y_mean'], device=device)
 by_std = torch.tensor(zscore_stats['ball_y_std'], device=device)
 
-rel_x_mean = torch.tensor(zscore_stats['rel_x_mean'], device=device)
-rel_x_std = torch.tensor(zscore_stats['rel_x_std'], device=device)
-rel_y_mean = torch.tensor(zscore_stats['rel_y_mean'], device=device)
-rel_y_std = torch.tensor(zscore_stats['rel_y_std'], device=device)
-
 with torch.no_grad():
     for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Test Inference", leave=True)):
-        # Use relative coordinates for prediction
-        past_rel_coords = batch["condition_relative"].to(device)  # [B, T_cond, 22]
-        target_rel_coords = batch["target_relative"].to(device)  # [B, T_target, 22]
-        target_reference = batch["target_reference"].to(device)  # [B, 22] - reference point
+        # Extract defender coordinates from condition
+        condition = batch["condition"].to(device)  # [B, T_cond, F]
+        condition_columns = batch["condition_columns"][0]
+        target_columns = batch["target_columns"][0]
         
-        B, T_cond, _ = past_rel_coords.shape
-        _, T_target, _ = target_rel_coords.shape
+        # Extract defender absolute coordinates from condition
+        B, T_cond, _ = condition.shape
+        past_abs = torch.zeros(B, T_cond, 22, device=condition.device)
         
-        # Predict relative coordinates
-        pred_rel = model(past_rel_coords)  # [B, T_target, 22]
-        pred_rel = pred_rel.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
-        target_rel = target_rel_coords.view(B, T_target, 11, 2)  # [B, T_target, 11, 2]
+        # Create mapping from condition columns to indices
+        col_to_idx = {col: i for i, col in enumerate(condition_columns)}
         
-        # Convert relative coordinates back to absolute coordinates for evaluation
-        # Denormalize relative coordinates first
-        pred_rel_denorm = pred_rel.clone()
-        pred_rel_denorm[..., 0] = pred_rel[..., 0] * rel_x_std + rel_x_mean
-        pred_rel_denorm[..., 1] = pred_rel[..., 1] * rel_y_std + rel_y_mean
+        # Extract defender coordinates
+        for i in range(0, len(target_columns), 2):
+            x_col = target_columns[i]     # e.g., 'Away_15_x'  
+            y_col = target_columns[i + 1] # e.g., 'Away_15_y'
+            
+            if x_col in col_to_idx and y_col in col_to_idx:
+                x_idx = col_to_idx[x_col]
+                y_idx = col_to_idx[y_col]
+                
+                past_abs[:, :, i] = condition[:, :, x_idx]     # x coordinate
+                past_abs[:, :, i + 1] = condition[:, :, y_idx] # y coordinate
         
-        target_rel_denorm = target_rel.clone()
-        target_rel_denorm[..., 0] = target_rel[..., 0] * rel_x_std + rel_x_mean
-        target_rel_denorm[..., 1] = target_rel[..., 1] * rel_y_std + rel_y_mean
+        # Target is already in absolute coordinates
+        target_abs = batch["target"].to(device)  # [B, T_target, 22]
         
-        # Get reference point (target_reference is normalized, so denormalize it)
-        ref_coords = target_reference.view(B, 11, 2)  # [B, 11, 2]
+        B, T_cond, _ = past_abs.shape
+        _, T_target, _ = target_abs.shape
         
-        # Convert to absolute coordinates: absolute = reference + relative
-        pred_abs = pred_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
-        target_abs = target_rel_denorm + ref_coords.unsqueeze(1)  # [B, T_target, 11, 2]
+        # Predict absolute coordinates
+        pred_abs = model(past_abs)  # [B, T_target, 22]
+        
+        # Reshape for evaluation: [B, T, 11, 2]
+        pred_abs = pred_abs.view(B, T_target, 11, 2)
+        target_abs = target_abs.view(B, T_target, 11, 2)
+        
+        # Denormalize coordinates for evaluation
+        pred_abs_denorm = pred_abs.clone()
+        pred_abs_denorm[..., 0] = pred_abs[..., 0] * px_std + px_mean
+        pred_abs_denorm[..., 1] = pred_abs[..., 1] * py_std + py_mean
+        
+        target_abs_denorm = target_abs.clone()
+        target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
+        target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
 
         # Calculate ADE and FDE
-        ade = ((pred_abs - target_abs)**2).sum(-1).sqrt().mean((1,2))  # [B]
-        fde = ((pred_abs[:,-1,:,:] - target_abs[:,-1,:,:])**2).sum(-1).sqrt().mean(1)  # [B]
+        ade = ((pred_abs_denorm - target_abs_denorm)**2).sum(-1).sqrt().mean((1,2))  # [B]
+        fde = ((pred_abs_denorm[:,-1,:,:] - target_abs_denorm[:,-1,:,:])**2).sum(-1).sqrt().mean(1)  # [B]
 
-        # Calculate Direction Error
+        # Calculate DE (Direction Error: overall movement direction)
         eps = 1e-6
-        overall_pred = pred_abs[:, -1] - pred_abs[:, 0]
-        overall_gt = target_abs[:, -1] - target_abs[:, 0]
+        overall_pred = pred_abs_denorm[:, -1] - pred_abs_denorm[:, 0]
+        overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]
         
         norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
         norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
@@ -323,8 +383,8 @@ with torch.no_grad():
         all_DE.extend(DE.cpu().tolist())
 
         # Calculate Fréchet distance
-        pred_np = pred_abs.cpu().numpy()      # [B,T,N,2]
-        target_np = target_abs.cpu().numpy()
+        pred_np = pred_abs_denorm.cpu().numpy()      # [B,T,N,2]
+        target_np = target_abs_denorm.cpu().numpy()
         B_, T, N, _ = pred_np.shape
         batch_frechet = []
         for b in range(B_):
@@ -344,7 +404,7 @@ with torch.no_grad():
               f"Frechet={np.mean(batch_frechet):.3f}, DE={torch.rad2deg(DE.mean()):.2f}°")
 
         # Visualization
-        base_dir = "results/test_trajs_transformer"
+        base_dir = f"results/{timestamp}_test_trajs_transformer_absolute"
         os.makedirs(base_dir, exist_ok=True)
 
         for i in range(B):
@@ -366,8 +426,8 @@ with torch.no_grad():
                 other_den[:, j, 0] = other_seq[:, j, 0] * x_std + x_mean
                 other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
-            pred_traj = pred_abs[i].cpu().numpy()
-            target_traj = target_abs[i].cpu().numpy()
+            pred_traj = pred_abs_denorm[i].cpu().numpy()
+            target_traj = target_abs_denorm[i].cpu().numpy()
             other_traj = other_den.cpu().numpy()
 
             current_ade = ade[i].item()
@@ -385,12 +445,12 @@ with torch.no_grad():
                 defenders_num=defender_nums, annotate=True, save_path=save_path
             )
 
-        del pred_rel, pred_rel_denorm, target_rel, target_rel_denorm
-        del pred_abs, target_abs, ref_coords, ade, fde, DE
+        del condition, past_abs, pred_abs, target_abs
+        del pred_abs_denorm, target_abs_denorm, ade, fde, DE
         torch.cuda.empty_cache()
         gc.collect()
 
-print(f"Transformer Baseline (Relative Coordinates):")
+print(f"Transformer Baseline (Absolute Coordinates)")
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
 print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
