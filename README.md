@@ -1,4 +1,4 @@
-# Soccer-Trajectory-Prediction
+# Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements (Modifying)
 Defense team player trajectory prediction in soccer
 
 
