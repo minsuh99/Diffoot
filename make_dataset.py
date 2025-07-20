@@ -240,7 +240,7 @@ def organize_and_process(data_path, save_path):
 
 
 class CustomDataset(Dataset):
-    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=12, zscore_stats = None, use_graph=True):
+    def __init__(self, data_root, segment_length=200, condition_length=100, framerate=25, stride=12, zscore_stats = None, use_graph=False):
         self.data_root = data_root
         self.segment_length = segment_length
         self.condition_length = condition_length
@@ -724,7 +724,7 @@ class CustomDataset(Dataset):
         return sample
     
 class ApplyAugmentedDataset(Dataset):
-    def __init__(self, base_dataset, flip_prob = 0.7, use_graph=True):
+    def __init__(self, base_dataset, flip_prob = 0.7, use_graph=False):
         self.base = base_dataset
         if isinstance(base_dataset, Subset):
             self.zscore_stats = base_dataset.dataset.zscore_stats
