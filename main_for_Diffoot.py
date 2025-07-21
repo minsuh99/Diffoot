@@ -10,8 +10,8 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from models.diff_modules import diff_CSDI
-from models.diff_model import DiffusionTrajectoryModel
+from models.Diffoot_modules import Diffoot_DenoisingNetwork
+from models.Diffoot import Diffoot
 from models.encoder import InteractionGraphEncoder
 from make_dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
 from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats, calc_frechet_distance
@@ -42,9 +42,9 @@ csdi_config = {
     "layers": 5,
     "side_dim": 256,
     
-    "time_seq_len": 100,      # Target 시간 길이
-    "feature_seq_len": 11,    # 선수 수
-    "compressed_dim": 32     # 압축 차원
+    "time_seq_len": 100,
+    "feature_seq_len": 11,
+    "compressed_dim": 32
 }
 hyperparams = {
     'raw_data_path': "idsse-data", # raw_data_path = "Download raw file path"
@@ -62,6 +62,16 @@ hyperparams = {
     'eta': 0.2,
     **csdi_config
 }
+num_steps = hyperparams['num_steps']
+channels = hyperparams['channels']
+diffusion_embedding_dim = hyperparams['diffusion_embedding_dim']
+nheads = hyperparams['nheads']
+layers = hyperparams['layers']
+side_dim = hyperparams['side_dim']
+time_seq_len = hyperparams['time_seq_len']
+feature_seq_len = hyperparams['feature_seq_len']
+compressed_dim = hyperparams['compressed_dim']
+
 raw_data_path = hyperparams['raw_data_path']
 data_save_path = hyperparams['data_save_path']
 train_batch_size = hyperparams['train_batch_size']
@@ -149,15 +159,15 @@ in_dim = graph['Node'].x.size(1)
 
 # Model Define
 graph_encoder = InteractionGraphEncoder(in_dim=in_dim, hidden_dim=side_dim, out_dim=side_dim).to(device)
-denoiser = diff_CSDI(csdi_config)
-diff_model = DiffusionTrajectoryModel(denoiser, num_steps=csdi_config["num_steps"]).to(device)
+denoiser = Diffoot_DenoisingNetwork(csdi_config)
+diff_model = Diffoot(denoiser, num_steps=num_steps).to(device)
 optimizer = torch.optim.AdamW(list(diff_model.parameters()) + list(graph_encoder.parameters()), lr=learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=2, threshold=1e-5, min_lr=learning_rate*0.01)
 
 logger.info(f"Device: {device}")
 logger.info(f"GraphEncoder: {graph_encoder}")
-logger.info(f"Denoiser (diff_CSDI): {denoiser}")
-logger.info(f"DiffusionTrajectoryModel: {diff_model}")
+logger.info(f"Denoiser (Diffoot_DenoisingNetwork): {denoiser}")
+logger.info(f"Diffoot: {diff_model}")
 
 # 4. Train
 best_model_path = None
@@ -338,8 +348,8 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels,\n"
-          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers")
+plt.title(f"Train & Validation Loss, {num_steps} steps, {channels} channels,\n"
+          f"{diffusion_embedding_dim} embedding dim, {nheads} heads, {layers} layers")
 plt.legend()
 plt.tight_layout()
 plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
@@ -410,57 +420,57 @@ with torch.no_grad():
 
         graph_batch = batch["graph"].to(device)
 
-        # condition 준비
         H = graph_encoder(batch["graph"].to(device))
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         cond_info = cond_H
         
         preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
 
-        # 2. 기준점 비정규화
+        # reference point denormalization
         ref_denorm = initial_pos.clone()
         ref_denorm[..., 0] = initial_pos[..., 0] * px_std + px_mean
         ref_denorm[..., 1] = initial_pos[..., 1] * py_std + py_mean
 
-        # GT 절대좌표 비정규화
+        # Target Denormalization
         target_abs_denorm = target_abs.clone()
         target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
         target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
 
         # Evaluation
-        batch_ades_all_samples = []  # [num_samples, B]
-        batch_fdes_all_samples = []  # [num_samples, B]
-        batch_frechet_all_samples = []  # [num_samples, B]
-        batch_DE_all_samples = []  # [num_samples, B]
+        batch_ades_all_samples = []
+        batch_fdes_all_samples = []
+        batch_frechet_all_samples = []
+        batch_DE_all_samples = []
 
         for sample_idx in range(num_samples):
-            pred = preds[sample_idx]  # [B, T, 11, 2]
+            pred = preds[sample_idx]
 
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
 
-            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
-
+            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)
+            
+            # ADE & FDE
             ade = ((pred_absolute[...,:2] - target_abs_denorm[...,:2])**2).sum(-1).sqrt().mean((1,2))  # [B]
             fde = ((pred_absolute[:,-1,:,:2] - target_abs_denorm[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)  # [B]
-
+            # DE(Direction Error)
             eps = 1e-6
-            overall_pred = pred_absolute[:, -1] - pred_absolute[:, 0]  # [B, N, 2]
-            overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]  # [B, N, 2]
+            overall_pred = pred_absolute[:, -1] - pred_absolute[:, 0]
+            overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]
             
-            norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
-            norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+            norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)
+            norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)
             
-            u = overall_pred / norm_pred  # [B, N, 2]
-            v = overall_gt / norm_gt  # [B, N, 2]
+            u = overall_pred / norm_pred 
+            v = overall_gt / norm_gt
             
             cosine = (u * v).sum(dim=-1).clamp(-1.0, 1.0)
             theta = cosine.acos()
             DE = theta.mean(dim=1)
             
-            # Calculate Fréchet distance
-            pred_np = pred_absolute.cpu().numpy()      # [B,T,N,2]
+            # Fréchet distance
+            pred_np = pred_absolute.cpu().numpy()
             target_np = target_abs_denorm.cpu().numpy()
             B_, T, N, _ = pred_np.shape
             batch_frechet = []
@@ -478,11 +488,12 @@ with torch.no_grad():
             batch_frechet_all_samples.append(torch.tensor(batch_frechet))
             batch_DE_all_samples.append(DE.cpu())
 
-        batch_ades_tensor = torch.stack(batch_ades_all_samples)  # [num_samples, B]
-        batch_fdes_tensor = torch.stack(batch_fdes_all_samples)  # [num_samples, B]
-        batch_frechet_tensor = torch.stack(batch_frechet_all_samples)  # [num_samples, B]
-        batch_DE_tensor = torch.stack(batch_DE_all_samples)  # [num_samples, B]
+        batch_ades_tensor = torch.stack(batch_ades_all_samples)
+        batch_fdes_tensor = torch.stack(batch_fdes_all_samples)
+        batch_frechet_tensor = torch.stack(batch_frechet_all_samples)
+        batch_DE_tensor = torch.stack(batch_DE_all_samples)
 
+        # Best-of-K methods
         min_ades, min_ade_indices = batch_ades_tensor.min(dim=0)  # [B]
         min_fdes, _ = batch_fdes_tensor.min(dim=0)  # [B]
         min_frechet, _ = batch_frechet_tensor.min(dim=0)  # [B]
@@ -492,8 +503,7 @@ with torch.no_grad():
         all_min_fdes.extend(min_fdes.tolist())
         all_min_frechet.extend(min_frechet.tolist())
         all_min_DE.extend(min_DE.tolist())
-        
-        # Also store average results for comparison
+
         avg_ades = batch_ades_tensor.mean(dim=0)
         avg_fdes = batch_fdes_tensor.mean(dim=0)
         avg_frechet = batch_frechet_tensor.mean(dim=0)
@@ -504,7 +514,6 @@ with torch.no_grad():
         all_frechet_dist.extend(avg_frechet.tolist())
         all_DE.extend(avg_DE.tolist())
         
-        # Debug print
         print(f"[Batch {batch_idx}] "
               f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, "
               f"Frechet={avg_frechet.mean():.3f}, DE={torch.rad2deg(avg_DE.mean()):.2f}° | "
@@ -518,16 +527,16 @@ with torch.no_grad():
 
         all_pred_absolutes = []
         for sample_idx in range(num_samples):
-            pred = preds[sample_idx]  # [B, T, 11, 2]
+            pred = preds[sample_idx]
 
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
 
-            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)  # [B, T, N, 2]
+            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)
             all_pred_absolutes.append(pred_absolute.cpu().numpy())
         
-        all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
+        all_pred_absolutes = np.stack(all_pred_absolutes)
 
         for i in range(B):
             other_cols = batch["other_columns"][i]
@@ -548,7 +557,7 @@ with torch.no_grad():
                 other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
             best_sample_idx = min_ade_indices[i].item()
-            pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
+            pred_traj = all_pred_absolutes[best_sample_idx, i]
             
             target_traj = target_abs_denorm[i].cpu().numpy()
             other_traj = other_den.cpu().numpy()
@@ -578,8 +587,10 @@ with torch.no_grad():
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
 print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
+print(f"DE: {np.mean(all_DE):.3f}° ± {np.std(all_DE):.3f}°")
 
 print(f"Best-of-{num_samples} Sampling (min):")
 print(f"minADE{num_samples}: {np.mean(all_min_ades):.3f} ± {np.std(all_min_ades):.3f} meters")
 print(f"minFDE{num_samples}: {np.mean(all_min_fdes):.3f} ± {np.std(all_min_fdes):.3f} meters")
 print(f"minFréchet{num_samples}: {np.mean(all_min_frechet):.3f} ± {np.std(all_min_frechet):.3f} meters")
+print(f"minDE{num_samples}: {np.mean(all_min_DE):.3f}° ± {np.std(all_min_DE):.3f}°")

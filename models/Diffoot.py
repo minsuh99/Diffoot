@@ -2,19 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.utils import per_player_mse_loss
 
-class DiffusionTrajectoryModel(nn.Module):
-    # def __init__(self, model, num_steps=1000, beta_start=1e-4, beta_end=0.02):
-    #     super().__init__()
-    #     self.model = model
-    #     self.num_steps = num_steps
-    
-    #     ts = torch.linspace(0, 1, num_steps)
-    #     betas = beta_start + (beta_end - beta_start) * (ts ** 2)
-    #     alphas = 1.0 - betas
-    #     alpha_hat = torch.cumprod(alphas, dim=0)
-    
+class Diffoot(nn.Module):    
     def __init__(self, model, num_steps=1000, s=0.008):
         super().__init__()
         self.model = model
@@ -25,8 +14,7 @@ class DiffusionTrajectoryModel(nn.Module):
 
         alphas_cumprod = torch.cos(((x / num_steps) + s) / (1 + s) * math.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        
-        # Calculate betas from alpha_cumprod
+
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         betas = torch.clip(betas, 0.0001, 0.9999).float()
         
@@ -112,9 +100,9 @@ class DiffusionTrajectoryModel(nn.Module):
             cond_info = cond_info.to(device).unsqueeze(0).repeat(num_samples, 1, 1, 1, 1)
             cond_info = cond_info.view(num_samples * B, *cond_info.shape[2:])
 
-        ref_raw = reference_point.view(B, N, D)  # [B, N, 2]
-        ref_raw = ref_raw.unsqueeze(0).repeat(num_samples, 1, 1, 1)  # [num_samples, B, N, 2]
-        ref_raw = ref_raw.view(num_samples * B, N, D)  # [num_samples*B, N, 2]
+        ref_raw = reference_point.view(B, N, D)
+        ref_raw = ref_raw.unsqueeze(0).repeat(num_samples, 1, 1, 1)
+        ref_raw = ref_raw.view(num_samples * B, N, D)
 
         x = torch.randn(num_samples * B, T, N, D, device=device)
 

@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # def get_torch_trans(heads=4, layers=1, channels=128):
 #     encoder_layer = nn.TransformerEncoderLayer(
 #         d_model=channels, nhead=heads, dim_feedforward=channels * 2,
@@ -27,25 +26,23 @@ class LinearAttentionHead(nn.Module):
         self.causal = causal
 
     def forward(self, Q, K, V):
-        K = K.transpose(1, 2)  # (B, dim, seq_len)
-        K = self.E(K)          # (B, dim, compressed_dim)
-        Q = torch.matmul(Q, K) # (B, seq_len, compressed_dim)
+        K = K.transpose(1, 2)
+        K = self.E(K)
+        Q = torch.matmul(Q, K)
 
         P_bar = Q / torch.sqrt(torch.tensor(self.dim, dtype=Q.dtype, device=Q.device))
-        
-        # Apply causal mask if needed
+
         if self.causal:
             seq_len, comp_dim = P_bar.size(1), P_bar.size(2)
             causal_mask = torch.triu(torch.ones(seq_len, comp_dim, device=P_bar.device)) == 1
             P_bar = P_bar.masked_fill(~causal_mask, -1e10)
-            # P_bar = P_bar.masked_fill(~causal_mask, -1e4)
         
         P_bar = P_bar.softmax(dim=-1)
         P_bar = self.dropout(P_bar)
 
-        V = V.transpose(1, 2)  # (B, dim, seq_len)
-        V = self.F(V)          # (B, dim, compressed_dim)
-        V = V.transpose(1, 2)  # (B, compressed_dim, dim)
+        V = V.transpose(1, 2)
+        V = self.F(V)
+        V = V.transpose(1, 2)
         
         out_tensor = torch.matmul(P_bar, V)
         return out_tensor
@@ -77,18 +74,17 @@ class LinformerMultiHead(nn.Module):
         self.w_o = nn.Linear(channels, channels)
         
     def forward(self, x):
-        # x shape: (B, seq_len, channels)     
         head_outputs = []
         for i, head in enumerate(self.heads):
-            Q = self.to_q[i](x)  # (B, seq_len, head_dim)
-            K = self.to_k[i](x)  # (B, seq_len, head_dim)
-            V = self.to_v[i](x)  # (B, seq_len, head_dim)
-            
-            head_out = head(Q, K, V)  # (B, seq_len, head_dim)
+            Q = self.to_q[i](x)
+            K = self.to_k[i](x)
+            V = self.to_v[i](x)
+
+            head_out = head(Q, K, V)
             head_outputs.append(head_out)
         
         # Concatenate heads
-        out = torch.cat(head_outputs, dim=-1)  # (B, seq_len, channels)
+        out = torch.cat(head_outputs, dim=-1)
         return self.w_o(out)
 
 def get_linformer_trans(heads=4, layers=1, channels=128, seq_len=100, compressed_dim=32, causal=False):
@@ -125,8 +121,6 @@ class LinformerTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        # x shape: (B, seq_len, channels)
-        
         # Self-attention with residual connection
         x = self.norm1(x)
         attn_out = self.attention(x)
@@ -170,10 +164,10 @@ class DiffusionEmbedding(nn.Module):
         return x
     
     def _build_embedding(self, num_steps, dim=64):
-        steps = torch.arange(num_steps).unsqueeze(1)  # (T,1)
-        frequencies = 10.0 ** (torch.arange(dim) / (dim - 1) * 4.0).unsqueeze(0)  # (1,dim)
-        table = steps * frequencies  # (T,dim)
-        table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)  # (T,dim*2)
+        steps = torch.arange(num_steps).unsqueeze(1)
+        frequencies = 10.0 ** (torch.arange(dim) / (dim - 1) * 4.0).unsqueeze(0)
+        table = steps * frequencies
+        table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)
         return table
 
 
@@ -195,21 +189,20 @@ class ResidualBlock(nn.Module):
         
         if side_dim is not None:
             self.cond_proj = nn.Linear(side_dim, channels)
-            # Cross-Attention module
+
             self.cross_attn = nn.MultiheadAttention(
                 embed_dim=channels,
                 num_heads=nheads,
                 batch_first=True,
                 dropout=0.2
             )
-            # FiLM projection from attended cond_info
+
             self.film_proj = nn.Sequential(
                 nn.Linear(channels, 2 * channels),
                 nn.SiLU(),
                 nn.Linear(2 * channels, 2 * channels)
             )
-            
-            # FiLM Layer Initialize
+
             with torch.no_grad():
                 nn.init.zeros_(self.film_proj[-1].weight)
                 if self.film_proj[-1].bias is not None:
@@ -237,27 +230,22 @@ class ResidualBlock(nn.Module):
     def forward(self, x, cond_info, diffusion_emb):
         B, C, K, L = x.shape
         base_shape = x.shape
-        
-        # Flatten spatial dims and add diffusion embedding
+
         y = x.reshape(B, C, K * L)
         diff = self.diffusion_projection(diffusion_emb).unsqueeze(-1)
         y = y + diff
         
         y = self.norm1(y.permute(0, 2, 1)).permute(0, 2, 1)
 
-        # Temporal + feature mixing
         yt = self.forward_time(y, base_shape)
         yf = self.forward_feature(y, base_shape)
         y = yt + yf
-        
-        # Mid projection
+
         y = self.mid_projection(y)
         y = self.norm2(y.permute(0, 2, 1)).permute(0, 2, 1)
         y = self.dropout(y)
 
-        # Cross-Attention based FiLM
         if cond_info is not None:
-            # Prepare Q and KV
             x_flat = y.reshape(B, C, K * L).permute(0, 2, 1)  # (B, K*L, C)
             c_flat = cond_info.reshape(B, self.side_dim, K * L).permute(0, 2, 1)  # (B, K*L, side_dim)
             c_proj = self.cond_proj(c_flat)
@@ -267,18 +255,15 @@ class ResidualBlock(nn.Module):
                 key=c_proj,
                 value=c_proj
             )
-
-            # Pool attended output
-            film_params = self.film_proj(attn_out)                  # (B, K*L, 2*C)
-            film_params = film_params.permute(0, 2, 1).reshape(B, 2*C, K, L)
-            gamma, beta = film_params.chunk(2, dim=1)               # 각각 (B, C, K, L)
-
             # Apply FiLM
+            film_params = self.film_proj(attn_out)
+            film_params = film_params.permute(0, 2, 1).reshape(B, 2*C, K, L)
+            gamma, beta = film_params.chunk(2, dim=1)
+
             y = y.reshape(B, C, K, L)
             y = gamma * y + beta
             y = y.reshape(B, C, K * L)
 
-        # Gated activation and skip
         z = self.output_projection(y)
         gate, filt = z.chunk(2, dim=1)
         activated = torch.sigmoid(gate) * torch.tanh(filt)
@@ -287,8 +272,8 @@ class ResidualBlock(nn.Module):
         skip = activated.reshape(B, C, K, L)
         return out, skip
 
-
-class diff_CSDI(nn.Module):
+# CSDI based Denoising Network
+class Diffoot_DenoisingNetwork(nn.Module):
     def __init__(self, config, inputdim=2):
         super().__init__()
         self.channels = config["channels"]
@@ -303,14 +288,13 @@ class diff_CSDI(nn.Module):
         self.dropout = nn.Dropout(0.2)
         self.norm = nn.LayerNorm(self.channels)
 
-        # Diffusion embedding module
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=self.num_steps,
             embedding_dim=self.diffusion_embedding_dim
         )
-        # Input projection
+
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
-        # Residual blocks
+
         self.residual_layers = nn.ModuleList([
             ResidualBlock(
                 channels=self.channels,
@@ -323,8 +307,7 @@ class diff_CSDI(nn.Module):
             ) for _ in range(config["layers"])
         ])
         self.inv_sqrt_layers = 1.0 / math.sqrt(len(self.residual_layers))
-        
-        # Output projections
+
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
         self.output_projection2 = Conv1d_with_init(self.channels, inputdim * 2, 1)  # noise(2) + log_sigma(2 channels)
         nn.init.xavier_uniform_(self.output_projection2.weight)
@@ -339,18 +322,9 @@ class diff_CSDI(nn.Module):
         x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1)
         x = F.silu(x)
 
-        # Prepare diffusion embedding
         diffusion_emb = self.diffusion_embedding(diffusion_step)
 
-        # Apply residual blocks
-        # x = x.reshape(B, self.channels, K, L)
-        # skip_connections = []
-        # for block in self.residual_layers:
-        #     x, skip = block(x, cond_info, diffusion_emb)
-        #     skip_connections.append(skip)
-
         # # Aggregate skips
-        # x = torch.sum(torch.stack(skip_connections), dim=0) / math.sqrt(len(self.residual_layers))
         x = x.reshape(B, self.channels, K, L)
         skip_sum = torch.zeros_like(x)
 
@@ -367,6 +341,6 @@ class diff_CSDI(nn.Module):
         x = self.output_projection2(x)
         x = x.reshape(B, inputdim * 2, K, L)
         eps, log_sigma = x[:, :inputdim], x[:, inputdim:]
-        log_sigma = torch.clamp(log_sigma, -10, 2) # Clamp range Fixed
+        log_sigma = torch.clamp(log_sigma, -10, 2)
         x = torch.cat([eps, log_sigma], dim=1)
         return x
