@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from models.Diffoot_modules import Diffoot_DenoisingNetwork
 from models.Diffoot import Diffoot
 from models.encoder import InteractionGraphEncoder
-from make_dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
+from dataset import CustomDataset, organize_and_process, ApplyAugmentedDataset
 from utils.utils import set_everything, worker_init_fn, generator, plot_trajectories_on_pitch, log_graph_stats, calc_frechet_distance
 from utils.data_utils import split_dataset_indices, compute_train_zscore_stats, custom_collate_fn
 from utils.graph_utils import build_graph_sequence_from_condition
