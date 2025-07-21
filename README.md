@@ -1,5 +1,5 @@
 # Diffoot (Modifying)
-Soure corde of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements
+Soure code of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements
 
 
 (25.07.20) Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
