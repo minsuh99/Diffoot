@@ -1,10 +1,29 @@
-# Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements (Modifying)
-Defense team player trajectory prediction in soccer
+# Diffoot (Modifying)
+Soure corde of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements
 
+
+(25.07.20) Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
+
+# FrameWork
+![Framework](figure/framework.jpg)
+
+# Results
+![Results](figure/result.jpg)
 
 # Requirements
-In requirements.txt
-
+Use requirements.txt
+```
+pip install requirements.txt
+```
+Here's the main packages' versions below:
+```
+python=3.10
+torch==2.4.0+cu121
+floodlight==0.5.0
+pandas == 2.2.3
+numpy == 2.2.4
+matplotlib == 3.10.1
+```
 
 # Get the data
 Download the raw data [here](https://springernature.figshare.com/articles/dataset/An_integrated_dataset_of_spatiotemporal_and_event_data_in_elite_soccer/28196177)
@@ -19,36 +38,23 @@ Download the raw data [here](https://springernature.figshare.com/articles/datase
 
 ```    
     SoccerTrajPredict/
+                ├── utils/                          # Util codes
+                │      ├── data_utils.py            # utils for data processing
+                |      ├── graph_utils.py           # utils for building graph data
+                │      ├── data_processing.py       # processing tools from idsse-data
+                │      ├── Metrica_EPV.py           # Tools from LauireOnTracking
+                │      ├── Metrica_IO.py            
+                │      ├── Metrica_PitchControl.py            
+                │      ├── Metrica_Velocities.py            
+                │      ├── Metrica_Viz.py       
+                │      └── utils.py                 # essential tools from references
+                ├── models/                         # Model codes
+                │      ├── Diffoot.py               # Main diffusion model of Diffoot
+                |      ├── Diffoot_modules.py       # Denoising network of Diffoot
+                |      └── encoder.py               # Encoder model codes
                 │
-                ├── idsse-data/                           # raw_data file directory
-                │   ├── DFL-MAT-J03WMX
-                │   │      ├──DFL_02_01_matchinformation_DFL-COM-000001_DFL-MAT-J03WMX.xml
-                │   │      ├──DFL_03_02_events_raw_DFL-COM-000001_DFL-MAT-J03WMX.xml
-                │   │      └──DFL_04_03_positions_raw_observed_DFL-COM-000001_DFL-MAT-J03WMX.xml
-                │   ├── DFL-MAT-J03WN1
-                |   └── ... (for all 7 matchs)
-                ├── codes/ 
-                │   ├── utils/                          # Util codes
-                │   │      ├── data_utils.py            # utils for data processing
-                |   |      ├── graph_utils.py           # utils for building graph data
-                │   │      ├── data_processing.py       # processing tools from idsse-data
-                │   │      ├── Metrica_EPV.py           # Tools from LauireOnTracking
-                │   │      ├── Metrica_IO.py            
-                │   │      ├── Metrica_PitchControl.py            
-                │   │      ├── Metrica_Velocities.py            
-                │   │      ├── Metrica_Viz.py       
-                │   │      └── utils.py                 # essential tools from references
-                │   ├── models/                         # Model codes
-                │   │      ├── diff_model.py            # Diffusion Model
-                |   |      ├── diff_modules.py          # Diffusion Modules (Denoising network)
-                |   |      ├── encoder.py               # Encoder model codes
-                |   |      ├── pretrainig_encoder.py    # pretraing encoder for conditions
-                │   │      ├── lstm_model.py            # Time-Series Model for comparing
-                │   │      └── transformer_model.py
-                │   │
-                │   ├── make_dataset.py             # Generating Dataset
-                |   ├── main_for_diffusion.py       # Main.py for diffusion model
-                |   └── main_for_timeseries.py      # Main.py for time-series model
+                ├── make_dataset.py             # Generating Dataset
+                └── main_for_Diffoot.py         # Main.py for diffusion model
                 │
                 ├── requirements.txt            # Dependencies
                 |
