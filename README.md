@@ -3,6 +3,7 @@ Soure code of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Footba
 
 
 (25.07.20) Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
+(25.08.12) Paper Accpeted
 
 # FrameWork
 ![Framework](figure/framework.jpg)
