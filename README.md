@@ -1,10 +1,11 @@
 # Diffoot (Modifying)
 Soure code of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements
 
-
 (25.07.20) Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
 
-(25.08.12) Paper Accpeted
+(25.08.12) Paper Accpeted (Will be Published)
+
+(25.09.25) Best Presentation Award
 
 # FrameWork
 ![Framework](figure/framework.jpg)
