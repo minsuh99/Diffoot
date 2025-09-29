@@ -478,7 +478,7 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
     ax.scatter(ball_x[0], ball_y[0], color='black', s=50, marker='o', alpha=1.0, edgecolors='white', linewidth=2)
     ax.scatter(ball_x[-1], ball_y[-1], color='black', s=40, marker='o', alpha=1.0)
     
-    square_size = 1.0
+    square_size = 2.0
     square = plt.Rectangle((ball_x[-1] - square_size/2, ball_y[-1] - square_size/2), 
                         square_size, square_size, 
                         color='black', alpha=0.9, zorder=10)
@@ -505,9 +505,9 @@ def plot_trajectories_on_pitch(others, target, pred, other_columns = None, defen
                     ha='center', va='center', zorder=11)
 
         x, y = pred[:, i, 0], pred[:, i, 1]
-        ax.plot(x, y, color='navy', linestyle='--', linewidth=2.0, alpha=1.0, label='Predicted' if i == 0 else None)
-        ax.scatter(x[0], y[0], color='navy', s=40, marker='o', alpha=1.0, edgecolors='white', linewidth=1)
-        ax.scatter(x[-1], y[-1], color='navy', s=50, marker='^', alpha=1.0)
+        ax.plot(x, y, color='magenta', linestyle='-.', linewidth=2.0, alpha=1.0, label='Predicted' if i == 0 else None)
+        ax.scatter(x[0], y[0], color='magenta', s=40, marker='o', alpha=1.0, edgecolors='white', linewidth=1)
+        ax.scatter(x[-1], y[-1], color='magenta', s=50, marker='^', alpha=1.0)
 
         # if annotate and defenders_num is not None:
         #     jersey = defenders_num[i]
