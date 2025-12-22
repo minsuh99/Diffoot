@@ -66,5 +66,18 @@ Download the raw data [here](https://springernature.figshare.com/articles/datase
 
 # Citation
 
+'''
+@inproceedings{Park2025Diffoot,
+  author    = {Park, Minsuh and Kim, Kyoung-Sook and Kim, Taehoon and Li, Ki-Joune},
+  title     = {Diffoot: Graph-Conditioned Diffusion Model for Predicting Football Player Movements},
+  booktitle = {Proceedings of the 7th International Conference on Big Data Engineering (BDE '25)},
+  year      = {2025},
+  pages     = {14--22},
+  publisher = {ACM},
+  doi       = {10.1145/3775050.3775053},
+  url       = {https://doi.org/10.1145/3775050.3775053}
+}
+'''
+
 # License
 Relseased under MIT License
