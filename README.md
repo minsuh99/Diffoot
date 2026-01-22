@@ -1,13 +1,13 @@
 # Diffoot (Modifying)
 Soure code of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Football Player Movements
 
-(25.07.20) Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
+(25.07.20) ✅Submitted paper for BDE 2025 (2025 7th International Conference on Big Data Engineering)
 
-(25.08.12) Paper Accpeted (Will be Published, ACM ISBN: 979-8-4007-1936-3)
+(25.08.12) ✅Paper Accpeted (Will be Published, ACM ISBN: 979-8-4007-1936-3)
 
-(25.09.25) Best Presentation Award
+(25.09.25) 🏆Best Presentation Award
 
-(25.12.20) Conference Proceedings is **Published**! (BDE '25: Proceedings of the 2025 7th International Conference on Big Data Engineering / ISBN: 979-8-4007-1936-3)
+(25.12.20) ✅Conference Proceedings is **Published**! (BDE '25: Proceedings of the 2025 7th International Conference on Big Data Engineering / ISBN: 979-8-4007-1936-3)
 
 # FrameWork
 ![Framework](figure/framework.jpg)
@@ -15,14 +15,28 @@ Soure code of  Diffoot - Graph-Conditioned Diffusion Model for Predicting Footba
 # Results
 ![Results](figure/result.jpg)
 
-# Requirements
-Use requirements.txt
+# Install Modules
+
+You can install dependencies using either `requirements.txt` or `environment.yml`
+
+If you want to install via `pip`,
+
 ```
-pip install requirements.txt
+pip install -r requirements.txt
 ```
+Or via `conda`,
+```
+conda env create -f environment.yml
+```
+If you install via `conda`, remove the `name` and `prefix` fields from `environment.yml`, and then create the environment with your own name 
+```
+conda env create -f environment.yml -n [your env name]
+```
+
+
 Here's the main packages' versions below:
 ```
-python=3.10
+python=3.10.16
 torch==2.4.0+cu121
 floodlight==0.5.0
 pandas == 2.2.3
