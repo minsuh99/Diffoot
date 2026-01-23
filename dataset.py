@@ -73,6 +73,7 @@ def process_match(xy, possession, ballstatus):
     home = pd.concat([df_home_1, df_home_2])
     away = pd.concat([df_away_1, df_away_2])
     dummy_events = pd.DataFrame(index=home.index) # empty df
+    dummy_events["Period"] = home["Period"].values # Fix
     
     home, away, _ = to_single_playing_direction(home, away, dummy_events)
     
@@ -235,7 +236,7 @@ def organize_and_process(data_path, save_path):
         )
         
     match_ids = [d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))]
-    for mid in match_ids:
+    for mid in tqdm(match_ids):
         _convert_match(mid)
 
 

@@ -185,37 +185,23 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     train_noise_nll = 0
     train_loss = 0
 
-    for batch in tqdm(train_dataloader, desc = "Batch Training...", leave=False):
+    for batch in tqdm(train_dataloader, desc="Batch Training...", leave=False):
         cond = batch["condition"].to(device)
         B, T_cond, _ = cond.shape
         _, T_target, _ = batch["target"].shape
-        target_columns = batch["target_columns"][0]
-        condition_columns = batch["condition_columns"][0]
+        target_abs = batch["target"].to(device)  # [B, T, 22]
+        reference_point = batch["target_reference"].to(device)  # [B, 22]
+        graph_batch = batch["graph"].to(device)
         
-        target_x_indices = []
-        target_y_indices = []
-        
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                target_x_indices.append(condition_columns.index(x_col))
-                target_y_indices.append(condition_columns.index(y_col))
-
-        last_past_cond = cond[:, -1]
-
-        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-        graph_batch = batch["graph"].to(device) # HeteroData batch
         # graph → H
         H = graph_encoder(graph_batch) # [B, 256]
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         cond_info = cond_H
 
-        # timestep (consistency)
-        t = torch.randint(0, diff_model.num_steps, (target_rel.size(0),), device=device)
-        
-        loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info)
+        # timestep
+        t = torch.randint(0, diff_model.num_steps, (target_abs.size(0),), device=device)
+
+        loss_v, noise_nll = diff_model(target_abs, reference_point, zscore_stats, t=t, cond_info=cond_info)
         loss = loss_v + noise_nll * 0.001
             
         optimizer.zero_grad()
@@ -226,7 +212,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
         train_noise_nll += (noise_nll * 0.001).item()
         train_loss += loss.item()
 
-        del cond, last_past_cond, target_rel, graph_batch, H, cond_H
+        del cond, target_abs, reference_point, graph_batch, H, cond_H
         del cond_info, t, loss_v, noise_nll
 
     num_batches = len(train_dataloader)
@@ -239,7 +225,7 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
     # --- Validation ---
     diff_model.eval()
     graph_encoder.eval()
-    
+
     val_loss_v = 0
     val_noise_nll = 0
     val_total_loss = 0
@@ -249,40 +235,26 @@ for epoch in tqdm(range(1, epochs + 1), desc="Training...", leave=True):
             cond = batch["condition"].to(device)
             B, T_cond, _ = cond.shape
             _, T_target, _ = batch["target"].shape
-            target_columns = batch["target_columns"][0]
-            condition_columns = batch["condition_columns"][0]
+            target_abs = batch["target"].to(device)  # [B, T, 22]
+            reference_point = batch["target_reference"].to(device)  # [B, 22]
+            graph_batch = batch["graph"].to(device)
             
-            target_x_indices = []
-            target_y_indices = []
-            
-            for i in range(0, len(target_columns), 2):
-                x_col = target_columns[i]
-                y_col = target_columns[i + 1]
-                
-                if x_col in condition_columns and y_col in condition_columns:
-                    target_x_indices.append(condition_columns.index(x_col))
-                    target_y_indices.append(condition_columns.index(y_col))
-            
-            last_past_cond = cond[:, -1]
-
-            target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T, 11, 2]
-            graph_batch = batch["graph"].to(device) # HeteroData batch
-
             # graph → H
             H = graph_encoder(graph_batch) # [B, 256]
             cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
             cond_info = cond_H
-            
-            t = torch.randint(0, diff_model.num_steps, (B,), device=device)
-    
-            loss_v, noise_nll = diff_model(target_rel, t=t, cond_info=cond_info)
+
+            # timestep
+            t = torch.randint(0, diff_model.num_steps, (target_abs.size(0),), device=device)
+
+            loss_v, noise_nll = diff_model(target_abs, reference_point, zscore_stats, t=t, cond_info=cond_info)
             val_loss = loss_v + noise_nll * 0.001
 
             val_loss_v += (loss_v).item()
             val_noise_nll += (noise_nll * 0.001).item()
             val_total_loss += val_loss.item()
 
-        del cond, last_past_cond, target_rel, graph_batch, H, cond_H
+        del cond, target_abs, reference_point, graph_batch, H, cond_H
         del cond_info, t, loss_v, noise_nll
 
     num_batches = len(val_dataloader)
@@ -348,8 +320,8 @@ plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
 plt.plot(range(1, epochs+1), val_losses, label='Val Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.title(f"Train & Validation Loss, {num_steps} steps, {channels} channels,\n"
-          f"{diffusion_embedding_dim} embedding dim, {nheads} heads, {layers} layers")
+plt.title(f"Train & Validation Loss, {csdi_config['num_steps']} steps, {csdi_config['channels']} channels,\n"
+          f"{csdi_config['diffusion_embedding_dim']} embedding dim, {csdi_config['nheads']} heads, {csdi_config['layers']} layers")
 plt.legend()
 plt.tight_layout()
 plt.savefig(f'results/{timestamp}_diffusion_lr_curve.png')
@@ -396,81 +368,63 @@ with torch.no_grad():
         _, T_target, _ = batch["target"].shape
         target_columns = batch["target_columns"][0]
         condition_columns = batch["condition_columns"][0]
-        
-        target_x_indices = []
-        target_y_indices = []
-        
-        for i in range(0, len(target_columns), 2):
-            x_col = target_columns[i]
-            y_col = target_columns[i + 1]
-            
-            if x_col in condition_columns and y_col in condition_columns:
-                target_x_indices.append(condition_columns.index(x_col))
-                target_y_indices.append(condition_columns.index(y_col))
-        
-        last_past_cond = cond[:, -1]
 
-        initial_pos = torch.stack([
-            last_past_cond[:, target_x_indices],  # [B, 11]
-            last_past_cond[:, target_y_indices]   # [B, 11]
-        ], dim=-1)  # [B, 11, 2]
+        reference_point = batch["target_reference"].to(device)  # [B, 22]
+        target_abs = batch["target"].to(device)  # [B, T, 22]
         
-        target_abs = batch["target"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
-        target_rel = batch["target_relative"].to(device).view(-1, T_target, 11, 2)  # [B, T_target, 11, 2]
-
         graph_batch = batch["graph"].to(device)
 
-        H = graph_encoder(batch["graph"].to(device))
+        # condition 준비
+        H = graph_encoder(graph_batch)
         cond_H = H.unsqueeze(-1).unsqueeze(-1).expand(-1, H.size(1), 11, T_target)
         cond_info = cond_H
-        
-        preds = diff_model.generate(shape=target_rel.shape, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples) # (B, T, 11, 2)
 
-        # reference point denormalization
-        ref_denorm = initial_pos.clone()
-        ref_denorm[..., 0] = initial_pos[..., 0] * px_std + px_mean
-        ref_denorm[..., 1] = initial_pos[..., 1] * py_std + py_mean
+        shape = (B, T_target, 11, 2)
+        preds = diff_model.generate(shape=shape, reference_point=reference_point, cond_info=cond_info, ddim_steps=ddim_step, eta=eta, num_samples=num_samples)  # [num_samples, B, T, 11, 2]
 
-        # Target Denormalization
-        target_abs_denorm = target_abs.clone()
-        target_abs_denorm[..., 0] = target_abs[..., 0] * px_std + px_mean
-        target_abs_denorm[..., 1] = target_abs[..., 1] * py_std + py_mean
+        # GT 절대좌표 비정규화
+        target_abs_ = target_abs.view(B, T_target, 11, 2)
+        target_abs_denorm = target_abs_.clone()
+        target_abs_denorm[..., 0] = target_abs_[..., 0] * px_std + px_mean
+        target_abs_denorm[..., 1] = target_abs_[..., 1] * py_std + py_mean
+
+        # Reference point 처리
+        reference_point_ = reference_point.view(B, 11, 2)  # [B, 11, 2]
 
         # Evaluation
-        batch_ades_all_samples = []
-        batch_fdes_all_samples = []
-        batch_frechet_all_samples = []
-        batch_DE_all_samples = []
+        batch_ades_all_samples = []  # [num_samples, B]
+        batch_fdes_all_samples = []  # [num_samples, B]
+        batch_frechet_all_samples = []  # [num_samples, B]
+        batch_DE_all_samples = []  # [num_samples, B]
 
         for sample_idx in range(num_samples):
-            pred = preds[sample_idx]
+            pred = preds[sample_idx]  # [B, T, 11, 2]
 
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
 
-            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)
-            
-            # ADE & FDE
+            pred_absolute = pred_rel_denorm + reference_point_.unsqueeze(1)  # [B, T, N, 2]
+
             ade = ((pred_absolute[...,:2] - target_abs_denorm[...,:2])**2).sum(-1).sqrt().mean((1,2))  # [B]
             fde = ((pred_absolute[:,-1,:,:2] - target_abs_denorm[:,-1,:,:2])**2).sum(-1).sqrt().mean(1)  # [B]
-            # DE(Direction Error)
+
             eps = 1e-6
-            overall_pred = pred_absolute[:, -1] - pred_absolute[:, 0]
-            overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]
+            overall_pred = pred_absolute[:, -1] - pred_absolute[:, 0]  # [B, N, 2]
+            overall_gt = target_abs_denorm[:, -1] - target_abs_denorm[:, 0]  # [B, N, 2]
             
-            norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)
-            norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)
+            norm_pred = overall_pred.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
+            norm_gt = overall_gt.norm(dim=-1, keepdim=True).clamp(min=eps)  # [B, N, 1]
             
-            u = overall_pred / norm_pred 
-            v = overall_gt / norm_gt
+            u = overall_pred / norm_pred  # [B, N, 2]
+            v = overall_gt / norm_gt  # [B, N, 2]
             
             cosine = (u * v).sum(dim=-1).clamp(-1.0, 1.0)
             theta = cosine.acos()
             DE = theta.mean(dim=1)
             
-            # Fréchet distance
-            pred_np = pred_absolute.cpu().numpy()
+            # Calculate Fréchet distance
+            pred_np = pred_absolute.cpu().numpy()      # [B,T,N,2]
             target_np = target_abs_denorm.cpu().numpy()
             B_, T, N, _ = pred_np.shape
             batch_frechet = []
@@ -488,12 +442,11 @@ with torch.no_grad():
             batch_frechet_all_samples.append(torch.tensor(batch_frechet))
             batch_DE_all_samples.append(DE.cpu())
 
-        batch_ades_tensor = torch.stack(batch_ades_all_samples)
-        batch_fdes_tensor = torch.stack(batch_fdes_all_samples)
-        batch_frechet_tensor = torch.stack(batch_frechet_all_samples)
-        batch_DE_tensor = torch.stack(batch_DE_all_samples)
+        batch_ades_tensor = torch.stack(batch_ades_all_samples)  # [num_samples, B]
+        batch_fdes_tensor = torch.stack(batch_fdes_all_samples)  # [num_samples, B]
+        batch_frechet_tensor = torch.stack(batch_frechet_all_samples)  # [num_samples, B]
+        batch_DE_tensor = torch.stack(batch_DE_all_samples)  # [num_samples, B]
 
-        # Best-of-K methods
         min_ades, min_ade_indices = batch_ades_tensor.min(dim=0)  # [B]
         min_fdes, _ = batch_fdes_tensor.min(dim=0)  # [B]
         min_frechet, _ = batch_frechet_tensor.min(dim=0)  # [B]
@@ -503,7 +456,8 @@ with torch.no_grad():
         all_min_fdes.extend(min_fdes.tolist())
         all_min_frechet.extend(min_frechet.tolist())
         all_min_DE.extend(min_DE.tolist())
-
+        
+        # Also store average results for comparison
         avg_ades = batch_ades_tensor.mean(dim=0)
         avg_fdes = batch_fdes_tensor.mean(dim=0)
         avg_frechet = batch_frechet_tensor.mean(dim=0)
@@ -514,6 +468,7 @@ with torch.no_grad():
         all_frechet_dist.extend(avg_frechet.tolist())
         all_DE.extend(avg_DE.tolist())
         
+        # Debug print
         print(f"[Batch {batch_idx}] "
               f"Avg - ADE={avg_ades.mean():.3f}, FDE={avg_fdes.mean():.3f}, "
               f"Frechet={avg_frechet.mean():.3f}, DE={torch.rad2deg(avg_DE.mean()):.2f}° | "
@@ -527,16 +482,16 @@ with torch.no_grad():
 
         all_pred_absolutes = []
         for sample_idx in range(num_samples):
-            pred = preds[sample_idx]
+            pred = preds[sample_idx]  # [B, T, 11, 2]
 
             pred_rel_denorm = pred.clone()
             pred_rel_denorm[..., 0] = pred[..., 0] * rel_x_std + rel_x_mean
             pred_rel_denorm[..., 1] = pred[..., 1] * rel_y_std + rel_y_mean
 
-            pred_absolute = pred_rel_denorm + ref_denorm.unsqueeze(1)
+            pred_absolute = pred_rel_denorm + reference_point_.unsqueeze(1)  # [B, T, N, 2]
             all_pred_absolutes.append(pred_absolute.cpu().numpy())
         
-        all_pred_absolutes = np.stack(all_pred_absolutes)
+        all_pred_absolutes = np.stack(all_pred_absolutes)  # [num_samples, B, T, N, 2]
 
         for i in range(B):
             other_cols = batch["other_columns"][i]
@@ -557,7 +512,7 @@ with torch.no_grad():
                 other_den[:, j, 1] = other_seq[:, j, 1] * y_std + y_mean
 
             best_sample_idx = min_ade_indices[i].item()
-            pred_traj = all_pred_absolutes[best_sample_idx, i]
+            pred_traj = all_pred_absolutes[best_sample_idx, i]  # [T, N, 2]
             
             target_traj = target_abs_denorm[i].cpu().numpy()
             other_traj = other_den.cpu().numpy()
@@ -578,8 +533,8 @@ with torch.no_grad():
                 defenders_num=defender_nums, annotate=True, save_path=save_path
             )
         
-        del preds, pred_rel_denorm, pred_absolute, target_abs_denorm, ref_denorm, ade, fde
-        del cond, target_rel, target_abs, initial_pos, H, cond_H, cond_info
+        del preds, pred_rel_denorm, pred_absolute, target_abs_denorm, reference_point, ade, fde
+        del cond, target_abs, H, cond_H, cond_info
         torch.cuda.empty_cache()
         gc.collect()
             
@@ -587,10 +542,10 @@ with torch.no_grad():
 print(f"ADE: {np.mean(all_ades):.3f} ± {np.std(all_ades):.3f} meters")
 print(f"FDE: {np.mean(all_fdes):.3f} ± {np.std(all_fdes):.3f} meters")
 print(f"Fréchet: {np.mean(all_frechet_dist):.3f} ± {np.std(all_frechet_dist):.3f} meters")
-print(f"DE: {np.mean(all_DE):.3f}° ± {np.std(all_DE):.3f}°")
+print(f"Direction Error (DE): {np.rad2deg(np.mean(all_DE)):.3f} ± {np.rad2deg(np.std(all_DE)):.3f}°")
 
 print(f"Best-of-{num_samples} Sampling (min):")
 print(f"minADE{num_samples}: {np.mean(all_min_ades):.3f} ± {np.std(all_min_ades):.3f} meters")
 print(f"minFDE{num_samples}: {np.mean(all_min_fdes):.3f} ± {np.std(all_min_fdes):.3f} meters")
 print(f"minFréchet{num_samples}: {np.mean(all_min_frechet):.3f} ± {np.std(all_min_frechet):.3f} meters")
-print(f"minDE{num_samples}: {np.mean(all_min_DE):.3f}° ± {np.std(all_min_DE):.3f}°")
+print(f"minDE{num_samples}: {np.rad2deg(np.mean(all_min_DE)):.3f} ± {np.rad2deg(np.std(all_min_DE)):.3f}°")
